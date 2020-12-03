@@ -446,7 +446,19 @@ void addONNXToKrnlPasses(mlir::PassManager &pm) {
   // oppertunities.
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addNestedPass<FuncOp>(createDisconnectKrnlDimFromAllocPass());
+}
 
+void addKrnlToAffinePasses(mlir::PassManager &pm) {
+  pm.addNestedPass<FuncOp>(mlir::createConvertKrnlToAffinePass());
+  // Fuse loops in Affine dialect.
+  pm.addNestedPass<FuncOp>(mlir::createLoopFusionPass());
+  // Normalize affine loops: e.g. remove loops with a single iteration.
+  pm.addNestedPass<FuncOp>(mlir::createAffineLoopNormalizePass());
+  // Hoist loop invariant instructions outside of affine loops
+  pm.addNestedPass<FuncOp>(mlir::createAffineLoopInvariantCodeMotionPass());
+}
+
+void addMemoryPoolPasses(mlir::PassManager &pm) {
   // TODO: make this pass optional:
   pm.addNestedPass<FuncOp>(mlir::createKrnlEnableMemoryPoolPass());
   pm.addNestedPass<FuncOp>(mlir::createKrnlBundleMemoryPoolsPass());
@@ -455,14 +467,10 @@ void addONNXToKrnlPasses(mlir::PassManager &pm) {
   pm.addPass(mlir::createCanonicalizerPass());
 }
 
-void addKrnlToAffinePasses(mlir::PassManager &pm) {
-  pm.addNestedPass<FuncOp>(mlir::createConvertKrnlToAffinePass());
-  // Fuse loops in Affine dialect.
-  //  pm.addPass(mlir::createLoopFusionPass());
-}
-
-void addKrnlToLLVMPasses(mlir::PassManager &pm) {
+void addKrnlToLLVMPasses(mlir::PassManager &pm, bool withMemoryPool = true) {
   pm.addPass(mlir::createLowerAffinePass());
+  if (withMemoryPool)
+    addMemoryPoolPasses(pm);
   pm.addPass(mlir::createLowerToCFGPass());
   pm.addPass(mlir::createConvertKrnlToLLVMPass());
   pm.addPass(mlir::createCanonicalizerPass());
@@ -592,7 +600,7 @@ int compileModule(mlir::OwningModuleRef &module, mlir::MLIRContext &context,
   }
 
   if (emissionTarget >= EmitLLVMIR)
-    addKrnlToLLVMPasses(pm);
+    addKrnlToLLVMPasses(pm, /*withMemoryPool=*/true);
 
   if (mlir::failed(pm.run(*module)))
     return 4;
