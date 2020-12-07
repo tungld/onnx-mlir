@@ -438,13 +438,22 @@ void addONNXToMLIRPasses(mlir::PassManager &pm) {
   pm.addPass(mlir::createSymbolDCEPass());
 }
 
+void addMemoryPoolPasses(mlir::PassManager &pm) {
+  // TODO: make this pass optional:
+  pm.addNestedPass<FuncOp>(mlir::createKrnlEnableMemoryPoolPass());
+  pm.addNestedPass<FuncOp>(mlir::createKrnlBundleMemoryPoolsPass());
+  //pm.addPass(mlir::createCanonicalizerPass());
+  pm.addNestedPass<FuncOp>(mlir::createKrnlOptimizeMemoryPoolsPass());
+  //pm.addPass(mlir::createCanonicalizerPass());
+}
+
 void addONNXToKrnlPasses(mlir::PassManager &pm) {
   pm.addPass(mlir::createLowerToKrnlPass());
   pm.addPass(mlir::createPackKrnlGlobalConstantsPass());
   // An additional pass of canonicalization is helpful because lowering
   // from ONNX dialect to Standard dialect exposes additional canonicalization
   // oppertunities.
-  pm.addPass(mlir::createCanonicalizerPass());
+  //pm.addPass(mlir::createCanonicalizerPass());
   pm.addNestedPass<FuncOp>(createDisconnectKrnlDimFromAllocPass());
 }
 
@@ -452,25 +461,23 @@ void addKrnlToAffinePasses(mlir::PassManager &pm) {
   pm.addNestedPass<FuncOp>(mlir::createConvertKrnlToAffinePass());
   // Fuse loops in Affine dialect.
   pm.addNestedPass<FuncOp>(mlir::createLoopFusionPass());
+  // Remove load/store pairs.
+  pm.addNestedPass<FuncOp>(mlir::createMemRefDataFlowOptPass());
   // Normalize affine loops: e.g. remove loops with a single iteration.
   pm.addNestedPass<FuncOp>(mlir::createAffineLoopNormalizePass());
   // Hoist loop invariant instructions outside of affine loops
   pm.addNestedPass<FuncOp>(mlir::createAffineLoopInvariantCodeMotionPass());
-}
-
-void addMemoryPoolPasses(mlir::PassManager &pm) {
-  // TODO: make this pass optional:
-  pm.addNestedPass<FuncOp>(mlir::createKrnlEnableMemoryPoolPass());
-  pm.addNestedPass<FuncOp>(mlir::createKrnlBundleMemoryPoolsPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addNestedPass<FuncOp>(mlir::createKrnlOptimizeMemoryPoolsPass());
-  pm.addPass(mlir::createCanonicalizerPass());
+  // Tiling
+  pm.addNestedPass<FuncOp>(mlir::createLoopTilingPass());
+  // Vectorize
+  //pm.addNestedPass<FuncOp>(mlir::createSuperVectorizePass({256}));
 }
 
 void addKrnlToLLVMPasses(mlir::PassManager &pm, bool withMemoryPool = true) {
   pm.addPass(mlir::createLowerAffinePass());
   if (withMemoryPool)
     addMemoryPoolPasses(pm);
+  //pm.addNestedPass<FuncOp>(mlir::createConvertVectorToSCFPass());
   pm.addPass(mlir::createLowerToCFGPass());
   pm.addPass(mlir::createConvertKrnlToLLVMPass());
   pm.addPass(mlir::createCanonicalizerPass());
