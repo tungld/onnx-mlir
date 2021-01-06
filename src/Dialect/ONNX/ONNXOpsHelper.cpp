@@ -96,3 +96,14 @@ bool allAreRanked(const ArrayRef<Value> vals) {
   }
   return true;
 }
+
+void setRankedType(Value val, ArrayRef<int64_t> dims, Type elementType) {
+  if (val.getType().isa<UnrankedTensorType>()) {
+    val.setType(RankedTensorType::get(dims, elementType));
+    return;
+  } else if (val.getType().isa<UnrankedMemRefType>()) {
+    val.setType(MemRefType::get(dims, elementType));
+    return;
+  } else
+    return;
+}

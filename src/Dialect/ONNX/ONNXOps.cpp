@@ -49,7 +49,7 @@ LogicalResult shapeHelperInferShapes(OP *op, Value typeOper) {
   IndexExprContext::getOutputDimsForType(
       shapeHelper.dimsForOutput(0), outputDims);
   auto elementType = typeOper.getType().cast<ShapedType>().getElementType();
-  op->getResult().setType(RankedTensorType::get(outputDims, elementType));
+  setRankedType(op->getResult(), outputDims, elementType);
 
   return success();
 }
@@ -72,7 +72,7 @@ LogicalResult shapeHelperInferMultipleShapes(OP *op, Value typeOper) {
     SmallVector<int64_t, 4> outputDims;
     IndexExprContext::getOutputDimsForType(
         shapeHelper.dimsForOutput(i), outputDims);
-    op->getResults()[i].setType(RankedTensorType::get(outputDims, elementType));
+    setRankedType(op->getResults()[i], outputDims, elementType);
   }
   return success();
 }
@@ -108,7 +108,7 @@ int64_t AffineMapIntConstant(Builder &builder, AffineMap map,
 //===----------------------------------------------------------------------===//
 // Get reduction type
 //===----------------------------------------------------------------------===//
-RankedTensorType getReductionOutputType(
+std::vector<int64_t> getReductionOutputShape(
     ShapedType operandTy, Optional<ArrayAttr> axesAttrs, uint64_t keepdims) {
   int64_t rank = operandTy.getRank();
 
@@ -139,7 +139,7 @@ RankedTensorType getReductionOutputType(
   // KeepDims
   bool isKeepdims = (keepdims == 1) ? true : false;
 
-  SmallVector<int64_t, 4> dims;
+  std::vector<int64_t> dims;
   for (decltype(rank) i = 0; i < rank; ++i) {
     if (isReductionAxis[i]) {
       if (isKeepdims)
@@ -149,7 +149,7 @@ RankedTensorType getReductionOutputType(
     }
   }
 
-  return RankedTensorType::get(dims, operandTy.getElementType());
+  return dims;
 }
 
 //===----------------------------------------------------------------------===//
@@ -443,27 +443,24 @@ static LogicalResult RNNShapeInference(T *op) {
     // Y :: [seq_length, num_directions, batch_size, hidden_size]
     Type yTy = op->getResults()[0].getType();
     if (!yTy.isa<NoneType>()) {
-      yTy = RankedTensorType::get(
+      setRankedType(op->getResults()[0],
           {sequenceLength, numDirection, batchSize, hiddenSize}, elementType);
-      op->getResults()[0].setType(yTy);
     }
   }
   if (numOfResults > 1) {
     // Y_h :: [num_directions, batch_size, hidden_size]
     Type yhTy = op->getResults()[1].getType();
     if (!yhTy.isa<NoneType>()) {
-      yhTy = RankedTensorType::get(
-          {numDirection, batchSize, hiddenSize}, elementType);
-      op->getResults()[1].setType(yhTy);
+      setRankedType(op->getResults()[1], {numDirection, batchSize, hiddenSize},
+          elementType);
     }
   }
   if (numOfResults > 2) {
     // Y_c :: [num_directions, batch_size, hidden_size]
     Type ycTy = op->getResults()[2].getType();
     if (!ycTy.isa<NoneType>()) {
-      ycTy = RankedTensorType::get(
-          {numDirection, batchSize, hiddenSize}, elementType);
-      op->getResults()[2].setType(ycTy);
+      setRankedType(op->getResults()[2], {numDirection, batchSize, hiddenSize},
+          elementType);
     }
   }
   return success();
@@ -1185,7 +1182,7 @@ LogicalResult ONNXQLinearMatMulOp::inferShapes(
       dims.emplace_back(rhsShape[1]);
   }
 
-  getResult().setType(RankedTensorType::get(dims, lhsTy.getElementType()));
+  setRankedType(getResult(), dims, lhsTy.getElementType());
   return success();
 }
 
@@ -1321,8 +1318,7 @@ LogicalResult ONNXReshapeOp::inferShapes(
       dims[dynamicValueIndex] = totalInputSize / totalKnownDimsSize;
   }
 
-  getResult().setType(
-      RankedTensorType::get(dims, inputTensorTy.getElementType()));
+  setRankedType(getResult(), dims, inputTensorTy.getElementType());
   return success();
 }
 
@@ -1342,8 +1338,8 @@ LogicalResult ONNXTransposeOp::inferShapes(
   SmallVector<int64_t, 4> outputDims;
   IndexExprContext::getOutputDimsForType(
       shapeHelper.dimsForOutput(0), outputDims);
-  getResult().setType(RankedTensorType::get(outputDims, elementType));
 
+  setRankedType(getResult(), outputDims, elementType);
   return success();
 }
 
@@ -1357,7 +1353,8 @@ LogicalResult ONNXReduceMaxOp::inferShapes(
     return emitError("Input tensor not ranked");
 
   auto operandTy = getOperand().getType().cast<ShapedType>();
-  getResult().setType(getReductionOutputType(operandTy, axes(), keepdims()));
+  auto outputDims = getReductionOutputShape(operandTy, axes(), keepdims());
+  setRankedType(getResult(), outputDims, operandTy.getElementType());
   return success();
 }
 
@@ -1371,7 +1368,8 @@ LogicalResult ONNXReduceMeanOp::inferShapes(
     return emitError("Input tensor not ranked");
 
   auto operandTy = getOperand().getType().cast<ShapedType>();
-  getResult().setType(getReductionOutputType(operandTy, axes(), keepdims()));
+  auto outputDims = getReductionOutputShape(operandTy, axes(), keepdims());
+  setRankedType(getResult(), outputDims, operandTy.getElementType());
   return success();
 }
 
@@ -1385,7 +1383,8 @@ LogicalResult ONNXReduceMinOp::inferShapes(
     return emitError("Input tensor not ranked");
 
   auto operandTy = getOperand().getType().cast<ShapedType>();
-  getResult().setType(getReductionOutputType(operandTy, axes(), keepdims()));
+  auto outputDims = getReductionOutputShape(operandTy, axes(), keepdims());
+  setRankedType(getResult(), outputDims, operandTy.getElementType());
   return success();
 }
 
@@ -1399,7 +1398,8 @@ LogicalResult ONNXReduceProdOp::inferShapes(
     return emitError("Input tensor not ranked");
 
   auto operandTy = getOperand().getType().cast<ShapedType>();
-  getResult().setType(getReductionOutputType(operandTy, axes(), keepdims()));
+  auto outputDims = getReductionOutputShape(operandTy, axes(), keepdims());
+  setRankedType(getResult(), outputDims, operandTy.getElementType());
   return success();
 }
 
@@ -1413,7 +1413,8 @@ LogicalResult ONNXReduceSumOp::inferShapes(
     return emitError("Input tensor not ranked");
 
   auto operandTy = getOperand().getType().cast<ShapedType>();
-  getResult().setType(getReductionOutputType(operandTy, axes(), keepdims()));
+  auto outputDims = getReductionOutputShape(operandTy, axes(), keepdims());
+  setRankedType(getResult(), outputDims, operandTy.getElementType());
   return success();
 }
 
@@ -1530,7 +1531,7 @@ LogicalResult ONNXConvOp::inferShapes(
   insertConvSpatialDim(&outputDims, builder, xShape, kernelShape, padsOpt,
       stridesOpt, dilationsOpt);
 
-  getResult().setType(RankedTensorType::get(outputDims, xTy.getElementType()));
+  setRankedType(getResult(), outputDims, xTy.getElementType());
   return success();
 }
 
@@ -1668,7 +1669,7 @@ LogicalResult ONNXConvTransposeOp::inferShapes(
     output_shapeAttr(builder.getI64ArrayAttr(outputDims));
   }
 
-  getResult().setType(RankedTensorType::get(outputDims, xTy.getElementType()));
+  setRankedType(getResult(), outputDims, xTy.getElementType());
   return success();
 }
 
@@ -1773,7 +1774,7 @@ LogicalResult ONNXQLinearConvOp::inferShapes(
   insertConvSpatialDim(&outputDims, builder, xShape, kernelShape, padsOpt,
       stridesOpt, dilationsOpt);
 
-  getResult().setType(RankedTensorType::get(outputDims, xTy.getElementType()));
+  setRankedType(getResult(), outputDims, xTy.getElementType());
   return success();
 }
 
@@ -1827,7 +1828,7 @@ LogicalResult ONNXAveragePoolOp::inferShapes(
   insertConvSpatialDim(&outputDims, builder, xShape, kernelShape, padsOpt,
       stridesOpt, llvm::None, ceilMode);
 
-  getResult().setType(RankedTensorType::get(outputDims, xTy.getElementType()));
+  setRankedType(getResult(), outputDims, xTy.getElementType());
   return success();
 }
 
@@ -1880,7 +1881,7 @@ LogicalResult ONNXMaxPoolSingleOutOp::inferShapes(
   insertConvSpatialDim(&outputDims, builder, xShape, kernelShape, padsOpt,
       stridesOpt, dilationsOpt, ceilMode);
 
-  getResult().setType(RankedTensorType::get(outputDims, xTy.getElementType()));
+  setRankedType(getResult(), outputDims, xTy.getElementType());
   return success();
 }
 
@@ -1905,8 +1906,7 @@ static LogicalResult inferShapesGlobalPool(PoolingOp *op) {
   // Spatial dimensions are reduced to 1.
   outputDims.insert(outputDims.end(), xTy.getRank() - 2, 1);
 
-  op->getResult().setType(
-      RankedTensorType::get(outputDims, xTy.getElementType()));
+  setRankedType(op->getResult(), outputDims, xTy.getElementType());
   return success();
 }
 
@@ -1984,19 +1984,18 @@ LogicalResult ONNXPadOp::inferShapes(
       outputShape[i] += p1 + p2;
   }
 
-  auto outputType = RankedTensorType::get(outputShape, dataTy.getElementType());
-  getResult().setType(outputType);
+  setRankedType(getResult(), outputShape, dataTy.getElementType());
   return success();
 }
 
-static Type padShapeInferenceHelper(Value data, ArrayAttr padsOpt) {
+static bool padShapeInferenceHelper(
+    Value data, ArrayAttr padsOpt, std::vector<int64_t> &outputShape) {
   // Cannot infer shape if no shape exists.
   if (!allAreRanked({data}))
-    return (Type)NULL;
+    return false;
   auto dataTy = data.getType().cast<ShapedType>();
   auto dataShape = dataTy.getShape();
   auto dataRank = dataShape.size();
-  SmallVector<int64_t, 4> outputShape(dataShape.begin(), dataShape.end());
   if (padsOpt) {
     auto padsArray = padsOpt.getValue();
     // Pads consists of two values for each axis of data.
@@ -2007,15 +2006,14 @@ static Type padShapeInferenceHelper(Value data, ArrayAttr padsOpt) {
       int64_t p2 = (padsArray[i + dataRank]).cast<IntegerAttr>().getInt();
       // Have to non-negative constant
       if (p1 < 0 || p2 < 0)
-        return (Type)NULL;
-      if (outputShape[i] != -1)
-        outputShape[i] += p1 + p2;
+        return false;
+      if (dataShape[i] != -1)
+        outputShape.emplace_back(dataShape[i] + p1 + p2);
+      else
+        outputShape.emplace_back(dataShape[i]);
     }
-
-    return (RankedTensorType::get(outputShape, dataTy.getElementType()));
-  } else {
-    return (Type)NULL;
   }
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -2024,10 +2022,11 @@ static Type padShapeInferenceHelper(Value data, ArrayAttr padsOpt) {
 
 LogicalResult ONNXPadConstantPadOp::inferShapes(
     std::function<void(mlir::FuncOp)> shapeInferenceFunc) {
-  auto outputType = padShapeInferenceHelper(data(), pads());
-  if (!outputType)
+  std::vector<int64_t> outputShape;
+  if (!padShapeInferenceHelper(data(), pads(), outputShape))
     return emitError("missing output");
-  getResult().setType(outputType);
+  setRankedType(getResult(), outputShape,
+      data().getType().cast<ShapedType>().getElementType());
   return success();
 }
 
@@ -2037,20 +2036,23 @@ LogicalResult ONNXPadConstantPadOp::inferShapes(
 
 LogicalResult ONNXPadConstantValuePadOp::inferShapes(
     std::function<void(mlir::FuncOp)> shapeInferenceFunc) {
-  auto outputType = padShapeInferenceHelper(data(), pads());
-  if (!outputType)
+  std::vector<int64_t> outputShape;
+  if (!padShapeInferenceHelper(data(), pads(), outputShape))
     return emitError("missing output");
-  getResult().setType(outputType);
+  setRankedType(getResult(), outputShape,
+      data().getType().cast<ShapedType>().getElementType());
   return success();
 }
 
 void ONNXPadConstantValuePadOp::build(OpBuilder &builder, OperationState &state,
     Value data, ArrayAttr pads, FloatAttr constant_value, StringAttr mode) {
-  Type outputType = padShapeInferenceHelper(data, pads);
-  if (!outputType) {
-    auto elementType = data.getType().cast<TensorType>().getElementType();
+  auto elementType = data.getType().cast<TensorType>().getElementType();
+  Type outputType;
+  std::vector<int64_t> outputShape;
+  if (!padShapeInferenceHelper(data, pads, outputShape))
     outputType = UnrankedTensorType::get(elementType);
-  }
+  else
+    outputType = RankedTensorType::get(outputShape, elementType);
   build(builder, state, outputType, data, pads, constant_value, mode);
 }
 
@@ -2092,7 +2094,7 @@ LogicalResult ONNXUnsqueezeOp::inferShapes(
       dims.emplace_back(operandTy.getShape()[j++]);
     }
   }
-  getResult().setType(RankedTensorType::get(dims, operandTy.getElementType()));
+  setRankedType(getResult(), dims, operandTy.getElementType());
   return success();
 }
 
@@ -2139,7 +2141,7 @@ LogicalResult ONNXSqueezeOp::inferShapes(
       dims.emplace_back(operandTy.getShape()[i]);
     }
   }
-  getResult().setType(RankedTensorType::get(dims, operandTy.getElementType()));
+  setRankedType(getResult(), dims, operandTy.getElementType());
   return success();
 }
 
@@ -2153,17 +2155,9 @@ LogicalResult ONNXCastOp::inferShapes(
     return emitError("Non-shaped input type");
   }
 
-  auto getOutputType = [&inputType](Type elementType) -> Type {
-    if (inputType.hasRank()) {
-      return RankedTensorType::get(inputType.getShape(), elementType);
-    }
-    return UnrankedTensorType::get(elementType);
-  };
-
   mlir::Type targetType =
       this->getAttr("to").cast<::mlir::TypeAttr>().getValue();
-  OpBuilder builder(getContext());
-  getResult().setType(getOutputType(targetType));
+  setRankedType(getResult(), inputType.getShape(), targetType);
   return success();
 }
 
@@ -2174,8 +2168,8 @@ LogicalResult ONNXCastOp::inferShapes(
 LogicalResult ONNXScalerOp::inferShapes(
     std::function<void(mlir::FuncOp)> shapeInferenceFunc) {
   ShapedType inputType = X().getType().dyn_cast<ShapedType>();
-  getResult().setType(RankedTensorType::get(
-      inputType.getShape(), FloatType::getF32(getContext())));
+  setRankedType(
+      getResult(), inputType.getShape(), FloatType::getF32(getContext()));
   return success();
 }
 
@@ -2252,8 +2246,7 @@ LogicalResult ONNXConcatOp::inferShapes(
   SmallVector<int64_t, 4> outputDims;
   IndexExprContext::getOutputDimsForType(
       shapeHelper.dimsForOutput(0), outputDims);
-  getResult().setType(
-      RankedTensorType::get(outputDims, commonType.getElementType()));
+  setRankedType(getResult(), outputDims, commonType.getElementType());
 
   return success();
 }
@@ -2345,7 +2338,7 @@ LogicalResult ONNXFlattenOp::inferShapes(
   dims.emplace_back(secondDim);
 
   // Set the type of output
-  getResult().setType(RankedTensorType::get(dims, inTy.getElementType()));
+  setRankedType(getResult(), dims, inTy.getElementType());
 
   return success();
 }
@@ -2369,21 +2362,17 @@ LogicalResult ONNXDynamicQuantizeLinearOp::inferShapes(
       IntegerType::get(8, IntegerType::Unsigned, getContext());
   FloatType f32Type = FloatType::getF32(getContext());
 
-  RankedTensorType scalarType = RankedTensorType::get({}, f32Type);
-  RankedTensorType y_zero_point_type = RankedTensorType::get({}, ui8Type);
-
   // Set the types for the scalars
   if (!yScaleTy.hasStaticShape()) {
-    y_scale().setType(scalarType);
+    setRankedType(y_scale(), {}, f32Type);
   }
 
   if (!yZPTy.hasStaticShape()) {
-    y_zero_point().setType(y_zero_point_type);
+    setRankedType(y_zero_point(), {}, ui8Type);
   }
 
   if (!yTy.hasStaticShape()) {
-    RankedTensorType outType = RankedTensorType::get(inTy.getShape(), ui8Type);
-    y().setType(outType);
+    setRankedType(y(), inTy.getShape(), ui8Type);
   }
 
   return success();
@@ -2406,8 +2395,7 @@ LogicalResult ONNXQuantizeLinearOp::inferShapes(
     // TODO: Unfortunately, we can't tell if this should be signed or unsigned
     //       here...
     IntegerType i8Type = IntegerType::get(8, getContext());
-    RankedTensorType outType = RankedTensorType::get(inTy.getShape(), i8Type);
-    y().setType(outType);
+    setRankedType(y(), inTy.getShape(), i8Type);
   }
 
   return success();
@@ -2428,8 +2416,7 @@ LogicalResult ONNXDequantizeLinearOp::inferShapes(
 
   if (!yTy.hasStaticShape()) {
     FloatType f32 = FloatType::getF32(getContext());
-    RankedTensorType outType = RankedTensorType::get(inTy.getShape(), f32);
-    y().setType(outType);
+    setRankedType(y(), inTy.getShape(), f32);
   }
 
   return success();
@@ -2535,8 +2522,7 @@ LogicalResult ONNXConvIntegerOp::inferShapes(
       stridesOpt, dilationsOpt);
 
   // ONNX spec specifies the output type as an int32
-  Type outputType = IntegerType::get(32, getContext());
-  getResult().setType(RankedTensorType::get(outputDims, outputType));
+  setRankedType(getResult(), outputDims, IntegerType::get(32, getContext()));
   return success();
 }
 
@@ -2553,8 +2539,7 @@ LogicalResult ONNXShapeOp::inferShapes(
   // Output is an 1D int64 tensor containing the shape of the input tensor.
   int64_t rank = data().getType().cast<ShapedType>().getRank();
   SmallVector<int64_t, 1> outDims(1, rank);
-  getResult().setType(
-      RankedTensorType::get(outDims, IntegerType::get(64, getContext())));
+  setRankedType(getResult(), outDims, IntegerType::get(64, getContext()));
   return success();
 }
 
@@ -2566,8 +2551,7 @@ LogicalResult ONNXSizeOp::inferShapes(
     std::function<void(mlir::FuncOp)> shapeInferenceFunc) {
   // Output is scalar of int64 containing the size of the input tensor.
   SmallVector<int64_t, 1> outDims;
-  getResult().setType(
-      RankedTensorType::get(outDims, IntegerType::get(64, getContext())));
+  setRankedType(getResult(), outDims, IntegerType::get(64, getContext()));
   return success();
 }
 
@@ -2644,7 +2628,7 @@ LogicalResult ONNXConstantOfShapeOp::inferShapes(
     return emitError("Input tensor must have static shape");
   if (inputShape[0] == 0) {
     // If 'input' is an empty tensor, the output would be a scalar.
-    getResult().setType(RankedTensorType::get({}, elementType));
+    setRankedType(getResult(), {}, elementType);
     return success();
   }
 
@@ -2668,7 +2652,7 @@ LogicalResult ONNXConstantOfShapeOp::inferShapes(
       return emitError("Constant value must have same length as output's rank");
   }
 
-  getResult().setType(RankedTensorType::get(outputDims, elementType));
+  setRankedType(getResult(), outputDims, elementType);
   return success();
 }
 
@@ -2726,7 +2710,7 @@ LogicalResult ONNXSliceOp::inferShapes(
   SmallVector<int64_t, 4> outputDims;
   IndexExprContext::getOutputDimsForType(
       shapeHelper.dimsForOutput(0), outputDims);
-  getResult().setType(RankedTensorType::get(outputDims, elementType));
+  setRankedType(getResult(), outputDims, elementType);
 
   return success();
 }
@@ -2796,7 +2780,7 @@ LogicalResult ONNXExpandOp::inferShapes(
     // return emitError("Tensor not expandable");
   }
 
-  getResult().setType(RankedTensorType::get(resultShape, elementType));
+  setRankedType(getResult(), resultShape, elementType);
   return success();
 }
 
@@ -2814,7 +2798,7 @@ LogicalResult ONNXDropoutOp::inferShapes(
   auto inputShape = data().getType().cast<ShapedType>().getShape();
 
   IntegerType i1Type = IntegerType::get(1, IntegerType::Signless, getContext());
-  getResult(1).setType(RankedTensorType::get(inputShape, i1Type));
+  setRankedType(getResult(1), inputShape, i1Type);
   return success();
 }
 
@@ -2853,8 +2837,7 @@ LogicalResult ONNXOneHotEncoderOp::inferShapes(
   }
   dims.emplace_back(outDim);
 
-  getResult().setType(
-      RankedTensorType::get(dims, FloatType::getF32(getContext())));
+  setRankedType(getResult(), dims, FloatType::getF32(getContext()));
   return success();
 }
 
@@ -2874,8 +2857,7 @@ LogicalResult ONNXLessOp::inferShapes(
   ArrayRef<int64_t> dims =
       getBroadcastedType(lhsTy, rhsTy).cast<ShapedType>().getShape();
 
-  getResult().setType(
-      RankedTensorType::get(dims, IntegerType::get(/*width=*/1, getContext())));
+  setRankedType(getResult(), dims, IntegerType::get(/*width=*/1, getContext()));
   return success();
 }
 
@@ -2948,7 +2930,7 @@ LogicalResult ONNXClipOp::inferShapes(
   Type elementType = inputTy.getElementType();
   ArrayRef<int64_t> inputShape = inputTy.getShape();
 
-  getResult().setType(RankedTensorType::get(inputShape, elementType));
+  setRankedType(getResult(), inputShape, elementType);
   return success();
 }
 
@@ -3376,11 +3358,9 @@ LogicalResult ONNXLoopOp::inferShapes(
 
   // We proceed to set types for loop body function inputs.
   // Set type for iteration number (trip count):
-  func.getBody().getArgument(0).setType(
-      RankedTensorType::get({}, builder.getI64Type()));
+  setRankedType(func.getBody().getArgument(0), {}, builder.getI64Type());
   // Set type for termination condition:
-  func.getBody().getArgument(1).setType(
-      RankedTensorType::get({}, builder.getI1Type()));
+  setRankedType(func.getBody().getArgument(1), {}, builder.getI1Type());
 
   // Set types for loop carried dependencies (i.e., set these loop carried
   // depdencies that appear in the body function input signature to have the
@@ -3430,9 +3410,8 @@ LogicalResult ONNXLoopOp::inferShapes(
     // to Loop operation, but we need to eliminate the possibility of early
     // termination to be sure.
     unsqueezedShape.insert(unsqueezedShape.begin(), -1);
-    std::get<0>(vScanOutputValToTy)
-        .setType(RankedTensorType::get(
-            unsqueezedShape, rankedScanTy.getElementType()));
+    setRankedType(std::get<0>(vScanOutputValToTy), unsqueezedShape,
+        rankedScanTy.getElementType());
   }
 
   return success();
