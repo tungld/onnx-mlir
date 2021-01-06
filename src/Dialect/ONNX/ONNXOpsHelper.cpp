@@ -87,3 +87,12 @@ bool getIntegerLiteralFromValue(Value value, int64_t &intLit) {
   }
   return false;
 }
+
+bool allAreRanked(const ArrayRef<Value> vals) {
+  for (Value val : vals) {
+    if (!(val.getType().isa<RankedTensorType>() ||
+            val.getType().isa<MemRefType>()))
+      return false;
+  }
+  return true;
+}

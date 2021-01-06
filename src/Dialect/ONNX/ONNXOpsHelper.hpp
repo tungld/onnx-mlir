@@ -42,3 +42,4 @@ int64_t ArrayAttrIntVal(Optional<ArrayAttr> a, int i);
 
 DenseElementsAttr getDenseElementAttributeFromValue(Value value);
 bool getIntegerLiteralFromValue(Value value, int64_t &intLit);
+bool allAreRanked(const ArrayRef<Value> vals);
