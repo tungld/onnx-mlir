@@ -153,6 +153,28 @@ std::vector<int64_t> getReductionOutputShape(
 }
 
 //===----------------------------------------------------------------------===//
+// Get a broadcasted type for RankedTensorType and MemRefType.
+//===----------------------------------------------------------------------===//
+Type getBroadcastedRankedType(Type type1, Type type2) {
+  if (type1.isa<RankedTensorType>() && type2.isa<RankedTensorType>())
+    return getBroadcastedType(type1, type2);
+  if (type1.isa<MemRefType>() && type2.isa<MemRefType>()) {
+    // Contruct RankedTensorType(s).
+    auto elementType = type1.cast<MemRefType>().getElementType();
+    auto ty1 =
+        RankedTensorType::get(type1.cast<MemRefType>().getShape(), elementType);
+    auto ty2 =
+        RankedTensorType::get(type2.cast<MemRefType>().getShape(), elementType);
+    // Compute a broadcasted type.
+    Type outputType = getBroadcastedType(ty1, ty2);
+    // Construct a MemRefType.
+    return MemRefType::get(
+        outputType.cast<RankedTensorType>().getShape(), elementType);
+  } else
+    return (Type)NULL;
+}
+
+//===----------------------------------------------------------------------===//
 // Support function that computes default values for dilations.
 //===----------------------------------------------------------------------===//
 template <class T>
@@ -850,7 +872,7 @@ LogicalResult ONNXPowOp::inferShapes(
     return emitError("Input tensor(s) not ranked");
   auto lhsTy = getOperand(0).getType().cast<ShapedType>();
   auto rhsTy = getOperand(1).getType().cast<ShapedType>();
-  getResult().setType(getBroadcastedType(lhsTy, rhsTy));
+  getResult().setType(getBroadcastedRankedType(lhsTy, rhsTy));
   return success();
 }
 
@@ -865,7 +887,7 @@ LogicalResult ONNXAddOp::inferShapes(
     return emitError("Input tensor(s) not ranked");
   auto lhsTy = getOperand(0).getType().cast<ShapedType>();
   auto rhsTy = getOperand(1).getType().cast<ShapedType>();
-  getResult().setType(getBroadcastedType(lhsTy, rhsTy));
+  getResult().setType(getBroadcastedRankedType(lhsTy, rhsTy));
   return success();
 }
 
@@ -880,7 +902,7 @@ LogicalResult ONNXMulOp::inferShapes(
     return emitError("Input tensor(s) not ranked");
   auto lhsTy = getOperand(0).getType().cast<ShapedType>();
   auto rhsTy = getOperand(1).getType().cast<ShapedType>();
-  getResult().setType(getBroadcastedType(lhsTy, rhsTy));
+  getResult().setType(getBroadcastedRankedType(lhsTy, rhsTy));
   return success();
 }
 
@@ -895,7 +917,7 @@ LogicalResult ONNXDivOp::inferShapes(
     return emitError("Input tensor(s) not ranked");
   auto lhsTy = getOperand(0).getType().cast<ShapedType>();
   auto rhsTy = getOperand(1).getType().cast<ShapedType>();
-  getResult().setType(getBroadcastedType(lhsTy, rhsTy));
+  getResult().setType(getBroadcastedRankedType(lhsTy, rhsTy));
   return success();
 }
 
@@ -910,7 +932,7 @@ LogicalResult ONNXSubOp::inferShapes(
     return emitError("Input tensor(s) not ranked");
   auto lhsTy = getOperand(0).getType().cast<ShapedType>();
   auto rhsTy = getOperand(1).getType().cast<ShapedType>();
-  getResult().setType(getBroadcastedType(lhsTy, rhsTy));
+  getResult().setType(getBroadcastedRankedType(lhsTy, rhsTy));
   return success();
 }
 
@@ -925,7 +947,7 @@ LogicalResult ONNXAndOp::inferShapes(
     return emitError("Input tensor(s) not ranked");
   auto lhsTy = getOperand(0).getType().cast<ShapedType>();
   auto rhsTy = getOperand(1).getType().cast<ShapedType>();
-  getResult().setType(getBroadcastedType(lhsTy, rhsTy));
+  getResult().setType(getBroadcastedRankedType(lhsTy, rhsTy));
   return success();
 }
 
@@ -940,7 +962,7 @@ LogicalResult ONNXOrOp::inferShapes(
     return emitError("Input tensor(s) not ranked");
   auto lhsTy = getOperand(0).getType().cast<ShapedType>();
   auto rhsTy = getOperand(1).getType().cast<ShapedType>();
-  getResult().setType(getBroadcastedType(lhsTy, rhsTy));
+  getResult().setType(getBroadcastedRankedType(lhsTy, rhsTy));
   return success();
 }
 
@@ -955,7 +977,7 @@ LogicalResult ONNXXorOp::inferShapes(
     return emitError("Input tensor(s) not ranked");
   auto lhsTy = getOperand(0).getType().cast<ShapedType>();
   auto rhsTy = getOperand(1).getType().cast<ShapedType>();
-  getResult().setType(getBroadcastedType(lhsTy, rhsTy));
+  getResult().setType(getBroadcastedRankedType(lhsTy, rhsTy));
   return success();
 }
 
@@ -973,7 +995,7 @@ LogicalResult ONNXSumOp::inferShapes(
   Type resultTy = getOperand(0).getType().cast<ShapedType>();
   for (int i = 1; i < getNumOperands(); ++i) {
     Type nextTy = getOperand(i).getType().cast<ShapedType>();
-    resultTy = getBroadcastedType(resultTy, nextTy);
+    resultTy = getBroadcastedRankedType(resultTy, nextTy);
   }
   getResult().setType(resultTy);
   return success();
@@ -993,7 +1015,7 @@ LogicalResult ONNXMaxOp::inferShapes(
   Type resultTy = getOperand(0).getType().cast<ShapedType>();
   for (int i = 1; i < getNumOperands(); ++i) {
     Type nextTy = getOperand(i).getType().cast<ShapedType>();
-    resultTy = getBroadcastedType(resultTy, nextTy);
+    resultTy = getBroadcastedRankedType(resultTy, nextTy);
   }
   getResult().setType(resultTy);
   return success();
@@ -1013,7 +1035,7 @@ LogicalResult ONNXMinOp::inferShapes(
   Type resultTy = getOperand(0).getType().cast<ShapedType>();
   for (int i = 1; i < getNumOperands(); ++i) {
     Type nextTy = getOperand(i).getType().cast<ShapedType>();
-    resultTy = getBroadcastedType(resultTy, nextTy);
+    resultTy = getBroadcastedRankedType(resultTy, nextTy);
   }
   getResult().setType(resultTy);
   return success();
@@ -2855,7 +2877,7 @@ LogicalResult ONNXLessOp::inferShapes(
   Type lhsTy = getOperand(0).getType().cast<ShapedType>();
   Type rhsTy = getOperand(1).getType().cast<ShapedType>();
   ArrayRef<int64_t> dims =
-      getBroadcastedType(lhsTy, rhsTy).cast<ShapedType>().getShape();
+      getBroadcastedRankedType(lhsTy, rhsTy).cast<ShapedType>().getShape();
 
   setRankedType(getResult(), dims, IntegerType::get(/*width=*/1, getContext()));
   return success();
