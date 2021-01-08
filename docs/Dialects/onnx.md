@@ -499,7 +499,7 @@ ONNX Cast operation
 
 | Attribute | MLIR Type | Description |
 | :-------: | :-------: | ----------- |
-`to` | ::mlir::IntegerAttr | 64-bit signed integer attribute
+`to` | ::mlir::TypeAttr | any type attribute
 
 #### Operands:
 
@@ -904,6 +904,33 @@ ONNX CumSum operation
 | Result | Description |
 | :----: | ----------- |
 `y` | tensor of 32-bit unsigned integer values or tensor of 64-bit unsigned integer values or tensor of 32-bit signless integer values or tensor of 64-bit signless integer values or tensor of 32-bit float values or tensor of 64-bit float values or memref of any type values
+
+### `onnx.Custom` (ONNXCustomOp)
+
+ONNX Custom operation
+
+"Allow call-out to a user defined operation. A single attribute"
+"is a string which names the operation, other inputs are"
+"passed to the user operation."
+"The number of inputs and outputs can vary."
+
+#### Attributes:
+
+| Attribute | MLIR Type | Description |
+| :-------: | :-------: | ----------- |
+`function_name` | ::mlir::StringAttr | string attribute
+
+#### Operands:
+
+| Operand | Description |
+| :-----: | ----------- |
+`input` | tensor of any type values or memref of any type values
+
+#### Results:
+
+| Result | Description |
+| :----: | ----------- |
+`outputs` | tensor of any type values or memref of any type values
 
 ### `onnx.DepthToSpace` (ONNXDepthToSpaceOp)
 

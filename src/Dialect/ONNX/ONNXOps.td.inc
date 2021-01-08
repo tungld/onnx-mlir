@@ -474,7 +474,7 @@ def ONNXCastOp:ONNX_Op<"Cast",
   "an integer 36 to Boolean may produce 1 because we truncate bits which can't be stored in the targeted type."
   }];
   let arguments = (ins AnyTypeOf<[TensorOf<[F16]>, TensorOf<[F32]>, TensorOf<[F64]>, TensorOf<[I8]>, TensorOf<[I16]>, TensorOf<[I32]>, TensorOf<[I64]>, TensorOf<[UI8]>, TensorOf<[UI16]>, TensorOf<[UI32]>, TensorOf<[UI64]>, TensorOf<[I1]>, TensorOf<[StringType]>, AnyMemRef]>:$input,
-    SI64Attr:$to);
+    TypeAttr:$to);
   let results = (outs AnyTypeOf<[TensorOf<[F16]>, TensorOf<[F32]>, TensorOf<[F64]>, TensorOf<[I8]>, TensorOf<[I16]>, TensorOf<[I32]>, TensorOf<[I64]>, TensorOf<[UI8]>, TensorOf<[UI16]>, TensorOf<[UI32]>, TensorOf<[UI64]>, TensorOf<[I1]>, TensorOf<[StringType]>, AnyMemRef]>:$output);
   let extraClassDeclaration = [{
     static int getNumberOfOperands() {
@@ -488,18 +488,14 @@ def ONNXCastOp:ONNX_Op<"Cast",
     }
     std::vector<mlir::Type> resultTypeInference() {
       std::vector<mlir::Type> resultTypes;
-      auto toAttr = to();
       auto builder = mlir::OpBuilder(getContext());
-      resultTypes.push_back(mlir::UnrankedTensorType::get(
-        convertONNXTypeToMLIRType(builder, static_cast<onnx::TensorProto_DataType>(toAttr))));
+      resultTypes.push_back(mlir::UnrankedTensorType::get(to()));
       return resultTypes;
     }
   }];
    let builders = [
-  OpBuilder<"OpBuilder &builder, OperationState &state, Value input, IntegerAttr to", [{
-   auto toAttr = to.getValue().getSExtValue();
-   auto resultType = mlir::UnrankedTensorType::get(
-    convertONNXTypeToMLIRType(builder, static_cast<onnx::TensorProto_DataType>(toAttr)));
+  OpBuilder<"OpBuilder &builder, OperationState &state, Value input, TypeAttr to", [{
+   auto resultType = mlir::UnrankedTensorType::get(to.getValue());
    build(builder, state, resultType, input, to);
   }] >
   ];
@@ -1742,6 +1738,7 @@ def ONNXGemmOp:ONNX_Op<"Gemm",
 
 def ONNXGlobalAveragePoolOp:ONNX_Op<"GlobalAveragePool",
   [NoSideEffect, DeclareOpInterfaceMethods<ShapeInferenceOpInterface>]> {
+  let hasCanonicalizer = 1;
   let summary = "ONNX GlobalAveragePool operation";
   let description = [{
   "GlobalAveragePool consumes an input tensor X and applies average pooling across"
@@ -1789,6 +1786,7 @@ def ONNXGlobalLpPoolOp:ONNX_Op<"GlobalLpPool",
 
 def ONNXGlobalMaxPoolOp:ONNX_Op<"GlobalMaxPool",
   [NoSideEffect, DeclareOpInterfaceMethods<ShapeInferenceOpInterface>]> {
+  let hasCanonicalizer = 1;
   let summary = "ONNX GlobalMaxPool operation";
   let description = [{
   "GlobalMaxPool consumes an input tensor X and applies max pooling across"

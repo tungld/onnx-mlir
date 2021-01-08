@@ -263,6 +263,14 @@ void omTensorSetStrides(OMTensor *tensor, int64_t *strides) {
     tensor->_strides[i] = strides[i];
 }
 
+/* OMTensor data strides setter with PyArray stride values */
+void omTensorSetStridesWithPyArrayStrides(OMTensor *tensor,
+  int64_t *stridesInBytes) {
+  for (int i = 0; i < tensor->_rank; i++)
+    tensor->_strides[i] =
+      stridesInBytes[i] / getDataTypeSize(tensor->_dataType);
+}
+
 /* OMTensor data type getter */
 OM_DATA_TYPE omTensorGetDataType(OMTensor *tensor) { return tensor->_dataType; }
 
