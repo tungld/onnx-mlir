@@ -77,18 +77,6 @@ struct ONNXConvOpLowering : public ConversionPattern {
       alloc = insertAllocAndDealloc(
           memRefType, loc, rewriter, insertDealloc, {inputOperand});
 
-    // Shape helper for bias addition which is unidirectional broadcasting.
-    ONNXOpBroadcastedShapeHelper shapeHelper(
-        &rewriter, loc, /*isUniBroadcasting=*/true);
-    if (hasBias) {
-      auto shapecomputed = shapeHelper.Compute({alloc, biasOperand});
-      (void)shapecomputed;
-      assert(succeeded(shapecomputed));
-    }
-
-    // Context for IndexExpr.
-    IndexExprContext ieContext(shapeHelper.context);
-
     // R = Conv(D, K)
     //
     // The input/output shapes will look like this:
@@ -154,6 +142,23 @@ struct ONNXConvOpLowering : public ConversionPattern {
 
     // Set up outermost loops: n g m r1 r2 ... rdim
     // Skip g if group is 1.
+
+    // Bias's shape is:
+    // - either [M] or
+    // - output shape [NxMxRHxRW] or its unidirectional broadcastable form.
+    // In case of unidirectional broadcasting, we use a shape helper to compute
+    // its access indices.
+    ONNXOpBroadcastedShapeHelper shapeHelper(
+        &rewriter, loc, /*isUniBroadcasting=*/true);
+    if (hasBias &&
+        biasOperand.getType().cast<ShapedType>().getShape().size() != 1) {
+      auto shapecomputed = shapeHelper.Compute({alloc, biasOperand});
+      (void)shapecomputed;
+      assert(succeeded(shapecomputed));
+    }
+
+    // Context for IndexExpr.
+    IndexExprContext ieContext(shapeHelper.context);
 
     // Before we start the iteration we need to compute the number of
     // unsplit kernels and fetch the number of groups from the attribute
@@ -287,8 +292,13 @@ struct ONNXConvOpLowering : public ConversionPattern {
         if (hasBias) {
           auto loadResult = ieContext.createLoadOp(alloc, resultIndices);
           SmallVector<IndexExpr, 4> biasIndices;
-          shapeHelper.GetAccessExprs(
-              ieContext, biasOperand, 1, resultIndices, biasIndices);
+          if (biasOperand.getType().cast<ShapedType>().getShape().size() == 1)
+            biasIndices.emplace_back(kernel);
+          else {
+            // Unidirectional broadcasting.
+            shapeHelper.GetAccessExprs(
+                ieContext, biasOperand, 1, resultIndices, biasIndices);
+          }
           auto loadBias = ieContext.createLoadOp(biasOperand, biasIndices);
           auto resultWithBias =
               rewriter.create<AddFOp>(loc, loadResult, loadBias);

@@ -24,6 +24,12 @@ include "src/Dialect/ONNX/ONNXOps.td"
 ///    dag benefitsAdded = (addBenefit 0)
 /// >;
 
+// Useful test definitions.
+
+def IsConstant :
+  Constraint<CPred<"dyn_cast_or_null<ONNXConstantOp>(($_self).getDefiningOp())">,
+  "operation is a constant">;
+
 // Usefult code generation invokation.
 def GetNullAttr : NativeCodeCall<"Attribute()">;
 
@@ -59,59 +65,31 @@ def FuseGemmFollowedByAddition : Pat<(ONNXAddOp (ONNXGemmOp:$res $m1, $m2, $none
 //===----------------------------------------------------------------------===//
 // Rules to fuse Conv and Add.
 //===----------------------------------------------------------------------===//
-// onnx.Add(%B, onnx.Conv(%X, %W, none)) = onnx.Conv(%X, %W, %B)
+// onnx.Add(%c, onnx.Conv(%X, %W, none)) = onnx.Conv(%X, %W, %c)
 def FuseConvFollowedByAddition1 : Pat<
 (ONNXAddOp
-   $b,
+   $c,
    (ONNXConvOp:$res
       $x, $w, $none,
       $auto_pad, $dilation, $group, $kernel_shape, $pads, $strides)),
 (ONNXConvOp
-   $x, $w, $b,
+   $x, $w, $c,
    $auto_pad, $dilation, $group, $kernel_shape, $pads, $strides),
-[(HasNoneType $none)],
-(addBenefit 3)
+[(HasNoneType $none), (IsConstant:$c)],
+(addBenefit 2)
 >;
 
-// onnx.Add(onnx.Conv(%X, %W, none), %B) = onnx.Conv(%X, %W, %B)
+// onnx.Add(onnx.Conv(%X, %W, none), %c) = onnx.Conv(%X, %W, %c)
 def FuseConvFollowedByAddition2 : Pat<
 (ONNXAddOp
    (ONNXConvOp
       $x, $w, $none,
       $auto_pad, $dilation, $group, $kernel_shape, $pads, $strides),
-   $b),
+   $c),
 (ONNXConvOp
-   $x, $w, $b,
+   $x, $w, $c,
    $auto_pad, $dilation, $group, $kernel_shape, $pads, $strides),
-[(HasNoneType $none)],
-(addBenefit 2)
->;
-
-// onnx.Add(%B1, onnx.Conv(%X, %W, %B2)) = onnx.Conv(%X, %W, onnx.Add(%B1, %B2))
-def FuseConvFollowedByAddition3 : Pat<
-(ONNXAddOp
-   $b1,
-   (ONNXConvOp
-      $x, $w, $b2,
-      $auto_pad, $dilation, $group, $kernel_shape, $pads, $strides)),
-(ONNXConvOp
-   $x, $w, (ONNXAddOp $b1, $b2),
-   $auto_pad, $dilation, $group, $kernel_shape, $pads, $strides),
-[],
-(addBenefit 1)
->;
-
-// onnx.Add(onnx.Conv(%X, %W, %B1), %B2) = onnx.Conv(%X, %W, onnx.Add(%B1, %B2))
-def FuseConvFollowedByAddition4 : Pat<
-(ONNXAddOp
-   (ONNXConvOp
-      $x, $w, $b1,
-      $auto_pad, $dilation, $group, $kernel_shape, $pads, $strides),
-   $b2),
-(ONNXConvOp
-   $x, $w, (ONNXAddOp $b1, $b2),
-   $auto_pad, $dilation, $group, $kernel_shape, $pads, $strides),
-[],
+[(HasNoneType $none), (IsConstant:$c)],
 (addBenefit 1)
 >;
 

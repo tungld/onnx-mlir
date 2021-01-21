@@ -67,8 +67,6 @@ void ONNXAddOp::getCanonicalizationPatterns(
   results.insert<MulAddToGemmOptPattern>(context);
   results.insert<FuseConvFollowedByAddition1>(context);
   results.insert<FuseConvFollowedByAddition2>(context);
-  results.insert<FuseConvFollowedByAddition3>(context);
-  results.insert<FuseConvFollowedByAddition4>(context);
 }
 
 void ONNXGemmOp::getCanonicalizationPatterns(
