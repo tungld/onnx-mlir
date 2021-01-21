@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "src/Conversion/ONNXToKrnl/ONNXToKrnlCommon.hpp"
+#include "src/Dialect/ONNX/ONNXShapeHelper.hpp"
 
 using namespace mlir;
 
@@ -55,9 +56,6 @@ struct ONNXConvOpLowering : public ConversionPattern {
     for (Attribute stride : stridesAttribute.getValue())
       strides.emplace_back(stride.cast<IntegerAttr>().getInt());
 
-    // Context for IndexExpr.
-    IndexExprContext ieContext(&rewriter, loc);
-
     // Spatial data starts from the second dimension.
     int spatialStartIndex = 2;
 
@@ -78,6 +76,18 @@ struct ONNXConvOpLowering : public ConversionPattern {
     else
       alloc = insertAllocAndDealloc(
           memRefType, loc, rewriter, insertDealloc, {inputOperand});
+
+    // Shape helper for bias addition which is unidirectional broadcasting.
+    ONNXOpBroadcastedShapeHelper shapeHelper(
+        &rewriter, loc, /*isUniBroadcasting=*/true);
+    if (hasBias) {
+      auto shapecomputed = shapeHelper.Compute({alloc, biasOperand});
+      (void)shapecomputed;
+      assert(succeeded(shapecomputed));
+    }
+
+    // Context for IndexExpr.
+    IndexExprContext ieContext(shapeHelper.context);
 
     // R = Conv(D, K)
     //
@@ -277,7 +287,8 @@ struct ONNXConvOpLowering : public ConversionPattern {
         if (hasBias) {
           auto loadResult = ieContext.createLoadOp(alloc, resultIndices);
           SmallVector<IndexExpr, 4> biasIndices;
-          biasIndices.emplace_back(kernel);
+          shapeHelper.GetAccessExprs(
+              ieContext, biasOperand, 1, resultIndices, biasIndices);
           auto loadBias = ieContext.createLoadOp(biasOperand, biasIndices);
           auto resultWithBias =
               rewriter.create<AddFOp>(loc, loadResult, loadBias);
