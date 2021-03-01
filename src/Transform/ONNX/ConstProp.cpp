@@ -49,6 +49,8 @@ namespace {
 // ConstProp.td for example.
 //
 
+const StringRef CONSTANT_ID_ATTR_NAME = "constantID";
+
 /// A helper function to contruct a RankedTensorType from a ShapedType.
 RankedTensorType constructRankedTensorType(ShapedType type) {
   assert(type.hasRank() && "Not a ranked type");
@@ -80,6 +82,13 @@ template <>
 int32_t getAttributeValue(Attribute attr) {
   return attr.cast<IntegerAttr>().getInt();
 }
+
+struct ConstPropONNXToONNXPass
+    : public PassWrapper<ConstPropONNXToONNXPass, FunctionPass> {
+  static int64_t constantID;
+  ConstPropONNXToONNXPass() { constantID = 0; }
+  void runOnFunction() final;
+};
 
 //===----------------------------------------------------------------------===//
 // Code to perform constant propagation for binary in presence of broadcast.
@@ -275,6 +284,7 @@ void IterateConstPropElementwiseBinary(PatternRewriter &rewriter,
 template <typename ElementwiseBinaryOp>
 DenseElementsAttr ConstPropElementwiseBinary(PatternRewriter &rewriter,
     Value resOperand, Attribute lhsAttr, Attribute rhsAttr) {
+  ConstPropONNXToONNXPass::constantID++;
   DenseElementsAttr lhsDenseAttr =
       lhsAttr.dyn_cast_or_null<mlir::DenseElementsAttr>();
   DenseElementsAttr rhsDenseAttr =
@@ -629,6 +639,17 @@ public:
   }
 };
 
+ONNXConstantOp CreateDenseONNXConstantOp(PatternRewriter &rewriter,
+    Location loc, Type outputType, Attribute denseAttr) {
+  ONNXConstantOp constOp =
+      rewriter.create<ONNXConstantOp>(loc, outputType, Attribute(), denseAttr);
+  constOp.getOperation()->setAttr(
+      CONSTANT_ID_ATTR_NAME, IntegerAttr::get(rewriter.getIntegerType(64, true),
+                                 ConstPropONNXToONNXPass::constantID));
+  ConstPropONNXToONNXPass::constantID++;
+  return constOp;
+}
+
 //===----------------------------------------------------------------------===//
 // Pattern definition.
 //===----------------------------------------------------------------------===//
@@ -639,11 +660,9 @@ public:
 // Code to manage the pass.
 //===----------------------------------------------------------------------===//
 
-struct ConstPropONNXToONNXPass
-    : public PassWrapper<ConstPropONNXToONNXPass, FunctionPass> {
-  void runOnFunction() final;
-};
 } // end anonymous namespace.
+
+int64_t ConstPropONNXToONNXPass::constantID;
 
 void ConstPropONNXToONNXPass::runOnFunction() {
   auto function = getFunction();
@@ -657,6 +676,13 @@ void ConstPropONNXToONNXPass::runOnFunction() {
   patterns.insert<ConstPropSplitPattern>(&getContext());
 
   applyPatternsAndFoldGreedily(function, std::move(patterns));
+
+  // Clean helper attributes.
+  ConstPropONNXToONNXPass::constantID = 0;
+  function.walk([&](ONNXConstantOp constOp) {
+    Operation *op = constOp.getOperation();
+    op->removeAttr(CONSTANT_ID_ATTR_NAME);
+  });
 } // end anonymous namespace
 
 /*!

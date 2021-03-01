@@ -57,8 +57,10 @@ def AttributeIsNull :
 def GetNullAttr : NativeCodeCall<"Attribute()">;
 
 // Create an dense ONNXConstantOp whose output type is the 1st argument's type.
+//def CreateDenseONNXConstantOp:
+//   NativeCodeCall<"$_builder.create<ONNXConstantOp>($0.getLoc(), $0.getType(), Attribute(), $1)">;
 def CreateDenseONNXConstantOp:
-   NativeCodeCall<"$_builder.create<ONNXConstantOp>($0.getLoc(), $0.getType(), Attribute(), $1)">;
+   NativeCodeCall<"CreateDenseONNXConstantOp($_builder, $0.getLoc(), $0.getType(), $1)">;
 
 def CreateAddOfTwoConst :
    NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXAddOp>($_builder, $0, $1, $2)">;
