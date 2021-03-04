@@ -56,12 +56,12 @@ namespace {
 const StringRef CONSTANT_ID_ATTR_NAME = "constantID";
 const StringRef CONSTANT_USERS_ATTR_NAME = "users";
 
-using OMTensorConstant = std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>;
+using OMConstant = std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>;
 
 struct ConstPropONNXToONNXPass
     : public PassWrapper<ConstPropONNXToONNXPass, FunctionPass> {
   static unsigned constantID;
-  static DenseMap<unsigned, OMTensorConstant> constantPool;
+  static DenseMap<unsigned, OMConstant> constantPool;
   static unsigned createOrGetOMTensor(PatternRewriter &rewriter, Operation *op);
   static unsigned createOMTensorFromAttribute(DenseElementsAttr attr);
   static OMTensor *getOMTensor(unsigned id);
@@ -70,7 +70,7 @@ struct ConstPropONNXToONNXPass
 };
 
 unsigned ConstPropONNXToONNXPass::constantID;
-DenseMap<unsigned, OMTensorConstant> ConstPropONNXToONNXPass::constantPool;
+DenseMap<unsigned, OMConstant> ConstPropONNXToONNXPass::constantPool;
 
 static OM_DATA_TYPE getOMDataType(Type elementType) {
   OM_DATA_TYPE dtype;
@@ -120,42 +120,22 @@ RankedTensorType constructRankedTensorType(ShapedType type) {
 /// A helper function to construct an OMTensor from a DenseElementsAttr.
 unsigned ConstPropONNXToONNXPass::createOMTensorFromAttribute(
     DenseElementsAttr attr) {
-  auto attrType = attr.getType().cast<ShapedType>();
-  auto elementType = attrType.getElementType();
-  std::vector<int64_t> shape = attrType.getShape();
+  Type elementType = attr.getType().cast<ShapedType>().getElementType();
+  std::vector<int64_t> shape = attr.getType().cast<ShapedType>().getShape();
 
-  // Construct an OMTensor.
-  std::vector<float> rawData;
-  int64_t elementCount = 1;
-  for (int i = 0; i < shape.size(); ++i) {
-    elementCount *= shape[i];
-  }
+  auto resOmt =
+      OMConstant(omTensorCreateWithShape<float>(shape), omTensorDestroy);
+  // copy data.
   if (elementType.isa<FloatType>()) {
     auto it = attr.getValues<FloatAttr>().begin();
-    for (int i = 0; i < elementCount; ++i) {
+    for (int64_t i = 0; i < omTensorGetNumElems(resOmt.get()); ++i) {
       float value = (float)(*it++).cast<FloatAttr>().getValueAsDouble();
-      rawData.emplace_back(value);
+      omTensorGetElemByOffset<float>(resOmt.get(), i) = value;
     }
   }
-  int owningData = 1;
-  OM_DATA_TYPE dtype = getOMDataType(elementType);
-  auto resOmt = OMTensorConstant(
-      omTensorCreateWithOwnership((void *)rawData.data(), shape.data(),
-          shape.size(), dtype, /*owning=*/owningData),
-      omTensorDestroy);
 
-  for (int i = 0; i < 4; ++i) {
-    float value = omTensorGetElem<float>(resOmt.get(), {i});
-    std::cout << "test: " << value << "\n";
-  }
   unsigned constantID = ConstPropONNXToONNXPass::constantID++;
-  ConstPropONNXToONNXPass::constantPool.insert({constantID, move(resOmt)});
-  OMTensor *omt = ConstPropONNXToONNXPass::getOMTensor(constantID);
-  std::cout << "constantID: " << constantID << "\n";
-  for (int i = 0; i < 4; ++i) {
-    float value = omTensorGetElem<float>(omt, {i});
-    std::cout << "after inserting: " << value << "\n";
-  }
+  ConstPropONNXToONNXPass::constantPool.insert({constantID, std::move(resOmt)});
 
   return constantID;
 }
@@ -591,13 +571,9 @@ OMTensor *ComputeConstPropElementwiseBinaryOp(
     // Calculate element-wise binary result.
     T lhsValue = omTensorGetElem<T>(lhsOmt, lhsIndices);
     T rhsValue = omTensorGetElem<T>(rhsOmt, rhsIndices);
-    std::cout << "lhs: " << lhsValue << "\n";
-    std::cout << "rhs: " << rhsValue << "\n";
     omTensorGetElem<T>(resOmt, outputIndices) =
         ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
             lhsValue, rhsValue);
-    std::cout << "result: " << omTensorGetElem<T>(resOmt, outputIndices)
-              << "\n";
   }
   return resOmt;
 }
@@ -616,17 +592,9 @@ ONNXConstantOp ConstPropElementwiseBinaryOp(
   unsigned lhsId =
       ConstPropONNXToONNXPass::createOrGetOMTensor(rewriter, lhsOp);
   OMTensor *lhsOmt = ConstPropONNXToONNXPass::getOMTensor(lhsId);
-  for (int i = 0; i < 4; ++i) {
-    float value = omTensorGetElem<float>(lhsOmt, {i});
-    std::cout << "reread lhs: " << value << "\n";
-  }
   unsigned rhsId =
       ConstPropONNXToONNXPass::createOrGetOMTensor(rewriter, rhsOp);
   OMTensor *rhsOmt = ConstPropONNXToONNXPass::getOMTensor(rhsId);
-  for (int i = 0; i < 4; ++i) {
-    float value = omTensorGetElem<float>(rhsOmt, {i});
-    std::cout << "reread rhs: " << value << "\n";
-  }
 
   // Do calculation.
   OMTensor *resOmt;
@@ -660,7 +628,7 @@ ONNXConstantOp ConstPropElementwiseBinaryOp(
   // Add the result to the constant pool.
   unsigned constantID = ConstPropONNXToONNXPass::constantID++;
   ConstPropONNXToONNXPass::constantPool.insert(
-      {constantID, move(OMTensorConstant(resOmt, omTensorDestroy))});
+      {constantID, move(OMConstant(resOmt, omTensorDestroy))});
 
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
@@ -1007,12 +975,6 @@ unsigned ConstPropONNXToONNXPass::createOrGetOMTensor(
             .dyn_cast_or_null<mlir::DenseElementsAttr>();
     constantID = ConstPropONNXToONNXPass::createOMTensorFromAttribute(dataAttr);
 
-    OMTensor *omt = ConstPropONNXToONNXPass::getOMTensor(constantID);
-    std::cout << "constantID: " << constantID << "\n";
-    for (int i = 0; i < 4; ++i) {
-      float value = omTensorGetElem<float>(omt, {i});
-      std::cout << "reread: " << value << "\n";
-    }
     // Insert an Attribute to the constant op for keeping the constant index of
     // the newly created OMTensor.
     op->setAttr(CONSTANT_ID_ATTR_NAME,
@@ -1045,6 +1007,7 @@ void ConstPropONNXToONNXPass::runOnFunction() {
 
   // Create DenseElementsAttr and clean up helper attributes.
   ConstPropONNXToONNXPass::constantID = 0;
+  // TODO: clean up the constant pool.
   function.walk([&](ONNXConstantOp constOp) {
     Operation *op = constOp.getOperation();
     Attribute constantIDAttr =
@@ -1056,8 +1019,8 @@ void ConstPropONNXToONNXPass::runOnFunction() {
       DenseElementsAttr denseAttr = createDenseElementsAttr(omt, outputType);
       op->setAttr("value", denseAttr);
     }
-    // op->removeAttr(CONSTANT_ID_ATTR_NAME);
-    // op->removeAttr(CONSTANT_USERS_ATTR_NAME);
+    //op->removeAttr(CONSTANT_ID_ATTR_NAME);
+    //op->removeAttr(CONSTANT_USERS_ATTR_NAME);
   });
 } // end anonymous namespace
 
