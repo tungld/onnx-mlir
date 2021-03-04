@@ -546,7 +546,7 @@ OMTensor *ComputeConstPropElementwiseBinaryOp(
   auto resOmt = omTensorCreateWithShape<T>(outputType.getShape());
 
   int64_t *lhsShape = omTensorGetShape(lhsOmt);
-  int64_t *rhsShape = omTensorGetShape(lhsOmt);
+  int64_t *rhsShape = omTensorGetShape(rhsOmt);
   int lhsRank = omTensorGetRank(lhsOmt);
   int rhsRank = omTensorGetRank(rhsOmt);
   int outputRank = outputType.getShape().size();
