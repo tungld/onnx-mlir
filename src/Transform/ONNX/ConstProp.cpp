@@ -93,6 +93,7 @@ struct ConstantPool {
   static OMTensor *get(unsigned id);
   static unsigned put(OMTensor *omt);
   static unsigned createOrGet(PatternRewriter &rewriter, Operation *op);
+  static bool erase(unsigned id);
   static void reset();
 };
 unsigned ConstantPool::header = 0;
@@ -114,6 +115,10 @@ unsigned ConstantPool::put(OMTensor *omt) {
 }
 
 void ConstantPool::reset() { ConstantPool::header = 0; }
+
+bool ConstantPool::erase(unsigned id) {
+  return ConstantPool::constantPool.erase(id);
+}
 
 /// Create or get a constant from in the constant pool.
 /// Return the constant index in the pool.
@@ -183,6 +188,14 @@ unsigned ConstantPool::createOrGet(PatternRewriter &rewriter, Operation *op) {
         IntegerAttr::get(
             rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
             constantID));
+    // Set the number of users.
+    int userCount = 0;
+    for (auto u : constOp.getResult().getUsers())
+      userCount++;
+    op->setAttr(CONSTANT_USERS_ATTR_NAME,
+        IntegerAttr::get(
+            rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
+            userCount));
   }
   return constantID;
 }
@@ -293,7 +306,8 @@ ONNXConstantOp CreateDenseONNXConstantOp(
     userCount++;
   constOp.getOperation()->setAttr(CONSTANT_USERS_ATTR_NAME,
       IntegerAttr::get(
-          rewriter.getIntegerType(/*width=*/64, /*isSigned=*/true), userCount));
+          rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
+          userCount));
   return constOp;
 }
 
@@ -654,7 +668,26 @@ ONNXConstantOp ConstPropElementwiseBinaryOp(
   ONNXConstantOp res =
       CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
 
-  // Clean up memory for lhs and rhs.
+  // Clean up memory for lhs and rhs if they are only used here.
+  Attribute constantIDAttr =
+      lhsOp->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
+  if (constantIDAttr) {
+    unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
+    Attribute refCountAttr =
+        lhsOp->getAttrOfType<::mlir::Attribute>(CONSTANT_USERS_ATTR_NAME);
+    if (refCountAttr && refCountAttr.cast<IntegerAttr>().getUInt() == 1)
+      ConstantPool::erase(constantID);
+  }
+  constantIDAttr =
+      rhsOp->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
+  if (constantIDAttr) {
+    unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
+    Attribute refCountAttr =
+        rhsOp->getAttrOfType<::mlir::Attribute>(CONSTANT_USERS_ATTR_NAME);
+    if (refCountAttr && refCountAttr.cast<IntegerAttr>().getUInt() == 1)
+      ConstantPool::erase(constantID);
+  }
+
   return res;
 }
 
@@ -1006,8 +1039,8 @@ void ConstPropONNXToONNXPass::runOnFunction() {
       DenseElementsAttr denseAttr = createDenseElementsAttr(omt, outputType);
       op->setAttr("value", denseAttr);
       op->removeAttr(CONSTANT_ID_ATTR_NAME);
+      op->removeAttr(CONSTANT_USERS_ATTR_NAME);
     }
-    op->removeAttr(CONSTANT_USERS_ATTR_NAME);
   });
   // TODO: clean up the constant pool.
   // ConstantPool::reset();
