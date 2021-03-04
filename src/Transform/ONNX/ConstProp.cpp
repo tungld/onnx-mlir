@@ -62,9 +62,6 @@ struct ConstPropONNXToONNXPass
     : public PassWrapper<ConstPropONNXToONNXPass, FunctionPass> {
   static unsigned constantID;
   static DenseMap<unsigned, OMConstant> constantPool;
-  static unsigned createOrGetOMTensor(PatternRewriter &rewriter, Operation *op);
-  static unsigned createOMTensorFromAttribute(DenseElementsAttr attr);
-  static OMTensor *getOMTensor(unsigned id);
   ConstPropONNXToONNXPass() { constantID = 0; }
   void runOnFunction() final;
 };
@@ -111,15 +108,17 @@ T getOMValue(OMTensor *omt, ArrayRef<int64_t> indices) {
   return *(dataPtr + position);
 }
 
-/// A helper function to contruct a RankedTensorType from a ShapedType.
-RankedTensorType constructRankedTensorType(ShapedType type) {
-  assert(type.hasRank() && "Not a ranked type");
-  return RankedTensorType::get(type.getShape(), type.getElementType());
+/// Helper functions to work with the constant pool.
+OMTensor *getOMTensor(unsigned id) {
+  auto it = ConstPropONNXToONNXPass::constantPool.find(id);
+  assert(it != ConstPropONNXToONNXPass::constantPool.end());
+  auto &omt = it->second;
+  return std::move(omt.get());
 }
 
-/// A helper function to construct an OMTensor from a DenseElementsAttr.
-unsigned ConstPropONNXToONNXPass::createOMTensorFromAttribute(
-    DenseElementsAttr attr) {
+/// Construct a constant from DenseElementsAtr and add it
+/// to the constant pool. 
+unsigned createOMTensorFromAttribute(DenseElementsAttr attr) {
   Type elementType = attr.getType().cast<ShapedType>().getElementType();
   std::vector<int64_t> shape = attr.getType().cast<ShapedType>().getShape();
 
@@ -138,6 +137,41 @@ unsigned ConstPropONNXToONNXPass::createOMTensorFromAttribute(
   ConstPropONNXToONNXPass::constantPool.insert({constantID, std::move(resOmt)});
 
   return constantID;
+}
+
+/// Create or get an item in the constant pool.
+unsigned createOrGetOMTensor(PatternRewriter &rewriter, Operation *op) {
+  ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
+  assert(constOp && "Not a constant operation");
+
+  Attribute constantIDAttr =
+      op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
+  unsigned constantID;
+  if (constantIDAttr) {
+    // The OMTensor for this constant op existed in the constant pool.
+    // Just get its index in the constant pool.
+    constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
+  } else {
+    // Create a new OMTensor, and add it to the constant pool.
+    DenseElementsAttr dataAttr =
+        op->getAttrOfType<::mlir::Attribute>("value")
+            .dyn_cast_or_null<mlir::DenseElementsAttr>();
+    constantID = createOMTensorFromAttribute(dataAttr);
+
+    // Insert an Attribute to the constant op for keeping the constant index of
+    // the newly created OMTensor.
+    op->setAttr(CONSTANT_ID_ATTR_NAME,
+        IntegerAttr::get(
+            rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
+            constantID));
+  }
+  return constantID;
+}
+
+/// A helper function to contruct a RankedTensorType from a ShapedType.
+RankedTensorType constructRankedTensorType(ShapedType type) {
+  assert(type.hasRank() && "Not a ranked type");
+  return RankedTensorType::get(type.getShape(), type.getElementType());
 }
 
 ///  A helper function to construct a DenseElementsAttr from an OMTensor..
@@ -589,12 +623,10 @@ ONNXConstantOp ConstPropElementwiseBinaryOp(
   Operation *rhsOp = rhs.getDefiningOp();
 
   // Get lhs and rhs values as OMTensors.
-  unsigned lhsId =
-      ConstPropONNXToONNXPass::createOrGetOMTensor(rewriter, lhsOp);
-  OMTensor *lhsOmt = ConstPropONNXToONNXPass::getOMTensor(lhsId);
-  unsigned rhsId =
-      ConstPropONNXToONNXPass::createOrGetOMTensor(rewriter, rhsOp);
-  OMTensor *rhsOmt = ConstPropONNXToONNXPass::getOMTensor(rhsId);
+  unsigned lhsId = createOrGetOMTensor(rewriter, lhsOp);
+  OMTensor *lhsOmt = getOMTensor(lhsId);
+  unsigned rhsId = createOrGetOMTensor(rewriter, rhsOp);
+  OMTensor *rhsOmt = getOMTensor(rhsId);
 
   // Do calculation.
   OMTensor *resOmt;
@@ -956,42 +988,6 @@ public:
 
 } // end anonymous namespace.
 
-unsigned ConstPropONNXToONNXPass::createOrGetOMTensor(
-    PatternRewriter &rewriter, Operation *op) {
-  ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
-  assert(constOp && "Not a constant operation");
-
-  Attribute constantIDAttr =
-      op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
-  unsigned constantID;
-  if (constantIDAttr) {
-    // The OMTensor for this constant op existed in the constant pool.
-    // Just get its index in the constant pool.
-    constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
-  } else {
-    // Create a new OMTensor, and add it to the constant pool.
-    DenseElementsAttr dataAttr =
-        op->getAttrOfType<::mlir::Attribute>("value")
-            .dyn_cast_or_null<mlir::DenseElementsAttr>();
-    constantID = ConstPropONNXToONNXPass::createOMTensorFromAttribute(dataAttr);
-
-    // Insert an Attribute to the constant op for keeping the constant index of
-    // the newly created OMTensor.
-    op->setAttr(CONSTANT_ID_ATTR_NAME,
-        IntegerAttr::get(
-            rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
-            constantID));
-  }
-  return constantID;
-}
-
-OMTensor *ConstPropONNXToONNXPass::getOMTensor(unsigned id) {
-  auto it = ConstPropONNXToONNXPass::constantPool.find(id);
-  assert(it != ConstPropONNXToONNXPass::constantPool.end());
-  auto &omt = it->second;
-  return std::move(omt.get());
-}
-
 void ConstPropONNXToONNXPass::runOnFunction() {
   auto function = getFunction();
   MLIRContext *context = &getContext();
@@ -1019,8 +1015,8 @@ void ConstPropONNXToONNXPass::runOnFunction() {
       DenseElementsAttr denseAttr = createDenseElementsAttr(omt, outputType);
       op->setAttr("value", denseAttr);
     }
-    //op->removeAttr(CONSTANT_ID_ATTR_NAME);
-    //op->removeAttr(CONSTANT_USERS_ATTR_NAME);
+    // op->removeAttr(CONSTANT_ID_ATTR_NAME);
+    // op->removeAttr(CONSTANT_USERS_ATTR_NAME);
   });
 } // end anonymous namespace
 
