@@ -57,13 +57,13 @@ def AttributeIsNull :
 def GetNullAttr : NativeCodeCall<"Attribute()">;
 
 // Create an dense ONNXConstantOp whose output type is the 1st argument's type.
-//def CreateDenseONNXConstantOp:
-//   NativeCodeCall<"$_builder.create<ONNXConstantOp>($0.getLoc(), $0.getType(), Attribute(), $1)">;
 def CreateDenseONNXConstantOp:
-   NativeCodeCall<"CreateDenseONNXConstantOp($_builder, $0.getLoc(), $0.getType(), $1)">;
+   NativeCodeCall<"$_builder.create<ONNXConstantOp>($0.getLoc(), $0.getType(), Attribute(), $1)">;
+//def CreateDenseONNXConstantOp:
+//   NativeCodeCall<"CreateDenseONNXConstantOp($_builder, $0, $1)">;
 
 def CreateAddOfTwoConst :
-   NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXAddOp>($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXAddOp>($_builder, $0, $1, $2)">;
 
 def CreateSubOfTwoConst :
    NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXSubOp>($_builder, $0, $1, $2)">;
@@ -147,9 +147,9 @@ def AddConstAssociative4 : Pat<
 // Constant Propagation for Add
 def AddConstProp : Pat<
     // From add(c1, c2).
-    (ONNXAddOp:$addOp (ONNXConstantOp $s1, $v1), (ONNXConstantOp $s2, $v2)),
+    (ONNXAddOp:$addOp (ONNXConstantOp:$lhs $s1, $v1), (ONNXConstantOp:$rhs $s2, $v2)),
     // To c1+c2
-    (CreateDenseONNXConstantOp $addOp, (CreateAddOfTwoConst $addOp, $v1, $v2)),
+    (CreateAddOfTwoConst $addOp, $lhs, $rhs),
     // Additional constraints (no sparse)
     [(AttributeIsNull:$s1), (AttributeIsNull:$s2)]>;
 

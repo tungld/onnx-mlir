@@ -22,10 +22,14 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "llvm/ADT/DenseMap.h"
 
+#include "onnx-mlir/Runtime/OMTensor.h"
 #include "src/Dialect/ONNX/ONNXOps.hpp"
 #include "src/Pass/Passes.hpp"
+#include "src/Runtime/OMTensorHelper.h"
 
+#include "llvm/ADT/SmallPtrSet.h"
 #include <math.h>
 
 using namespace mlir;
@@ -50,11 +54,151 @@ namespace {
 //
 
 const StringRef CONSTANT_ID_ATTR_NAME = "constantID";
+const StringRef CONSTANT_USERS_ATTR_NAME = "users";
+
+using OMTensorConstant = std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>;
+
+struct ConstPropONNXToONNXPass
+    : public PassWrapper<ConstPropONNXToONNXPass, FunctionPass> {
+  static unsigned constantID;
+  static DenseMap<unsigned, OMTensorConstant> constantPool;
+  static unsigned createOrGetOMTensor(PatternRewriter &rewriter, Operation *op);
+  static unsigned createOMTensorFromAttribute(DenseElementsAttr attr);
+  static OMTensor *getOMTensor(unsigned id);
+  ConstPropONNXToONNXPass() { constantID = 0; }
+  void runOnFunction() final;
+};
+
+unsigned ConstPropONNXToONNXPass::constantID;
+DenseMap<unsigned, OMTensorConstant> ConstPropONNXToONNXPass::constantPool;
+
+static OM_DATA_TYPE getOMDataType(Type elementType) {
+  OM_DATA_TYPE dtype;
+  if (elementType.isa<FloatType>()) {
+    // FloatType
+    FloatType floatTy = elementType.cast<FloatType>();
+    if (floatTy.getWidth() == 32) {
+      dtype = ONNX_TYPE_FLOAT;
+    } else if (floatTy.getWidth() == 64) {
+      dtype = ONNX_TYPE_DOUBLE;
+    } else
+      llvm_unreachable("Upsupported data type");
+  } else if (elementType.isa<IntegerType>()) {
+    // IntegerType
+    IntegerType intTy = elementType.cast<IntegerType>();
+    if (intTy.getWidth() == 32) {
+      dtype = ONNX_TYPE_INT32;
+    } else if (intTy.getWidth() == 64) {
+      dtype = ONNX_TYPE_INT64;
+    } else
+      llvm_unreachable("Upsupported data type");
+  } else
+    llvm_unreachable("Upsupported data type");
+  return dtype;
+}
+
+template <typename T>
+T getOMValue(OMTensor *omt, ArrayRef<int64_t> indices) {
+  int rank = omTensorGetRank(omt);
+  assert(rank == indices.size() && "Invalid indices");
+  int64_t *strides = omTensorGetStrides(omt);
+  T *dataPtr = reinterpret_cast<T *>(omTensorGetDataPtr(omt));
+
+  int64_t position = 0;
+  for (int i = 0; i < rank; ++i)
+    position += *(strides + i) * indices[i];
+
+  return *(dataPtr + position);
+}
 
 /// A helper function to contruct a RankedTensorType from a ShapedType.
 RankedTensorType constructRankedTensorType(ShapedType type) {
   assert(type.hasRank() && "Not a ranked type");
   return RankedTensorType::get(type.getShape(), type.getElementType());
+}
+
+/// A helper function to construct an OMTensor from a DenseElementsAttr.
+unsigned ConstPropONNXToONNXPass::createOMTensorFromAttribute(
+    DenseElementsAttr attr) {
+  auto attrType = attr.getType().cast<ShapedType>();
+  auto elementType = attrType.getElementType();
+  std::vector<int64_t> shape = attrType.getShape();
+
+  // Construct an OMTensor.
+  std::vector<float> rawData;
+  int64_t elementCount = 1;
+  for (int i = 0; i < shape.size(); ++i) {
+    elementCount *= shape[i];
+  }
+  if (elementType.isa<FloatType>()) {
+    auto it = attr.getValues<FloatAttr>().begin();
+    for (int i = 0; i < elementCount; ++i) {
+      float value = (float)(*it++).cast<FloatAttr>().getValueAsDouble();
+      rawData.emplace_back(value);
+    }
+  }
+  int owningData = 1;
+  OM_DATA_TYPE dtype = getOMDataType(elementType);
+  auto resOmt = OMTensorConstant(
+      omTensorCreateWithOwnership((void *)rawData.data(), shape.data(),
+          shape.size(), dtype, /*owning=*/owningData),
+      omTensorDestroy);
+
+  for (int i = 0; i < 4; ++i) {
+    float value = omTensorGetElem<float>(resOmt.get(), {i});
+    std::cout << "test: " << value << "\n";
+  }
+  unsigned constantID = ConstPropONNXToONNXPass::constantID++;
+  ConstPropONNXToONNXPass::constantPool.insert({constantID, move(resOmt)});
+  OMTensor *omt = ConstPropONNXToONNXPass::getOMTensor(constantID);
+  std::cout << "constantID: " << constantID << "\n";
+  for (int i = 0; i < 4; ++i) {
+    float value = omTensorGetElem<float>(omt, {i});
+    std::cout << "after inserting: " << value << "\n";
+  }
+
+  return constantID;
+}
+
+///  A helper function to construct a DenseElementsAttr from an OMTensor..
+static DenseElementsAttr createDenseElementsAttr(
+    OMTensor *omt, ShapedType outputType) {
+  RankedTensorType resType = constructRankedTensorType(outputType);
+  OM_DATA_TYPE dtype = omTensorGetDataType(omt);
+  int64_t numElements = omTensorGetNumElems(omt);
+  int rank = omTensorGetRank(omt);
+  // FloatType
+  if (resType.getElementType().isa<FloatType>()) {
+    FloatType floatTy = resType.getElementType().cast<FloatType>();
+    if (floatTy.getWidth() == 32) {
+      float *res = (float *)omTensorGetDataPtr(omt);
+      std::vector<float> resVector(res, res + numElements);
+      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
+    }
+    if (floatTy.getWidth() == 64) {
+      double *res = (double *)omTensorGetDataPtr(omt);
+      std::vector<double> resVector(res, res + numElements);
+      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
+    }
+  }
+
+  // IntegerType
+  if (resType.getElementType().isa<IntegerType>()) {
+    IntegerType intTy = resType.getElementType().cast<IntegerType>();
+    if (intTy.getWidth() == 32) {
+      int32_t *res = (int32_t *)omTensorGetDataPtr(omt);
+      std::vector<int32_t> resVector(res, res + numElements);
+      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
+    }
+    if (intTy.getWidth() == 64) {
+      int64_t *res = (int64_t *)omTensorGetDataPtr(omt);
+      std::vector<int64_t> resVector(res, res + numElements);
+      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
+    }
+  }
+
+  llvm_unreachable("Unknown data type");
+  return DenseElementsAttr();
 }
 
 /// A helper function to get a value of a given type from an attribute.
@@ -83,12 +227,68 @@ int32_t getAttributeValue(Attribute attr) {
   return attr.cast<IntegerAttr>().getInt();
 }
 
-struct ConstPropONNXToONNXPass
-    : public PassWrapper<ConstPropONNXToONNXPass, FunctionPass> {
-  static int64_t constantID;
-  ConstPropONNXToONNXPass() { constantID = 0; }
-  void runOnFunction() final;
-};
+ONNXConstantOp CreateDenseONNXConstantOp(
+    PatternRewriter &rewriter, Value replacingValue, unsigned constantID) {
+  Location loc = replacingValue.getLoc();
+  ShapedType outputType = replacingValue.getType().cast<ShapedType>();
+  ArrayRef<int64_t> shape = outputType.getShape();
+  Type elementType = outputType.getElementType();
+
+  int64_t elementCount = 1;
+  for (int i = 0; i < shape.size(); ++i)
+    elementCount *= shape[i];
+
+  // A DenseElementsAttr is just to make ONNXConstantOp legal. We don't use its
+  // value for computation. Real value will be obtained from the constant pool.
+  // This DenseElementsAttr is created so that it consumes memory as little as
+  // possbile.
+  DenseElementsAttr denseAttr;
+  if (elementType.isa<FloatType>()) {
+    // FloatType
+    FloatType floatTy = elementType.cast<FloatType>();
+    if (floatTy.getWidth() == 32) {
+      std::vector<float> data(elementCount, 0.0);
+      denseAttr = mlir::DenseElementsAttr::get<float>(
+          outputType, llvm::makeArrayRef(data));
+    } else if (floatTy.getWidth() == 64) {
+      std::vector<double> data(elementCount, 0.0);
+      denseAttr = mlir::DenseElementsAttr::get<double>(
+          outputType, llvm::makeArrayRef(data));
+    } else
+      llvm_unreachable("Upsupported data type");
+  } else if (elementType.isa<IntegerType>()) {
+    // IntegerType
+    IntegerType intTy = elementType.cast<IntegerType>();
+    if (intTy.getWidth() == 32) {
+      std::vector<int32_t> data(elementCount, 0);
+      denseAttr = mlir::DenseElementsAttr::get<int32_t>(
+          outputType, llvm::makeArrayRef(data));
+    } else if (intTy.getWidth() == 64) {
+      std::vector<int64_t> data(elementCount, 0);
+      denseAttr = mlir::DenseElementsAttr::get<int64_t>(
+          outputType, llvm::makeArrayRef(data));
+    } else
+      llvm_unreachable("Upsupported data type");
+  } else
+    llvm_unreachable("Upsupported data type");
+
+  ONNXConstantOp constOp =
+      rewriter.create<ONNXConstantOp>(loc, outputType, Attribute(), denseAttr);
+
+  // Set constant index in the constant pool.
+  constOp.getOperation()->setAttr(CONSTANT_ID_ATTR_NAME,
+      IntegerAttr::get(
+          rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
+          constantID));
+  // Set the number of users.
+  int userCount = 0;
+  for (auto u : replacingValue.getUsers())
+    userCount++;
+  constOp.getOperation()->setAttr(CONSTANT_USERS_ATTR_NAME,
+      IntegerAttr::get(
+          rewriter.getIntegerType(/*width=*/64, /*isSigned=*/true), userCount));
+  return constOp;
+}
 
 //===----------------------------------------------------------------------===//
 // Code to perform constant propagation for binary in presence of broadcast.
@@ -331,6 +531,143 @@ DenseElementsAttr ConstPropElementwiseBinary(PatternRewriter &rewriter,
   }
 
   llvm_unreachable("Unknown data type");
+}
+
+template <typename ElementwiseBinaryOp, typename T>
+OMTensor *ComputeConstPropElementwiseBinaryOp(
+    OMTensor *lhsOmt, OMTensor *rhsOmt, ShapedType outputType) {
+  std::vector<int64_t> outputShape = outputType.getShape();
+  int outputRank = outputShape.size();
+  Type elementType = outputType.getElementType();
+  int64_t *lhsShape = omTensorGetShape(lhsOmt);
+  int64_t *rhsShape = omTensorGetShape(lhsOmt);
+  int lhsRank = omTensorGetRank(lhsOmt);
+  int rhsRank = omTensorGetRank(rhsOmt);
+
+  // Initialize a result OMTensor.
+  auto resOmt = omTensorCreateWithShape<T>(outputShape);
+
+  // Check broadcasting.
+  bool broadcasting = false;
+  if (lhsRank != rhsRank)
+    broadcasting = true;
+  else
+    for (int i = 0; i < outputRank; ++i)
+      if (*(lhsShape + i) != *(rhsShape + i)) {
+        broadcasting = true;
+        break;
+      }
+
+  for (const auto &outputIndices : omTensorComputeIndexSet(resOmt)) {
+    // Compute indices to access inputs.
+    std::vector<int64_t> lhsIndices, rhsIndices;
+    if (!broadcasting)
+      for (int k = 0; k < outputRank; ++k) {
+        lhsIndices.emplace_back(outputIndices[k]);
+        rhsIndices.emplace_back(outputIndices[k]);
+      }
+    else
+      for (int k = 0; k < outputRank; ++k) {
+        // in the lhs index range.
+        if (k >= outputRank - lhsRank) {
+          int lhsIndex = k - outputRank + lhsRank;
+          if (*(lhsShape + lhsIndex) == 1)
+            // broadcast
+            lhsIndices.emplace_back(0);
+          else
+            lhsIndices.emplace_back(outputIndices[k]);
+        }
+        // in the rhs index range.
+        if (k >= outputRank - rhsRank) {
+          int rhsIndex = k - outputRank + rhsRank;
+          if (*(rhsShape + rhsIndex) == 1)
+            // broadcast
+            rhsIndices.emplace_back(0);
+          else
+            rhsIndices.emplace_back(outputIndices[k]);
+        }
+      }
+
+    // Calculate element-wise binary result.
+    T lhsValue = omTensorGetElem<T>(lhsOmt, lhsIndices);
+    T rhsValue = omTensorGetElem<T>(rhsOmt, rhsIndices);
+    std::cout << "lhs: " << lhsValue << "\n";
+    std::cout << "rhs: " << rhsValue << "\n";
+    omTensorGetElem<T>(resOmt, outputIndices) =
+        ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
+            lhsValue, rhsValue);
+    std::cout << "result: " << omTensorGetElem<T>(resOmt, outputIndices)
+              << "\n";
+  }
+  return resOmt;
+}
+
+/// Do element-wise binary calculation of 'lhs' and 'rhs' values and create an
+/// ONNXConstantOp for the result.
+template <typename ElementwiseBinaryOp>
+ONNXConstantOp ConstPropElementwiseBinaryOp(
+    PatternRewriter &rewriter, Value replacingValue, Value lhs, Value rhs) {
+  ShapedType outputType = replacingValue.getType().cast<ShapedType>();
+  Type elementType = outputType.getElementType();
+  Operation *lhsOp = lhs.getDefiningOp();
+  Operation *rhsOp = rhs.getDefiningOp();
+
+  // Get lhs and rhs values as OMTensors.
+  unsigned lhsId =
+      ConstPropONNXToONNXPass::createOrGetOMTensor(rewriter, lhsOp);
+  OMTensor *lhsOmt = ConstPropONNXToONNXPass::getOMTensor(lhsId);
+  for (int i = 0; i < 4; ++i) {
+    float value = omTensorGetElem<float>(lhsOmt, {i});
+    std::cout << "reread lhs: " << value << "\n";
+  }
+  unsigned rhsId =
+      ConstPropONNXToONNXPass::createOrGetOMTensor(rewriter, rhsOp);
+  OMTensor *rhsOmt = ConstPropONNXToONNXPass::getOMTensor(rhsId);
+  for (int i = 0; i < 4; ++i) {
+    float value = omTensorGetElem<float>(rhsOmt, {i});
+    std::cout << "reread rhs: " << value << "\n";
+  }
+
+  // Do calculation.
+  OMTensor *resOmt;
+  if (elementType.isa<FloatType>()) {
+    // FloatType
+    FloatType floatTy = elementType.cast<FloatType>();
+    if (floatTy.getWidth() == 32) {
+      resOmt = ComputeConstPropElementwiseBinaryOp<ElementwiseBinaryOp, float>(
+          lhsOmt, rhsOmt, outputType);
+    }
+    if (floatTy.getWidth() == 64) {
+      resOmt = ComputeConstPropElementwiseBinaryOp<ElementwiseBinaryOp, double>(
+          lhsOmt, rhsOmt, outputType);
+    }
+  } else if (elementType.isa<IntegerType>()) {
+    // IntegerType
+    IntegerType intTy = elementType.cast<IntegerType>();
+    if (intTy.getWidth() == 32) {
+      resOmt =
+          ComputeConstPropElementwiseBinaryOp<ElementwiseBinaryOp, int32_t>(
+              lhsOmt, rhsOmt, outputType);
+    }
+    if (intTy.getWidth() == 64) {
+      resOmt =
+          ComputeConstPropElementwiseBinaryOp<ElementwiseBinaryOp, int64_t>(
+              lhsOmt, rhsOmt, outputType);
+    }
+  } else
+    llvm_unreachable("Unknown data type");
+
+  // Add the result to the constant pool.
+  unsigned constantID = ConstPropONNXToONNXPass::constantID++;
+  ConstPropONNXToONNXPass::constantPool.insert(
+      {constantID, move(OMTensorConstant(resOmt, omTensorDestroy))});
+
+  // Construct a new ONNXConstantOp.
+  ONNXConstantOp res =
+      CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
+
+  // Clean up memory for lhs and rhs.
+  return res;
 }
 
 //===----------------------------------------------------------------------===//
@@ -639,17 +976,6 @@ public:
   }
 };
 
-ONNXConstantOp CreateDenseONNXConstantOp(PatternRewriter &rewriter,
-    Location loc, Type outputType, Attribute denseAttr) {
-  ONNXConstantOp constOp =
-      rewriter.create<ONNXConstantOp>(loc, outputType, Attribute(), denseAttr);
-  constOp.getOperation()->setAttr(
-      CONSTANT_ID_ATTR_NAME, IntegerAttr::get(rewriter.getIntegerType(64, true),
-                                 ConstPropONNXToONNXPass::constantID));
-  ConstPropONNXToONNXPass::constantID++;
-  return constOp;
-}
-
 //===----------------------------------------------------------------------===//
 // Pattern definition.
 //===----------------------------------------------------------------------===//
@@ -662,7 +988,47 @@ ONNXConstantOp CreateDenseONNXConstantOp(PatternRewriter &rewriter,
 
 } // end anonymous namespace.
 
-int64_t ConstPropONNXToONNXPass::constantID;
+unsigned ConstPropONNXToONNXPass::createOrGetOMTensor(
+    PatternRewriter &rewriter, Operation *op) {
+  ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
+  assert(constOp && "Not a constant operation");
+
+  Attribute constantIDAttr =
+      op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
+  unsigned constantID;
+  if (constantIDAttr) {
+    // The OMTensor for this constant op existed in the constant pool.
+    // Just get its index in the constant pool.
+    constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
+  } else {
+    // Create a new OMTensor, and add it to the constant pool.
+    DenseElementsAttr dataAttr =
+        op->getAttrOfType<::mlir::Attribute>("value")
+            .dyn_cast_or_null<mlir::DenseElementsAttr>();
+    constantID = ConstPropONNXToONNXPass::createOMTensorFromAttribute(dataAttr);
+
+    OMTensor *omt = ConstPropONNXToONNXPass::getOMTensor(constantID);
+    std::cout << "constantID: " << constantID << "\n";
+    for (int i = 0; i < 4; ++i) {
+      float value = omTensorGetElem<float>(omt, {i});
+      std::cout << "reread: " << value << "\n";
+    }
+    // Insert an Attribute to the constant op for keeping the constant index of
+    // the newly created OMTensor.
+    op->setAttr(CONSTANT_ID_ATTR_NAME,
+        IntegerAttr::get(
+            rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
+            constantID));
+  }
+  return constantID;
+}
+
+OMTensor *ConstPropONNXToONNXPass::getOMTensor(unsigned id) {
+  auto it = ConstPropONNXToONNXPass::constantPool.find(id);
+  assert(it != ConstPropONNXToONNXPass::constantPool.end());
+  auto &omt = it->second;
+  return std::move(omt.get());
+}
 
 void ConstPropONNXToONNXPass::runOnFunction() {
   auto function = getFunction();
@@ -677,11 +1043,21 @@ void ConstPropONNXToONNXPass::runOnFunction() {
 
   applyPatternsAndFoldGreedily(function, std::move(patterns));
 
-  // Clean helper attributes.
+  // Create DenseElementsAttr and clean up helper attributes.
   ConstPropONNXToONNXPass::constantID = 0;
   function.walk([&](ONNXConstantOp constOp) {
     Operation *op = constOp.getOperation();
-    op->removeAttr(CONSTANT_ID_ATTR_NAME);
+    Attribute constantIDAttr =
+        op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
+    if (constantIDAttr) {
+      unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
+      OMTensor *omt = getOMTensor(constantID);
+      ShapedType outputType = constOp.getResult().getType().cast<ShapedType>();
+      DenseElementsAttr denseAttr = createDenseElementsAttr(omt, outputType);
+      op->setAttr("value", denseAttr);
+    }
+    // op->removeAttr(CONSTANT_ID_ATTR_NAME);
+    // op->removeAttr(CONSTANT_USERS_ATTR_NAME);
   });
 } // end anonymous namespace
 
