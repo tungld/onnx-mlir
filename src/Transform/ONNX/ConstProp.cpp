@@ -56,69 +56,24 @@ namespace {
 const StringRef CONSTANT_ID_ATTR_NAME = "constantID";
 const StringRef CONSTANT_USERS_ATTR_NAME = "users";
 
+//===----------------------------------------------------------------------===//
+// Code for a constant pool to store intermediate constants.
+//===----------------------------------------------------------------------===//
 using OMConstant = std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>;
+static unsigned constantPoolID = 0;
+static DenseMap<unsigned, OMConstant> constantPool;
 
-struct ConstPropONNXToONNXPass
-    : public PassWrapper<ConstPropONNXToONNXPass, FunctionPass> {
-  static unsigned constantID;
-  static DenseMap<unsigned, OMConstant> constantPool;
-  ConstPropONNXToONNXPass() { constantID = 0; }
-  void runOnFunction() final;
-};
-
-unsigned ConstPropONNXToONNXPass::constantID;
-DenseMap<unsigned, OMConstant> ConstPropONNXToONNXPass::constantPool;
-
-static OM_DATA_TYPE getOMDataType(Type elementType) {
-  OM_DATA_TYPE dtype;
-  if (elementType.isa<FloatType>()) {
-    // FloatType
-    FloatType floatTy = elementType.cast<FloatType>();
-    if (floatTy.getWidth() == 32) {
-      dtype = ONNX_TYPE_FLOAT;
-    } else if (floatTy.getWidth() == 64) {
-      dtype = ONNX_TYPE_DOUBLE;
-    } else
-      llvm_unreachable("Upsupported data type");
-  } else if (elementType.isa<IntegerType>()) {
-    // IntegerType
-    IntegerType intTy = elementType.cast<IntegerType>();
-    if (intTy.getWidth() == 32) {
-      dtype = ONNX_TYPE_INT32;
-    } else if (intTy.getWidth() == 64) {
-      dtype = ONNX_TYPE_INT64;
-    } else
-      llvm_unreachable("Upsupported data type");
-  } else
-    llvm_unreachable("Upsupported data type");
-  return dtype;
-}
-
-template <typename T>
-T getOMValue(OMTensor *omt, ArrayRef<int64_t> indices) {
-  int rank = omTensorGetRank(omt);
-  assert(rank == indices.size() && "Invalid indices");
-  int64_t *strides = omTensorGetStrides(omt);
-  T *dataPtr = reinterpret_cast<T *>(omTensorGetDataPtr(omt));
-
-  int64_t position = 0;
-  for (int i = 0; i < rank; ++i)
-    position += *(strides + i) * indices[i];
-
-  return *(dataPtr + position);
-}
-
-/// Helper functions to work with the constant pool.
-OMTensor *getOMTensor(unsigned id) {
-  auto it = ConstPropONNXToONNXPass::constantPool.find(id);
-  assert(it != ConstPropONNXToONNXPass::constantPool.end());
+/// Get a constant as OMTensor from the constant pool using index.
+static OMTensor *getOMTensor(unsigned id) {
+  auto it = constantPool.find(id);
+  assert(it != constantPool.end());
   auto &omt = it->second;
   return std::move(omt.get());
 }
 
-/// Construct a constant from DenseElementsAtr and add it
-/// to the constant pool. 
-unsigned createOMTensorFromAttribute(DenseElementsAttr attr) {
+/// Construct a constant from DenseElementsAtr and add it to the constant pool.
+/// Return the constant index in the pool.
+static unsigned createOMTensorFromAttribute(DenseElementsAttr attr) {
   Type elementType = attr.getType().cast<ShapedType>().getElementType();
   std::vector<int64_t> shape = attr.getType().cast<ShapedType>().getShape();
 
@@ -133,14 +88,15 @@ unsigned createOMTensorFromAttribute(DenseElementsAttr attr) {
     }
   }
 
-  unsigned constantID = ConstPropONNXToONNXPass::constantID++;
-  ConstPropONNXToONNXPass::constantPool.insert({constantID, std::move(resOmt)});
+  unsigned constantID = constantPoolID++;
+  constantPool.insert({constantID, std::move(resOmt)});
 
   return constantID;
 }
 
-/// Create or get an item in the constant pool.
-unsigned createOrGetOMTensor(PatternRewriter &rewriter, Operation *op) {
+/// Create or get a constant from in the constant pool.
+/// Return the constant index in the pool.
+static unsigned createOrGetOMTensor(PatternRewriter &rewriter, Operation *op) {
   ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
   assert(constOp && "Not a constant operation");
 
@@ -174,7 +130,7 @@ RankedTensorType constructRankedTensorType(ShapedType type) {
   return RankedTensorType::get(type.getShape(), type.getElementType());
 }
 
-///  A helper function to construct a DenseElementsAttr from an OMTensor..
+///  A helper function to construct a DenseElementsAttr from an OMTensor.
 static DenseElementsAttr createDenseElementsAttr(
     OMTensor *omt, ShapedType outputType) {
   RankedTensorType resType = constructRankedTensorType(outputType);
@@ -498,7 +454,7 @@ void IterateConstPropElementwiseBinary(PatternRewriter &rewriter,
 template <typename ElementwiseBinaryOp>
 DenseElementsAttr ConstPropElementwiseBinary(PatternRewriter &rewriter,
     Value resOperand, Attribute lhsAttr, Attribute rhsAttr) {
-  ConstPropONNXToONNXPass::constantID++;
+  constantPoolID++;
   DenseElementsAttr lhsDenseAttr =
       lhsAttr.dyn_cast_or_null<mlir::DenseElementsAttr>();
   DenseElementsAttr rhsDenseAttr =
@@ -658,9 +614,8 @@ ONNXConstantOp ConstPropElementwiseBinaryOp(
     llvm_unreachable("Unknown data type");
 
   // Add the result to the constant pool.
-  unsigned constantID = ConstPropONNXToONNXPass::constantID++;
-  ConstPropONNXToONNXPass::constantPool.insert(
-      {constantID, move(OMConstant(resOmt, omTensorDestroy))});
+  unsigned constantID = constantPoolID++;
+  constantPool.insert({constantID, move(OMConstant(resOmt, omTensorDestroy))});
 
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
@@ -986,6 +941,10 @@ public:
 // Code to manage the pass.
 //===----------------------------------------------------------------------===//
 
+struct ConstPropONNXToONNXPass
+    : public PassWrapper<ConstPropONNXToONNXPass, FunctionPass> {
+  void runOnFunction() final;
+};
 } // end anonymous namespace.
 
 void ConstPropONNXToONNXPass::runOnFunction() {
@@ -1002,7 +961,7 @@ void ConstPropONNXToONNXPass::runOnFunction() {
   applyPatternsAndFoldGreedily(function, std::move(patterns));
 
   // Create DenseElementsAttr and clean up helper attributes.
-  ConstPropONNXToONNXPass::constantID = 0;
+  constantPoolID = 0;
   // TODO: clean up the constant pool.
   function.walk([&](ONNXConstantOp constOp) {
     Operation *op = constOp.getOperation();
