@@ -84,11 +84,9 @@ int32_t getAttrValue(Attribute attr) {
 //===----------------------------------------------------------------------===//
 // Code for a constant pool to store intermediate constants.
 //===----------------------------------------------------------------------===//
-using OMConstant = std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>;
-
 struct ConstantPool {
   static unsigned header;
-  static DenseMap<unsigned, OMConstant> storage;
+  static DenseMap<unsigned, OMTensor *> storage;
   static OMTensor *get(unsigned id);
   static unsigned put(OMTensor *omt);
   static unsigned createOrGet(PatternRewriter &rewriter, Operation *op);
@@ -97,22 +95,24 @@ struct ConstantPool {
   static void reset();
 };
 unsigned ConstantPool::header = 0;
-DenseMap<unsigned, OMConstant> ConstantPool::storage;
+DenseMap<unsigned, OMTensor *> ConstantPool::storage;
 
 /// Get a constant by index from the constant pool.
 OMTensor *ConstantPool::get(unsigned id) {
   auto it = ConstantPool::storage.find(id);
-  assert(it != ConstantPool::storage.end());
-  auto &omt = it->second;
-  return std::move(omt.get());
+  if (it != ConstantPool::storage.end())
+    return it->second;
+  else
+    return nullptr;
 }
 
 /// Put a constant to the constant pool.
 /// Return the constant index in the pool.
 unsigned ConstantPool::put(OMTensor *omt) {
-  auto resOmt = OMConstant(omt, omTensorDestroy);
-  unsigned constantID = ConstantPool::header++;
-  ConstantPool::storage.insert({constantID, std::move(resOmt)});
+  unsigned constantID = ConstantPool::header;
+  ConstantPool::storage.insert({constantID, omt});
+  // Move header forward.
+  ConstantPool::header += 1;
   return constantID;
 }
 
@@ -120,7 +120,13 @@ void ConstantPool::reset() { ConstantPool::header = 0; }
 
 /// Erase a constant by index.
 bool ConstantPool::erase(unsigned id) {
-  return ConstantPool::storage.erase(id);
+  OMTensor *omt = ConstantPool::get(id);
+  if (omt) {
+    ConstantPool::storage.erase(id);
+    omTensorDestroy(omt);
+    return true;
+  }
+  return false;
 }
 
 /// Update an ONNXConstantOp.
@@ -135,7 +141,7 @@ bool ConstantPool::update(PatternRewriter &rewriter, Operation *op) {
     Attribute refCountAttr =
         op->getAttrOfType<::mlir::Attribute>(CONSTANT_USERS_ATTR_NAME);
     if (refCountAttr) {
-      int refCount = refCountAttr && refCountAttr.cast<IntegerAttr>().getUInt();
+      int refCount = refCountAttr.cast<IntegerAttr>().getUInt();
       if (refCount == 1)
         ConstantPool::erase(constantID);
       else
@@ -456,8 +462,10 @@ ONNXConstantOp ConstPropElementwiseBinary(
   // Get lhs and rhs values as OMTensors.
   unsigned lhsId = ConstantPool::createOrGet(rewriter, lhsOp);
   OMTensor *lhsOmt = ConstantPool::get(lhsId);
+  assert(lhsOmt && "LHS null pointer");
   unsigned rhsId = ConstantPool::createOrGet(rewriter, rhsOp);
   OMTensor *rhsOmt = ConstantPool::get(rhsId);
+  assert(rhsOmt && "RHS null pointer");
 
   // Do calculation.
   OMTensor *resOmt;
@@ -644,17 +652,62 @@ DenseElementsAttr ConstPropTranspose(PatternRewriter &rewriter,
 // Code to perform constant propagation for unsqueeze.
 //===----------------------------------------------------------------------===//
 
-DenseElementsAttr ConstPropUnsqueeze(
-    PatternRewriter &rewriter, Value resOperand, Attribute attr) {
-  // Read dense attribute, the constant tensor we are transforming.
-  DenseElementsAttr denseAttr =
-      attr.dyn_cast_or_null<mlir::DenseElementsAttr>();
-  assert(denseAttr && "expected dense attribute");
-  RankedTensorType resType =
-      constructRankedTensorType(resOperand.getType().cast<ShapedType>());
+template <typename T>
+OMTensor *IterateConstPropUnsqueeze(OMTensor *omt, Type outputType) {
+  // Initialize a result OMTensor.
+  auto outputShape = outputType.cast<ShapedType>().getShape();
+  OMTensor *resOmt = omTensorCreateWithShape<T>(outputShape);
+  for (int64_t i = 0; i < omTensorGetNumElems(resOmt); ++i) {
+    T value = omTensorGetElemByOffset<T>(omt, i);
+    omTensorGetElemByOffset<T>(resOmt, i) = value;
+  }
+  return resOmt;
+}
 
-  // Unqueeze does not change the order of access, so just reshape.
-  return denseAttr.reshape(resType);
+ONNXConstantOp ConstPropUnsqueeze(
+    PatternRewriter &rewriter, Value replacingValue, Value input) {
+  Type outputType = replacingValue.getType();
+  Type elementType = outputType.cast<ShapedType>().getElementType();
+  Operation *inputOp = input.getDefiningOp();
+
+  // Get input value as OMTensor.
+  unsigned inputId = ConstantPool::createOrGet(rewriter, inputOp);
+  OMTensor *inputOmt = ConstantPool::get(inputId);
+
+  // Do calculation.
+  OMTensor *resOmt;
+  if (elementType.isa<FloatType>()) {
+    // FloatType
+    FloatType floatTy = elementType.cast<FloatType>();
+    if (floatTy.getWidth() == 32) {
+      resOmt = IterateConstPropUnsqueeze<float>(inputOmt, outputType);
+    }
+    if (floatTy.getWidth() == 64) {
+      resOmt = IterateConstPropUnsqueeze<double>(inputOmt, outputType);
+    }
+  } else if (elementType.isa<IntegerType>()) {
+    // IntegerType
+    IntegerType intTy = elementType.cast<IntegerType>();
+    if (intTy.getWidth() == 32) {
+      resOmt = IterateConstPropUnsqueeze<int32_t>(inputOmt, outputType);
+    }
+    if (intTy.getWidth() == 64) {
+      resOmt = IterateConstPropUnsqueeze<int64_t>(inputOmt, outputType);
+    }
+  } else
+    llvm_unreachable("Unknown data type");
+
+  // Add the result to the constant pool.
+  unsigned constantID = ConstantPool::put(resOmt);
+
+  // Construct a new ONNXConstantOp.
+  ONNXConstantOp res =
+      CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
+
+  // Clean up memory for input if it is only used here.
+  ConstantPool::update(rewriter, inputOp);
+
+  return res;
 }
 
 //===----------------------------------------------------------------------===//
@@ -832,6 +885,7 @@ void ConstPropONNXToONNXPass::runOnFunction() {
       op->setAttr("value", denseAttr);
       op->removeAttr(CONSTANT_ID_ATTR_NAME);
       op->removeAttr(CONSTANT_USERS_ATTR_NAME);
+      ConstantPool::erase(constantID);
     }
   });
   // TODO: clean up the constant pool.
