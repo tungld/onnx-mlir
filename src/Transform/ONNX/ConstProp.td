@@ -59,14 +59,12 @@ def GetNullAttr : NativeCodeCall<"Attribute()">;
 // Create an dense ONNXConstantOp whose output type is the 1st argument's type.
 def CreateDenseONNXConstantOp:
    NativeCodeCall<"$_builder.create<ONNXConstantOp>($0.getLoc(), $0.getType(), Attribute(), $1)">;
-//def CreateDenseONNXConstantOp:
-//   NativeCodeCall<"CreateDenseONNXConstantOp($_builder, $0, $1)">;
 
 def CreateAddOfTwoConst :
-   NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXAddOp>($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXAddOp>($_builder, $0, $1, $2)">;
 
 def CreateSubOfTwoConst :
-   NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXSubOp>($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXSubOp>($_builder, $0, $1, $2)">;
 
 def CreateNegOfConst :
    NativeCodeCall<"ConstPropElementwiseUnary<mlir::ONNXNegOp>($_builder, $0, $1)">;
@@ -75,10 +73,10 @@ def CreateSqrtOfConst :
    NativeCodeCall<"ConstPropElementwiseUnary<mlir::ONNXSqrtOp>($_builder, $0, $1)">;
 
 def CreateMulOfTwoConst :
-   NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXMulOp>($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXMulOp>($_builder, $0, $1, $2)">;
 
 def CreateDivOfTwoConst :
-   NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXDivOp>($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXDivOp>($_builder, $0, $1, $2)">;
 
 def CreateTransposeOfConst :
    NativeCodeCall<"ConstPropTranspose($_builder, $0, $1, $2)">;
@@ -171,7 +169,7 @@ def NegofConst :  Pat<
     // From - (c)
     (ONNXNegOp:$negOp (ONNXConstantOp:$constOp $s, $v)),
     // To (-c)
-    (CreateDenseONNXConstantOp $negOp, (CreateNegOfConst $constOp, $v)),
+    (CreateNegOfConst $negOp, $constOp),
     [(AttributeIsNull:$s)]>;
   
 // Change a subtraction of a constant c by an addition of -c. Helpfull to combine
@@ -180,7 +178,7 @@ def SubConstToNeg : Pat<
     // From x - c.
     (ONNXSubOp:$subOp $x, (ONNXConstantOp:$constOp $s, $v)),
     // To x + (-c).
-    (ONNXAddOp $x, (CreateDenseONNXConstantOp $constOp, (CreateNegOfConst $constOp, $v))),
+    (ONNXAddOp $x, (CreateNegOfConst $constOp, $constOp)),
     [(IsNotAConstant:$x), (AttributeIsNull:$s)]>;
 
 // Constant Propagation for Sqrt
@@ -188,7 +186,7 @@ def SqrtofConst :  Pat<
     // From  onnx.Sqrt(c)
     (ONNXSqrtOp:$sqrtOp (ONNXConstantOp:$constOp $s, $v)),
     // To sqrt(c)
-    (CreateDenseONNXConstantOp $sqrtOp, (CreateSqrtOfConst $constOp, $v)),
+    (CreateSqrtOfConst $sqrtOp, $constOp),
     [(AttributeIsNull:$s)]>;
  
 //===----------------------------------------------------------------------===//

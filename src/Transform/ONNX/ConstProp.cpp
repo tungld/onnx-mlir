@@ -14,7 +14,7 @@
 // This pass is applied before any other pass so that there is no need to
 // implement shape inference for the constpropd operation. Hence, it is expected
 // that there is no knowledge about tensor shape at this point
-// //===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 #include "mlir/IR/Matchers.h"
 #include "mlir/IR/PatternMatch.h"
@@ -381,211 +381,7 @@ T ComputeConstPropElementwiseBinary(T lhs, T rhs) {
 }
 
 template <typename ElementwiseBinaryOp, typename T>
-void IterateConstPropElementwiseBinary(PatternRewriter &rewriter,
-    std::vector<T> &resVector, DenseElementsAttr lhsAttr,
-    DenseElementsAttr rhsAttr, ArrayRef<int64_t> outputShape) {
-  // If there is no broadcasting, the two inputs and the output have the same
-  // memory layout. We can safely do computation on each element pair (lhs,
-  // rhs) in the increasing order of indices.
-  //
-  // If there is broadcating, the algorithm to compute the output is as
-  // follows: For each value 'x' in [0, N), where N is the number of elements
-  // in the output:
-  //   - compute the access indices for the output, using 'x' and strides (see
-  //   below),
-  //   - deduce access indices for the lhs and rhs from the output access
-  //   indices, using broadcasting rules,
-  //   - calculate element-wise binary result,
-  //   - store the result.
-
-  // shape:   [M, N, K]
-  // strides: [N * K, K, 1]
-  //
-  // Given a value x in range [0, M*N*K), convert it to an index of [m, m, k]
-  // as follows:
-  //
-  // for(int i = 0; i < rank; ++i) {
-  //   s = strides[i]
-  //   if (x < s)
-  //     indices[i] = 0
-  //   else {
-  //     indices[i] = x / s
-  //     x = x % s
-  //   }
-  //
-  // }
-
-  int outputRank = outputShape.size();
-  auto lhsShape = lhsAttr.getType().getShape();
-  int lhsRank = lhsShape.size();
-  auto rhsShape = rhsAttr.getType().getShape();
-  int rhsRank = rhsShape.size();
-  auto elementType = lhsAttr.getType().getElementType();
-
-  //  Compute strides and the number of elements in the output.
-  SmallVector<uint64_t, 4> strides(outputRank, 0);
-  uint64_t elementCount = 1;
-  for (int i = outputRank - 1; i >= 0; i--) {
-    strides[i] = elementCount;
-    elementCount *= outputShape[i];
-  }
-
-  resVector.reserve(elementCount);
-
-  // Check broadcasting.
-  bool broadcasting = false;
-  if (lhsRank != rhsRank)
-    broadcasting = true;
-  else
-    for (int i = 0; i < outputRank; ++i)
-      if (lhsShape[i] != rhsShape[i]) {
-        broadcasting = true;
-        break;
-      }
-
-  // If not broadcasting, it is not necessary to compute access indices
-  // because inputs and output have the same memory layout. So it is safe to
-  // traverse data in the increasing order of indices.
-  if (!broadcasting) {
-    if (elementType.isa<FloatType>()) {
-      auto lhsIt = lhsAttr.getValues<FloatAttr>().begin();
-      auto rhsIt = rhsAttr.getValues<FloatAttr>().begin();
-      for (int i = 0; i < elementCount; ++i) {
-        // Get lhs and rhs elements.
-        T lhsValue = (T)(*lhsIt++).cast<FloatAttr>().getValueAsDouble();
-        T rhsValue = (T)(*rhsIt++).cast<FloatAttr>().getValueAsDouble();
-        // Calculate element-wise binary result.
-        T res = ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
-            lhsValue, rhsValue);
-        resVector.emplace_back(res);
-      }
-    } else if (elementType.isa<IntegerType>()) {
-      auto lhsIt = lhsAttr.getValues<IntegerAttr>().begin();
-      auto rhsIt = rhsAttr.getValues<IntegerAttr>().begin();
-      for (int i = 0; i < elementCount; ++i) {
-        // Get lhs and rhs elements.
-        T lhsValue = (T)(*lhsIt++).cast<IntegerAttr>().getInt();
-        T rhsValue = (T)(*rhsIt++).cast<IntegerAttr>().getInt();
-        // Calculate element-wise binary result.
-        T res = ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
-            lhsValue, rhsValue);
-        resVector.emplace_back(res);
-      }
-    } else
-      llvm_unreachable("Unknown data type");
-    return;
-  }
-
-  // If broadcasting, go through each element in [0, N), where N is the number
-  // of elements in the output, and compute the access indices for the output.
-  // Then, use the output access indices to deduce access indices for the
-  // inputs, using broadcasting rules.
-  for (int64_t i = 0; i < elementCount; ++i) {
-    // Compute access indices for the output.
-    SmallVector<uint64_t, 4> outputIndices(outputRank, 0);
-    uint64_t x = i;
-    for (int j = 0; j < outputRank; ++j) {
-      uint64_t s = strides[j];
-      if (x < s)
-        outputIndices[j] = 0;
-      else {
-        outputIndices[j] = floor(x / s);
-        x = x % s;
-      }
-    }
-
-    // Compute indices to access inputs.
-    SmallVector<uint64_t, 4> lhsIndices, rhsIndices;
-    for (int k = 0; k < outputRank; ++k) {
-      // in the lhs index range.
-      if (k >= outputRank - lhsRank) {
-        int lhsIndex = k - outputRank + lhsRank;
-        if (lhsShape[lhsIndex] == 1)
-          // broadcast
-          lhsIndices.emplace_back(0);
-        else
-          lhsIndices.emplace_back(outputIndices[k]);
-      }
-      // in the rhs index range.
-      if (k >= outputRank - rhsRank) {
-        int rhsIndex = k - outputRank + rhsRank;
-        if (rhsShape[rhsIndex] == 1)
-          // broadcast
-          rhsIndices.emplace_back(0);
-        else
-          rhsIndices.emplace_back(outputIndices[k]);
-      }
-    }
-
-    // Get lhs and rhs elements.
-    Attribute lhsElementAttr = lhsAttr.getValue(ArrayRef<uint64_t>(lhsIndices));
-    Attribute rhsElementAttr = rhsAttr.getValue(ArrayRef<uint64_t>(rhsIndices));
-
-    // Calculate element-wise binary result.
-    T lhsValue = getAttrValue<T>(lhsElementAttr);
-    T rhsValue = getAttrValue<T>(rhsElementAttr);
-    T res = ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
-        lhsValue, rhsValue);
-    resVector.emplace_back(res);
-  }
-  return;
-}
-
-// Process the constant operands, perform the operation with broadcast, and
-// generate the new constant operation.
-template <typename ElementwiseBinaryOp>
-DenseElementsAttr ConstPropElementwiseBinary(PatternRewriter &rewriter,
-    Value resOperand, Attribute lhsAttr, Attribute rhsAttr) {
-  DenseElementsAttr lhsDenseAttr =
-      lhsAttr.dyn_cast_or_null<mlir::DenseElementsAttr>();
-  DenseElementsAttr rhsDenseAttr =
-      rhsAttr.dyn_cast_or_null<mlir::DenseElementsAttr>();
-  assert((lhsDenseAttr && lhsDenseAttr) && "expected dense attributes");
-  assert(resOperand.getType().cast<ShapedType>().hasRank() &&
-         "expected ranked tensor");
-  RankedTensorType resType =
-      constructRankedTensorType(resOperand.getType().cast<ShapedType>());
-  auto outputShape = resOperand.getType().cast<ShapedType>().getShape();
-
-  // FloatType
-  if (resType.getElementType().isa<FloatType>()) {
-    FloatType floatTy = resType.getElementType().cast<FloatType>();
-    if (floatTy.getWidth() == 32) {
-      std::vector<float> resVector;
-      IterateConstPropElementwiseBinary<ElementwiseBinaryOp, float>(
-          rewriter, resVector, lhsDenseAttr, rhsDenseAttr, outputShape);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
-    }
-    if (floatTy.getWidth() == 64) {
-      std::vector<double> resVector;
-      IterateConstPropElementwiseBinary<ElementwiseBinaryOp, double>(
-          rewriter, resVector, lhsDenseAttr, rhsDenseAttr, outputShape);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
-    }
-  }
-
-  // IntegerType
-  if (resType.getElementType().isa<IntegerType>()) {
-    IntegerType intTy = resType.getElementType().cast<IntegerType>();
-    if (intTy.getWidth() == 32) {
-      std::vector<int32_t> resVector;
-      IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int32_t>(
-          rewriter, resVector, lhsDenseAttr, rhsDenseAttr, outputShape);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
-    }
-    if (intTy.getWidth() == 64) {
-      std::vector<int64_t> resVector;
-      IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int64_t>(
-          rewriter, resVector, lhsDenseAttr, rhsDenseAttr, outputShape);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
-    }
-  }
-
-  llvm_unreachable("Unknown data type");
-}
-
-template <typename ElementwiseBinaryOp, typename T>
-OMTensor *ComputeConstPropElementwiseBinaryOp(
+OMTensor *IterateConstPropElementwiseBinary(
     OMTensor *lhsOmt, OMTensor *rhsOmt, Type outputType) {
   auto outputShape = outputType.cast<ShapedType>().getShape();
   int64_t *lhsShape = omTensorGetShape(lhsOmt);
@@ -650,7 +446,7 @@ OMTensor *ComputeConstPropElementwiseBinaryOp(
 /// Do element-wise binary calculation of 'lhs' and 'rhs' values and create an
 /// ONNXConstantOp for the result.
 template <typename ElementwiseBinaryOp>
-ONNXConstantOp ConstPropElementwiseBinaryOp(
+ONNXConstantOp ConstPropElementwiseBinary(
     PatternRewriter &rewriter, Value replacingValue, Value lhs, Value rhs) {
   Type outputType = replacingValue.getType();
   Type elementType = outputType.cast<ShapedType>().getElementType();
@@ -669,25 +465,23 @@ ONNXConstantOp ConstPropElementwiseBinaryOp(
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
     if (floatTy.getWidth() == 32) {
-      resOmt = ComputeConstPropElementwiseBinaryOp<ElementwiseBinaryOp, float>(
+      resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, float>(
           lhsOmt, rhsOmt, outputType);
     }
     if (floatTy.getWidth() == 64) {
-      resOmt = ComputeConstPropElementwiseBinaryOp<ElementwiseBinaryOp, double>(
+      resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, double>(
           lhsOmt, rhsOmt, outputType);
     }
   } else if (elementType.isa<IntegerType>()) {
     // IntegerType
     IntegerType intTy = elementType.cast<IntegerType>();
     if (intTy.getWidth() == 32) {
-      resOmt =
-          ComputeConstPropElementwiseBinaryOp<ElementwiseBinaryOp, int32_t>(
-              lhsOmt, rhsOmt, outputType);
+      resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int32_t>(
+          lhsOmt, rhsOmt, outputType);
     }
     if (intTy.getWidth() == 64) {
-      resOmt =
-          ComputeConstPropElementwiseBinaryOp<ElementwiseBinaryOp, int64_t>(
-              lhsOmt, rhsOmt, outputType);
+      resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int64_t>(
+          lhsOmt, rhsOmt, outputType);
     }
   } else
     llvm_unreachable("Unknown data type");
@@ -730,86 +524,70 @@ T ComputeConstPropElementwiseUnary(T val) {
 }
 
 template <typename ElementwiseUnaryOp, typename T>
-void IterateConstPropElementwiseUnary(PatternRewriter &rewriter,
-    std::vector<T> &resVector, DenseElementsAttr attr,
-    ArrayRef<int64_t> outputShape) {
-  int64_t elementCount = 1;
-  for (int i = 0; i < outputShape.size(); ++i) {
-    elementCount *= outputShape[i];
+OMTensor *IterateConstPropElementwiseUnary(OMTensor *omt, Type outputType) {
+  // Initialize a result OMTensor.
+  auto outputShape = outputType.cast<ShapedType>().getShape();
+  OMTensor *resOmt = omTensorCreateWithShape<T>(outputShape);
+  // Calculate element-wise unary result.
+  for (const auto &idx : omTensorComputeIndexSet(resOmt)) {
+    T value = omTensorGetElem<T>(omt, idx);
+    omTensorGetElem<T>(resOmt, idx) =
+        ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(value);
   }
+  return resOmt;
+}
 
-  resVector.reserve(elementCount);
+/// Do element-wise unary calculation of 'input' value and create an
+/// ONNXConstantOp for the result.
+template <typename ElementwiseUnaryOp>
+ONNXConstantOp ConstPropElementwiseUnary(
+    PatternRewriter &rewriter, Value replacingValue, Value input) {
+  Type outputType = replacingValue.getType();
+  Type elementType = outputType.cast<ShapedType>().getElementType();
+  Operation *inputOp = input.getDefiningOp();
 
-  auto elementType = attr.getType().getElementType();
+  // Get input value as OMTensor.
+  unsigned inputId = ConstantPool::createOrGet(rewriter, inputOp);
+  OMTensor *inputOmt = ConstantPool::get(inputId);
+
+  // Do calculation.
+  OMTensor *resOmt;
   if (elementType.isa<FloatType>()) {
-    auto it = attr.getValues<FloatAttr>().begin();
-    for (int i = 0; i < elementCount; ++i) {
-      T value = (T)(*it++).cast<FloatAttr>().getValueAsDouble();
-      T res = ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(value);
-      resVector.emplace_back(res);
+    // FloatType
+    FloatType floatTy = elementType.cast<FloatType>();
+    if (floatTy.getWidth() == 32) {
+      resOmt = IterateConstPropElementwiseUnary<ElementwiseUnaryOp, float>(
+          inputOmt, outputType);
+    }
+    if (floatTy.getWidth() == 64) {
+      resOmt = IterateConstPropElementwiseUnary<ElementwiseUnaryOp, double>(
+          inputOmt, outputType);
     }
   } else if (elementType.isa<IntegerType>()) {
-    auto it = attr.getValues<IntegerAttr>().begin();
-    for (int i = 0; i < elementCount; ++i) {
-      T value = (T)(*it++).cast<IntegerAttr>().getInt();
-      T res = ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(value);
-      resVector.emplace_back(res);
+    // IntegerType
+    IntegerType intTy = elementType.cast<IntegerType>();
+    if (intTy.getWidth() == 32) {
+      resOmt = IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int32_t>(
+          inputOmt, outputType);
+    }
+    if (intTy.getWidth() == 64) {
+      resOmt = IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int64_t>(
+          inputOmt, outputType);
     }
   } else
     llvm_unreachable("Unknown data type");
-}
 
-// Process the constant operands, perform the operation with broadcast, and
-// generate the new constant operation.
-template <typename ElementwiseUnaryOp>
-DenseElementsAttr ConstPropElementwiseUnary(
-    PatternRewriter &rewriter, Value resOperand, Attribute attr) {
-  DenseElementsAttr denseAttr =
-      attr.dyn_cast_or_null<mlir::DenseElementsAttr>();
-  assert(denseAttr && "expected dense attribute");
-  assert(resOperand.getType().cast<ShapedType>().hasRank() &&
-         "expected ranked tensor");
-  RankedTensorType resType =
-      constructRankedTensorType(resOperand.getType().cast<ShapedType>());
-  auto rank = denseAttr.getType().getShape().size();
-  SmallVector<uint64_t, 4> indices(rank, 0);
-  auto outputShape = resOperand.getType().cast<ShapedType>().getShape();
+  // Add the result to the constant pool.
+  unsigned constantID = ConstantPool::put(resOmt);
 
-  // FloatType
-  if (resType.getElementType().isa<FloatType>()) {
-    FloatType floatTy = resType.getElementType().cast<FloatType>();
-    if (floatTy.getWidth() == 32) {
-      std::vector<float> resVector;
-      IterateConstPropElementwiseUnary<ElementwiseUnaryOp, float>(
-          rewriter, resVector, denseAttr, outputShape);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
-    }
-    if (floatTy.getWidth() == 64) {
-      std::vector<double> resVector;
-      IterateConstPropElementwiseUnary<ElementwiseUnaryOp, double>(
-          rewriter, resVector, denseAttr, outputShape);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
-    }
-  }
+  // Construct a new ONNXConstantOp.
+  ONNXConstantOp res =
+      CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
 
-  // IntegerType
-  if (resType.getElementType().isa<IntegerType>()) {
-    IntegerType intTy = resType.getElementType().cast<IntegerType>();
-    if (intTy.getWidth() == 32) {
-      std::vector<int32_t> resVector;
-      IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int32_t>(
-          rewriter, resVector, denseAttr, outputShape);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
-    }
-    if (intTy.getWidth() == 64) {
-      std::vector<int64_t> resVector;
-      IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int64_t>(
-          rewriter, resVector, denseAttr, outputShape);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
-    }
-  }
+  // Clean up memory for input if it is only used here.
+  ConstantPool::update(rewriter, inputOp);
 
-  llvm_unreachable("Unknown data type");
+  return res;
 }
 
 //===----------------------------------------------------------------------===//
