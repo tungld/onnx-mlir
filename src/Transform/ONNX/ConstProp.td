@@ -66,7 +66,7 @@ def CreateAddOfTwoConst :
    NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXAddOp>($_builder, $0, $1, $2)">;
 
 def CreateSubOfTwoConst :
-   NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXSubOp>($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXSubOp>($_builder, $0, $1, $2)">;
 
 def CreateNegOfConst :
    NativeCodeCall<"ConstPropElementwiseUnary<mlir::ONNXNegOp>($_builder, $0, $1)">;
@@ -75,10 +75,10 @@ def CreateSqrtOfConst :
    NativeCodeCall<"ConstPropElementwiseUnary<mlir::ONNXSqrtOp>($_builder, $0, $1)">;
 
 def CreateMulOfTwoConst :
-   NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXMulOp>($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXMulOp>($_builder, $0, $1, $2)">;
 
 def CreateDivOfTwoConst :
-   NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXDivOp>($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropElementwiseBinaryOp<mlir::ONNXDivOp>($_builder, $0, $1, $2)">;
 
 def CreateTransposeOfConst :
    NativeCodeCall<"ConstPropTranspose($_builder, $0, $1, $2)">;
@@ -161,9 +161,9 @@ def AddConstProp : Pat<
 // Constant Propagation for Sub
 def SubConstProp : Pat<
     // From sub(c1, c2).
-    (ONNXSubOp:$subOp (ONNXConstantOp $s1, $v1), (ONNXConstantOp $s2, $v2)),
+    (ONNXSubOp:$subOp (ONNXConstantOp:$lhs $s1, $v1), (ONNXConstantOp:$rhs $s2, $v2)),
     // To c1-c2
-    (CreateDenseONNXConstantOp $subOp, (CreateSubOfTwoConst $subOp, $v1, $v2)),
+    (CreateSubOfTwoConst $subOp, $lhs, $rhs),
     [(AttributeIsNull:$s1), (AttributeIsNull:$s2)]>;
 
 // Neg of constant is simly -const
@@ -253,18 +253,18 @@ def MulConstAssociative4 : Pat<
 // Constant Propagation for Mul
 def MulConstProp : Pat<
     // From mul(c1, c2).
-    (ONNXMulOp:$mulOp (ONNXConstantOp $s1, $v1), (ONNXConstantOp $s2, $v2)),
+    (ONNXMulOp:$mulOp (ONNXConstantOp:$lhs $s1, $v1), (ONNXConstantOp:$rhs $s2, $v2)),
     // To c1+c2
-    (CreateDenseONNXConstantOp $mulOp, (CreateMulOfTwoConst $mulOp, $v1, $v2)),
+    (CreateMulOfTwoConst $mulOp, $lhs, $rhs),
     // Mulitional constraints (no sparse)
     [(AttributeIsNull:$s1), (AttributeIsNull:$s2)]>;
 
 // Constant Propagation for Div 
 def DivConstProp : Pat<
     // From div(c1, c2).
-    (ONNXDivOp:$mulOp (ONNXConstantOp $s1, $v1), (ONNXConstantOp $s2, $v2)),
+    (ONNXDivOp:$divOp (ONNXConstantOp:$lhs $s1, $v1), (ONNXConstantOp:$rhs $s2, $v2)),
     // To c1/c2
-    (CreateDenseONNXConstantOp $mulOp, (CreateDivOfTwoConst $mulOp, $v1, $v2)),
+    (CreateDivOfTwoConst $divOp, $lhs, $rhs),
     // Division constraints (no sparse)
     [(AttributeIsNull:$s1), (AttributeIsNull:$s2)]>;
 
