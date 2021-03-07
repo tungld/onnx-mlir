@@ -85,7 +85,11 @@ int32_t getAttrValue(Attribute attr) {
 //===----------------------------------------------------------------------===//
 struct ConstantPool {
   static unsigned header;
-  static DenseMap<unsigned, OMTensor *> storage;
+  static int64_t size;
+  static int64_t nd;
+  static DenseMap<unsigned,
+      std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>>
+      storage;
   static OMTensor *get(unsigned id);
   static unsigned put(OMTensor *omt);
   static unsigned createOrGet(PatternRewriter &rewriter, Operation *op);
@@ -94,14 +98,18 @@ struct ConstantPool {
   static void reset();
 };
 unsigned ConstantPool::header = 0;
-DenseMap<unsigned, OMTensor *> ConstantPool::storage;
+int64_t ConstantPool::size = 0;
+int64_t ConstantPool::nd = 0;
+DenseMap<unsigned, std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>>
+    ConstantPool::storage;
 
 /// Get a constant by index from the constant pool.
 OMTensor *ConstantPool::get(unsigned id) {
   auto it = ConstantPool::storage.find(id);
-  if (it != ConstantPool::storage.end())
-    return it->second;
-  else
+  if (it != ConstantPool::storage.end()) {
+    auto &res = it->second;
+    return res.get();
+  } else
     return nullptr;
 }
 
@@ -109,23 +117,33 @@ OMTensor *ConstantPool::get(unsigned id) {
 /// Return the constant index in the pool.
 unsigned ConstantPool::put(OMTensor *omt) {
   unsigned constantID = ConstantPool::header;
-  ConstantPool::storage.insert({constantID, omt});
+  auto resOmt = std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>(
+      omt, omTensorDestroy);
+  ConstantPool::storage.insert({constantID, std::move(resOmt)});
   // Move header forward.
   ConstantPool::header += 1;
+  std::cout << "id: " << constantID << ", put at " << omTensorGetDataPtr(omt)
+            << ", pool size: " << ConstantPool::storage.getMemorySize() << "\n";
+  ConstantPool::size += omTensorGetBufferSize(omt);
+  std::cout << "buffer size : " << ConstantPool::size << "\n";
   return constantID;
 }
 
 void ConstantPool::reset() {
   ConstantPool::header = 0;
-  ConstantPool::storage.clear();
+  ConstantPool::storage.shrink_and_clear();
 }
 
 /// Erase a constant by index.
 bool ConstantPool::erase(unsigned id) {
   OMTensor *omt = ConstantPool::get(id);
   if (omt) {
+    std::cout << "id: " << id << ", erase at at " << omTensorGetDataPtr(omt)
+              << ", pool size: " << ConstantPool::storage.getMemorySize()
+              << "\n";
+    ConstantPool::size -= omTensorGetBufferSize(omt);
+    std::cout << "buffer size : " << ConstantPool::size << "\n";
     ConstantPool::storage.erase(id);
-    omTensorDestroy(omt);
     return true;
   }
   return false;
@@ -312,6 +330,9 @@ ONNXConstantOp CreateDenseONNXConstantOp(
   } else
     llvm_unreachable("Upsupported data type");
 
+  std::cout << "create a dense attr "
+            << "\n";
+  std::cout << "number of dense attrs: " << ++ConstantPool::nd << "\n";
   ONNXConstantOp constOp =
       rewriter.create<ONNXConstantOp>(loc, outputType, Attribute(), denseAttr);
 
