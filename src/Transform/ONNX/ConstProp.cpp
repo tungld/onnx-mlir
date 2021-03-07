@@ -53,7 +53,6 @@ namespace {
 //
 
 const StringRef CONSTANT_ID_ATTR_NAME = "constantID";
-const StringRef CONSTANT_USERS_ATTR_NAME = "users";
 
 /// A helper function to get a value of a given type from an attribute.
 template <typename T>
@@ -116,7 +115,10 @@ unsigned ConstantPool::put(OMTensor *omt) {
   return constantID;
 }
 
-void ConstantPool::reset() { ConstantPool::header = 0; }
+void ConstantPool::reset() {
+  ConstantPool::header = 0;
+  ConstantPool::storage.clear();
+}
 
 /// Erase a constant by index.
 bool ConstantPool::erase(unsigned id) {
@@ -133,22 +135,19 @@ bool ConstantPool::erase(unsigned id) {
 /// Erase its constant from the constant pool if the op has no other uses.
 /// Otherwise, update the ops's ref-count.
 bool ConstantPool::update(PatternRewriter &rewriter, Operation *op) {
+  ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
+  assert(constOp && "Not a constant operation");
+
   bool updated = false;
   Attribute constantIDAttr =
       op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
   if (constantIDAttr) {
     unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
-    Attribute refCountAttr =
-        op->getAttrOfType<::mlir::Attribute>(CONSTANT_USERS_ATTR_NAME);
-    if (refCountAttr) {
-      int refCount = refCountAttr.cast<IntegerAttr>().getUInt();
-      if (refCount == 1)
-        ConstantPool::erase(constantID);
-      else
-        op->setAttr(CONSTANT_USERS_ATTR_NAME,
-            IntegerAttr::get(
-                rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
-                refCount - 1));
+    int refCount = 0;
+    for (auto &u : constOp.getResult().getUses())
+      refCount += 1;
+    if (refCount <= 1) {
+      ConstantPool::erase(constantID);
       updated = true;
     }
   }
@@ -223,14 +222,6 @@ unsigned ConstantPool::createOrGet(PatternRewriter &rewriter, Operation *op) {
         IntegerAttr::get(
             rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
             constantID));
-    // Set the number of users.
-    int userCount = 0;
-    for (auto u : constOp.getResult().getUsers())
-      userCount++;
-    op->setAttr(CONSTANT_USERS_ATTR_NAME,
-        IntegerAttr::get(
-            rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
-            userCount));
   }
   return constantID;
 }
@@ -245,21 +236,19 @@ RankedTensorType constructRankedTensorType(ShapedType type) {
 static DenseElementsAttr createDenseElementsAttr(
     OMTensor *omt, ShapedType outputType) {
   RankedTensorType resType = constructRankedTensorType(outputType);
-  OM_DATA_TYPE dtype = omTensorGetDataType(omt);
   int64_t numElements = omTensorGetNumElems(omt);
-  int rank = omTensorGetRank(omt);
   // FloatType
   if (resType.getElementType().isa<FloatType>()) {
     FloatType floatTy = resType.getElementType().cast<FloatType>();
     if (floatTy.getWidth() == 32) {
       float *res = (float *)omTensorGetDataPtr(omt);
-      std::vector<float> resVector(res, res + numElements);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
+      return DenseElementsAttr::get<float>(
+          resType, ArrayRef<float>(res, numElements));
     }
     if (floatTy.getWidth() == 64) {
       double *res = (double *)omTensorGetDataPtr(omt);
-      std::vector<double> resVector(res, res + numElements);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
+      return DenseElementsAttr::get<double>(
+          resType, ArrayRef<double>(res, numElements));
     }
   }
 
@@ -268,13 +257,13 @@ static DenseElementsAttr createDenseElementsAttr(
     IntegerType intTy = resType.getElementType().cast<IntegerType>();
     if (intTy.getWidth() == 32) {
       int32_t *res = (int32_t *)omTensorGetDataPtr(omt);
-      std::vector<int32_t> resVector(res, res + numElements);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
+      return DenseElementsAttr::get<int32_t>(
+          resType, ArrayRef<int32_t>(res, numElements));
     }
     if (intTy.getWidth() == 64) {
       int64_t *res = (int64_t *)omTensorGetDataPtr(omt);
-      std::vector<int64_t> resVector(res, res + numElements);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(resVector));
+      return DenseElementsAttr::get<int64_t>(
+          resType, ArrayRef<int64_t>(res, numElements));
     }
   }
 
@@ -286,30 +275,24 @@ ONNXConstantOp CreateDenseONNXConstantOp(
     PatternRewriter &rewriter, Value replacingValue, unsigned constantID) {
   Location loc = replacingValue.getLoc();
   Type outputType = replacingValue.getType();
-  ArrayRef<int64_t> shape = outputType.cast<ShapedType>().getShape();
   Type elementType = outputType.cast<ShapedType>().getElementType();
-
-  int64_t elementCount = 1;
-  for (int i = 0; i < shape.size(); ++i)
-    elementCount *= shape[i];
 
   // A DenseElementsAttr is just to make ONNXConstantOp legal. We don't use
   // its value for computation. Real value will be obtained from the constant
   // pool. This DenseElementsAttr is created so that it consumes memory as
   // little as possbile.
   DenseElementsAttr denseAttr;
-  RankedTensorType denseType =
-      constructRankedTensorType(outputType.cast<ShapedType>());
+  RankedTensorType denseType = RankedTensorType::get({1}, elementType);
   if (elementType.isa<FloatType>()) {
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
     if (floatTy.getWidth() == 32) {
-      std::vector<float> data(elementCount, 0.0);
-      denseAttr = mlir::SplatElementsAttr::get<float>(
+      std::vector<float> data(1, 0.0);
+      denseAttr = mlir::DenseElementsAttr::get<float>(
           denseType, llvm::makeArrayRef(data));
     } else if (floatTy.getWidth() == 64) {
-      std::vector<double> data(elementCount, 0.0);
-      denseAttr = mlir::SplatElementsAttr::get<double>(
+      std::vector<double> data(1, 0.0);
+      denseAttr = mlir::DenseElementsAttr::get<double>(
           denseType, llvm::makeArrayRef(data));
     } else
       llvm_unreachable("Upsupported data type");
@@ -317,12 +300,12 @@ ONNXConstantOp CreateDenseONNXConstantOp(
     // IntegerType
     IntegerType intTy = elementType.cast<IntegerType>();
     if (intTy.getWidth() == 32) {
-      std::vector<int32_t> data(elementCount, 0);
-      denseAttr = mlir::SplatElementsAttr::get<int32_t>(
+      std::vector<int32_t> data(1, 0);
+      denseAttr = mlir::DenseElementsAttr::get<int32_t>(
           denseType, llvm::makeArrayRef(data));
     } else if (intTy.getWidth() == 64) {
-      std::vector<int64_t> data(elementCount, 0);
-      denseAttr = mlir::SplatElementsAttr::get<int64_t>(
+      std::vector<int64_t> data(1, 0);
+      denseAttr = mlir::DenseElementsAttr::get<int64_t>(
           denseType, llvm::makeArrayRef(data));
     } else
       llvm_unreachable("Upsupported data type");
@@ -337,14 +320,6 @@ ONNXConstantOp CreateDenseONNXConstantOp(
       IntegerAttr::get(
           rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
           constantID));
-  // Set the number of users.
-  int userCount = 0;
-  for (auto u : replacingValue.getUsers())
-    userCount++;
-  constOp.getOperation()->setAttr(CONSTANT_USERS_ATTR_NAME,
-      IntegerAttr::get(
-          rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
-          userCount));
   return constOp;
 }
 
@@ -884,12 +859,11 @@ void ConstPropONNXToONNXPass::runOnFunction() {
       DenseElementsAttr denseAttr = createDenseElementsAttr(omt, outputType);
       op->setAttr("value", denseAttr);
       op->removeAttr(CONSTANT_ID_ATTR_NAME);
-      op->removeAttr(CONSTANT_USERS_ATTR_NAME);
       ConstantPool::erase(constantID);
     }
   });
-  // TODO: clean up the constant pool.
-  // ConstantPool::reset();
+  // Clean up the constant pool.
+  ConstantPool::reset();
 } // end anonymous namespace
 
 /*!
