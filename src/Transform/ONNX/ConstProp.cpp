@@ -161,10 +161,7 @@ bool ConstantPool::update(PatternRewriter &rewriter, Operation *op) {
       op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
   if (constantIDAttr) {
     unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
-    int refCount = 0;
-    for (auto &u : constOp.getResult().getUses())
-      refCount += 1;
-    if (refCount <= 1) {
+    if (constOp.getResult().use_empty() || constOp.getResult().hasOneUse()) {
       ConstantPool::erase(constantID);
       updated = true;
     }
@@ -292,49 +289,12 @@ static DenseElementsAttr createDenseElementsAttr(
 ONNXConstantOp CreateDenseONNXConstantOp(
     PatternRewriter &rewriter, Value replacingValue, unsigned constantID) {
   Location loc = replacingValue.getLoc();
-  Type outputType = replacingValue.getType();
-  Type elementType = outputType.cast<ShapedType>().getElementType();
-
-  // A DenseElementsAttr is just to make ONNXConstantOp legal. We don't use
-  // its value for computation. Real value will be obtained from the constant
-  // pool. This DenseElementsAttr is created so that it consumes memory as
-  // little as possbile.
-  DenseElementsAttr denseAttr;
-  RankedTensorType denseType = RankedTensorType::get({1}, elementType);
-  if (elementType.isa<FloatType>()) {
-    // FloatType
-    FloatType floatTy = elementType.cast<FloatType>();
-    if (floatTy.getWidth() == 32) {
-      std::vector<float> data(1, 0.0);
-      denseAttr = mlir::DenseElementsAttr::get<float>(
-          denseType, llvm::makeArrayRef(data));
-    } else if (floatTy.getWidth() == 64) {
-      std::vector<double> data(1, 0.0);
-      denseAttr = mlir::DenseElementsAttr::get<double>(
-          denseType, llvm::makeArrayRef(data));
-    } else
-      llvm_unreachable("Upsupported data type");
-  } else if (elementType.isa<IntegerType>()) {
-    // IntegerType
-    IntegerType intTy = elementType.cast<IntegerType>();
-    if (intTy.getWidth() == 32) {
-      std::vector<int32_t> data(1, 0);
-      denseAttr = mlir::DenseElementsAttr::get<int32_t>(
-          denseType, llvm::makeArrayRef(data));
-    } else if (intTy.getWidth() == 64) {
-      std::vector<int64_t> data(1, 0);
-      denseAttr = mlir::DenseElementsAttr::get<int64_t>(
-          denseType, llvm::makeArrayRef(data));
-    } else
-      llvm_unreachable("Upsupported data type");
-  } else
-    llvm_unreachable("Upsupported data type");
 
   std::cout << "create a dense attr "
             << "\n";
   std::cout << "number of dense attrs: " << ++ConstantPool::nd << "\n";
-  ONNXConstantOp constOp =
-      rewriter.create<ONNXConstantOp>(loc, outputType, Attribute(), denseAttr);
+  ONNXConstantOp constOp = rewriter.create<ONNXConstantOp>(
+      loc, replacingValue.getType(), Attribute(), Attribute());
 
   // Set constant index in the constant pool.
   constOp.getOperation()->setAttr(CONSTANT_ID_ATTR_NAME,
