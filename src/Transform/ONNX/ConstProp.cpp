@@ -28,7 +28,6 @@
 
 #include <alloca.h>
 #include <fstream>
-#include <iostream>
 #include <math.h>
 
 using namespace mlir;
@@ -468,50 +467,92 @@ ONNXConstantOp ConstPropElementwiseUnary(
 // Code to perform constant propagation for transpose.
 //===----------------------------------------------------------------------===//
 
-void RecurseConstPropTranspose(PatternRewriter &rewriter,
-    std::vector<Attribute> &resVector, DenseElementsAttr attr,
-    SmallVector<uint64_t, 4> &indices, SmallVector<uint64_t, 4> &perm,
-    int freeRank) {
-  if (freeRank == 0) {
-    // Fully defined ranks.
-    auto res = attr.getValue(ArrayRef<uint64_t>(indices));
-    resVector.emplace_back(res);
-  } else {
-    // Recurse.
-    auto shape = attr.getType().getShape();
-    int rank = shape.size();
-    int index = perm[rank - freeRank];
-    int size = attr.getType().getShape()[index];
-    for (int i = 0; i < size; ++i) {
-      indices[index] = i;
-      RecurseConstPropTranspose(
-          rewriter, resVector, attr, indices, perm, freeRank - 1);
-    }
+template <typename T>
+void IterateConstPropTranspose(char *constArray, ArrayRef<int64_t> constShape,
+    ArrayRef<uint64_t> perm, char *resArray, ArrayRef<int64_t> resShape) {
+  // Data pointers.
+  T *constArrayT = reinterpret_cast<T *>(constArray);
+  T *resArrayT = reinterpret_cast<T *>(resArray);
+
+  // Get a reversed perm.
+  SmallVector<uint64_t, 4> reversedPerm(perm.size(), 0);
+  for (int i = 0; i < perm.size(); ++i)
+    reversedPerm[perm[i]] = i;
+
+  // Strides info.
+  std::vector<int64_t> constStrides = getStrides(constShape);
+  std::vector<int64_t> resStrides = getStrides(resShape);
+
+  // Calculate transpose result.
+  for (int64_t i = 0; i < getNumberOfElements(resShape); ++i) {
+    // Indices.
+    std::vector<int64_t> resIndices = getAccessIndex(i, resStrides);
+    SmallVector<int64_t, 4> constIndices(perm.size(), 0);
+    for (int j = 0; j < constIndices.size(); ++j)
+      constIndices[j] = resIndices[reversedPerm[j]];
+    // Transpose.
+    int64_t constOffset = getLinearAccessIndex(constIndices, constStrides);
+    int64_t resOffset = getLinearAccessIndex(resIndices, resStrides);
+    *(resArrayT + resOffset) = *(constArrayT + constOffset);
   }
 }
 
-DenseElementsAttr ConstPropTranspose(PatternRewriter &rewriter,
-    Value resOperand, Attribute attr, ArrayAttr permAttr) {
-  // Read dense attribute, the constant tensor we are transforming.
-  DenseElementsAttr denseAttr =
-      attr.dyn_cast_or_null<mlir::DenseElementsAttr>();
-  assert(denseAttr && "expected dense attribute");
-  RankedTensorType resType =
-      constructRankedTensorType(resOperand.getType().cast<ShapedType>());
-  auto rank = denseAttr.getType().getShape().size();
-  // Read permute vector.
+ONNXConstantOp ConstPropTranspose(
+    PatternRewriter &rewriter, Value replacingValue, Value constValue) {
+  Operation *constOp = constValue.getDefiningOp();
+  Operation *replacingOp = replacingValue.getDefiningOp();
+
+  Type replacingType = replacingValue.getType();
+  Type elementType = replacingType.cast<ShapedType>().getElementType();
+  ArrayRef<int64_t> replacingShape =
+      replacingType.cast<ShapedType>().getShape();
+  ArrayRef<int64_t> constShape =
+      constValue.getType().cast<ShapedType>().getShape();
+  int64_t size = getSizeInBytes(replacingType);
+
+  // Get perm attribute.
   SmallVector<uint64_t, 4> perm;
+  Attribute permAttr = replacingOp->getAttrOfType<::mlir::Attribute>("perm");
   assert(permAttr && "permute attribute expected to be defined here");
-  for (auto permVal : permAttr.getValue())
+  for (auto permVal : permAttr.cast<ArrayAttr>().getValue())
     perm.emplace_back(permVal.cast<IntegerAttr>().getInt());
-  // Init indice vector.
-  SmallVector<uint64_t, 4> indices(rank, 0);
-  std::vector<Attribute> resVector;
-  // Copy using permute order.
-  RecurseConstPropTranspose(
-      rewriter, resVector, denseAttr, indices, perm, rank);
-  ArrayRef<Attribute> resRef(resVector);
-  return DenseElementsAttr::get(resType, resRef);
+
+  // Get the const value.
+  char *constArray = (char *)alloca(size);
+  getArrayFromAttributeOrFile(constOp, constArray);
+
+  // Do calculation.
+  char *resArray = (char *)alloca(size);
+  if (elementType.isa<FloatType>()) {
+    // FloatType
+    FloatType floatTy = elementType.cast<FloatType>();
+    if (floatTy.getWidth() == 32) {
+      IterateConstPropTranspose<float>(
+          constArray, constShape, perm, resArray, replacingShape);
+    }
+    if (floatTy.getWidth() == 64) {
+      IterateConstPropTranspose<double>(
+          constArray, constShape, perm, resArray, replacingShape);
+    }
+  } else if (elementType.isa<IntegerType>()) {
+    // IntegerType
+    IntegerType intTy = elementType.cast<IntegerType>();
+    if (intTy.getWidth() == 32) {
+      IterateConstPropTranspose<int32_t>(
+          constArray, constShape, perm, resArray, replacingShape);
+    }
+    if (intTy.getWidth() == 64) {
+      IterateConstPropTranspose<int64_t>(
+          constArray, constShape, perm, resArray, replacingShape);
+    }
+  } else
+    llvm_unreachable("Unknown data type");
+
+  // Construct a new ONNXConstantOp.
+  ONNXConstantOp res =
+      CreateDenseONNXConstantOp(rewriter, replacingValue, resArray);
+
+  return res;
 }
 
 //===----------------------------------------------------------------------===//

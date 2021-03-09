@@ -79,7 +79,7 @@ def CreateDivOfTwoConst :
    NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXDivOp>($_builder, $0, $1, $2)">;
 
 def CreateTransposeOfConst :
-   NativeCodeCall<"ConstPropTranspose($_builder, $0, $1, $2)">;
+   NativeCodeCall<"ConstPropTranspose($_builder, $0, $1)">;
 
 def CreateUnsqueezeOfConst:
    NativeCodeCall<"ConstPropUnsqueeze($_builder, $0, $1)">;
@@ -274,9 +274,9 @@ def DivConstProp : Pat<
 // Neg of constant is simly -const
 def TransposeofConst :  Pat<
     // From TransposeOp(c, p)
-    (ONNXTransposeOp:$resOp (ONNXConstantOp $s, $v), $p),
+    (ONNXTransposeOp:$resOp (ONNXConstantOp:$constOp $s, $_), $_),
     // To c' where c' is transposed attribute
-    (CreateDenseONNXConstantOp $resOp, (CreateTransposeOfConst $resOp, $v, $p)),
+    (CreateTransposeOfConst $resOp, $constOp),
     [(AttributeIsNull:$s)]>;
 
 //===----------------------------------------------------------------------===//
