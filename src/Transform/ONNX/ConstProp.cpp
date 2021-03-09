@@ -29,6 +29,7 @@
 #include "src/Runtime/OMTensorHelper.h"
 
 #include "llvm/ADT/SmallPtrSet.h"
+#include <fstream>
 #include <math.h>
 
 using namespace mlir;
@@ -52,7 +53,6 @@ namespace {
 // ConstProp.td for example.
 //
 
-const StringRef CONSTANT_ID_ATTR_NAME = "constantID";
 const StringRef FILE_NAME_ATTR = "file_name";
 
 /// A helper function to get a value of a given type from an attribute.
@@ -82,153 +82,82 @@ int32_t getAttrValue(Attribute attr) {
 }
 
 template <typename T>
-std::vector<T> convertToVectorType(std::vector<char> vt) {
+void convertToVectorType(const std::vector<char> &vt, std::vector<T> &res) {
   int size = vt.size() / sizeof(T);
-  T *arrayPtr = reinterpret_cast<T *>(&vt[0]);
-  std::vector<T> res = std::vector<T>(arrayPtr, arrayPtr + size);
-  return res;
+  const T *arrayPtr = reinterpret_cast<const T *>(&vt[0]);
+  res = std::vector<T>(arrayPtr, arrayPtr + size);
 }
 
 template <typename T>
-std::vector<char> convertFromVectorType(std::vector<T> vt) {
+void convertFromVectorType(const std::vector<T> &vt, std::vector<char> &res) {
   int size = vt.size() * sizeof(T);
-  char *arrayPtr = reinterpret_cast<char *>(&vt[0]);
-  std::vector<char> res = std::vector<char>(arrayPtr, arrayPtr + size);
-  return res;
-}
-
-//===----------------------------------------------------------------------===//
-// Code for a constant pool to store intermediate constants.
-//===----------------------------------------------------------------------===//
-unsigned ConstantPoolheader = 0;
-std::map<unsigned, std::vector<char>> ConstantPoolstorage;
-
-/// Get a constant by index from the constant pool.
-std::vector<char> ConstantPoolget(unsigned id) {
-  auto it = ConstantPoolstorage.find(id);
-  if (it != ConstantPoolstorage.end()) {
-    return it->second;
-  } else
-    return {};
-}
-
-/// Put a constant to the constant pool.
-/// Return the constant index in the pool.
-unsigned ConstantPoolput(std::vector<char> omt) {
-  unsigned constantID = ConstantPoolheader;
-  ConstantPoolstorage.insert(
-      std::pair<unsigned, std::vector<char>>(constantID, std::move(omt)));
-  // Move header forward.
-  ConstantPoolheader += 1;
-  std::cout << "put " << constantID << "\n";
-  return constantID;
-}
-
-void ConstantPoolreset() {
-  ConstantPoolheader = 0;
-  ConstantPoolstorage.clear();
-  std::map<unsigned, std::vector<char>>().swap(ConstantPoolstorage);
-}
-
-/// Erase a constant by index.
-bool ConstantPoolerase(unsigned id) {
-  std::vector<char> vt = ConstantPoolget(id);
-  ConstantPoolstorage.erase(id);
-  std::vector<char>().swap(vt);
-  std::cout << "erase " << id << "\n";
-  return true;
-}
-
-/// Update an ONNXConstantOp.
-/// Erase its constant from the constant pool if the op has no other uses.
-/// Otherwise, update the ops's ref-count.
-bool ConstantPoolupdate(PatternRewriter &rewriter, Operation *op) {
-  ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
-  assert(constOp && "Not a constant operation");
-
-  bool updated = false;
-  Attribute constantIDAttr =
-      op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
-  if (constantIDAttr) {
-    unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
-    if (constOp.getResult().use_empty() || constOp.getResult().hasOneUse()) {
-      ConstantPoolerase(constantID);
-      updated = true;
-    }
-  }
-  return updated;
-}
-
-std::vector<char> ConstantPoolcreate(PatternRewriter &rewriter, Operation *op) {
-  ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
-  assert(constOp && "Not a constant operation");
-  // Create a new OMTensor, and add it to the constant pool.
-  DenseElementsAttr dataAttr = op->getAttrOfType<::mlir::Attribute>("value")
-                                   .dyn_cast_or_null<mlir::DenseElementsAttr>();
-  Type elementType = dataAttr.getType().cast<ShapedType>().getElementType();
-  std::vector<int64_t> shape = dataAttr.getType().cast<ShapedType>().getShape();
-  int64_t elementCount = 1;
-  for (int i = 0; i < shape.size(); ++i)
-    elementCount *= shape[i];
-
-  std::vector<char> resOmt;
-  // copy data.
-  if (elementType.isa<FloatType>()) {
-    auto it = dataAttr.getValues<FloatAttr>().begin();
-    FloatType floatTy = elementType.cast<FloatType>();
-    if (floatTy.getWidth() == 32) {
-      std::vector<float> vt;
-      for (int64_t i = 0; i < elementCount; ++i) {
-        vt.emplace_back(getAttrValue<float>(*it++));
-      }
-      resOmt = convertFromVectorType<float>(vt);
-    } else if (floatTy.getWidth() == 64) {
-      std::vector<double> vt;
-      for (int64_t i = 0; i < elementCount; ++i) {
-        vt.emplace_back(getAttrValue<double>(*it++));
-      }
-      resOmt = convertFromVectorType<double>(vt);
-    } else
-      llvm_unreachable("Unsupported data type");
-  } else if (elementType.isa<IntegerType>()) {
-    auto it = dataAttr.getValues<IntegerAttr>().begin();
-    IntegerType intTy = elementType.cast<IntegerType>();
-    if (intTy.getWidth() == 32) {
-      std::vector<int32_t> vt;
-      for (int64_t i = 0; i < elementCount; ++i) {
-        vt.emplace_back(getAttrValue<int32_t>(*it++));
-      }
-      resOmt = convertFromVectorType<int32_t>(vt);
-    } else if (intTy.getWidth() == 64) {
-      std::vector<int64_t> vt;
-      for (int64_t i = 0; i < elementCount; ++i) {
-        vt.emplace_back(getAttrValue<int64_t>(*it++));
-      }
-      resOmt = convertFromVectorType<int64_t>(vt);
-    } else
-      llvm_unreachable("Unsupported data type");
-  } else
-    llvm_unreachable("Unsupported data type");
-  return resOmt;
+  const char *arrayPtr = reinterpret_cast<const char *>(&vt[0]);
+  res = std::vector<char>(arrayPtr, arrayPtr + size);
 }
 
 /// Create or get a constant in the constant pool for a given ONNXConstantOp.
 /// Return the constant index in the pool.
-std::vector<char> ConstantPoolcreateOrGet(
-    PatternRewriter &rewriter, Operation *op) {
+void ConstantPoolcreateOrGet(
+    PatternRewriter &rewriter, Operation *op, std::vector<char> &res) {
   ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
   assert(constOp && "Not a constant operation");
 
-  Attribute constantIDAttr =
-      op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
-  unsigned constantID;
-  if (constantIDAttr) {
-    // The OMTensor for this constant op existed in the constant pool.
-    // Just get its index in the constant pool.
-    constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
-    return ConstantPoolget(constantID);
+  Attribute fileNameAttr = op->getAttrOfType<::mlir::Attribute>(FILE_NAME_ATTR);
+  if (fileNameAttr) {
+    StringRef fileName = fileNameAttr.cast<StringAttr>().getValue();
+    std::string pathStr = std::string(fileName.begin(), fileName.end());
+    std::ifstream file(pathStr, std::ios::binary);
+    res = std::vector<char>((std::istreambuf_iterator<char>(file)),
+        std::istreambuf_iterator<char>());
   } else {
-    return ConstantPoolcreate(rewriter, op);
+    // Create a new OMTensor, and add it to the constant pool.
+    DenseElementsAttr dataAttr =
+        op->getAttrOfType<::mlir::Attribute>("value")
+            .dyn_cast_or_null<mlir::DenseElementsAttr>();
+    Type elementType = dataAttr.getType().cast<ShapedType>().getElementType();
+    std::vector<int64_t> shape =
+        dataAttr.getType().cast<ShapedType>().getShape();
+    int64_t elementCount = 1;
+    for (int i = 0; i < shape.size(); ++i)
+      elementCount *= shape[i];
+
+    // copy data.
+    if (elementType.isa<FloatType>()) {
+      auto it = dataAttr.getValues<FloatAttr>().begin();
+      FloatType floatTy = elementType.cast<FloatType>();
+      if (floatTy.getWidth() == 32) {
+        std::vector<float> vt;
+        for (int64_t i = 0; i < elementCount; ++i) {
+          vt.emplace_back(getAttrValue<float>(*it++));
+        }
+        convertFromVectorType<float>(vt, res);
+      } else if (floatTy.getWidth() == 64) {
+        std::vector<double> vt;
+        for (int64_t i = 0; i < elementCount; ++i) {
+          vt.emplace_back(getAttrValue<double>(*it++));
+        }
+        convertFromVectorType<double>(vt, res);
+      } else
+        llvm_unreachable("Unsupported data type");
+    } else if (elementType.isa<IntegerType>()) {
+      auto it = dataAttr.getValues<IntegerAttr>().begin();
+      IntegerType intTy = elementType.cast<IntegerType>();
+      if (intTy.getWidth() == 32) {
+        std::vector<int32_t> vt;
+        for (int64_t i = 0; i < elementCount; ++i) {
+          vt.emplace_back(getAttrValue<int32_t>(*it++));
+        }
+        convertFromVectorType<int32_t>(vt, res);
+      } else if (intTy.getWidth() == 64) {
+        std::vector<int64_t> vt;
+        for (int64_t i = 0; i < elementCount; ++i) {
+          vt.emplace_back(getAttrValue<int64_t>(*it++));
+        }
+        convertFromVectorType<int64_t>(vt, res);
+      } else
+        llvm_unreachable("Unsupported data type");
+    } else
+      llvm_unreachable("Unsupported data type");
   }
 }
 
@@ -240,17 +169,19 @@ RankedTensorType constructRankedTensorType(ShapedType type) {
 
 ///  A helper function to construct a DenseElementsAttr from an OMTensor.
 static DenseElementsAttr createDenseElementsAttr(
-    std::vector<char> omt, ShapedType outputType) {
+    const std::vector<char> &omt, ShapedType outputType) {
   RankedTensorType resType = constructRankedTensorType(outputType);
   // FloatType
   if (resType.getElementType().isa<FloatType>()) {
     FloatType floatTy = resType.getElementType().cast<FloatType>();
     if (floatTy.getWidth() == 32) {
-      std::vector<float> res = convertToVectorType<float>(omt);
+      std::vector<float> res;
+      convertToVectorType<float>(omt, res);
       return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
     }
     if (floatTy.getWidth() == 64) {
-      std::vector<double> res = convertToVectorType<double>(omt);
+      std::vector<double> res;
+      convertToVectorType<double>(omt, res);
       return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
     }
   }
@@ -259,11 +190,13 @@ static DenseElementsAttr createDenseElementsAttr(
   if (resType.getElementType().isa<IntegerType>()) {
     IntegerType intTy = resType.getElementType().cast<IntegerType>();
     if (intTy.getWidth() == 32) {
-      std::vector<int32_t> res = convertToVectorType<int32_t>(omt);
+      std::vector<int32_t> res;
+      convertToVectorType<int32_t>(omt, res);
       return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
     }
     if (intTy.getWidth() == 64) {
-      std::vector<int64_t> res = convertToVectorType<int64_t>(omt);
+      std::vector<int64_t> res;
+      convertToVectorType<int64_t>(omt, res);
       return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
     }
   }
@@ -272,18 +205,24 @@ static DenseElementsAttr createDenseElementsAttr(
   return DenseElementsAttr();
 }
 
-ONNXConstantOp CreateDenseONNXConstantOp(
-    PatternRewriter &rewriter, Value replacingValue, unsigned constantID) {
+ONNXConstantOp CreateDenseONNXConstantOp(PatternRewriter &rewriter,
+    Value replacingValue, const std::vector<char> &vt) {
   Location loc = replacingValue.getLoc();
 
   ONNXConstantOp constOp = rewriter.create<ONNXConstantOp>(
       loc, replacingValue.getType(), Attribute(), Attribute());
 
-  // Set constant index in the constant pool.
-  constOp.getOperation()->setAttr(CONSTANT_ID_ATTR_NAME,
-      IntegerAttr::get(
-          rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
-          constantID));
+  // Write to file.
+  llvm::SmallVector<char, 10> path;
+  llvm::sys::fs::createTemporaryFile("constprop", "tmp", path);
+  std::string pathStr = std::string(path.begin(), path.end());
+
+  std::ofstream outfile(pathStr, std::ofstream::binary);
+  outfile.write(vt.data(), vt.size());
+
+  // Store the file name.
+  constOp.getOperation()->setAttr(
+      FILE_NAME_ATTR, rewriter.getStringAttr(pathStr));
   return constOp;
 }
 
@@ -326,15 +265,17 @@ T ComputeConstPropElementwiseBinary(T lhs, T rhs) {
 }
 
 template <typename ElementwiseBinaryOp, typename T>
-std::vector<char> IterateConstPropElementwiseBinary(std::vector<char> lhsOmt,
+void IterateConstPropElementwiseBinary(std::vector<char> lhsOmt,
     std::vector<char> rhsOmt, ArrayRef<int64_t> lhsShape,
-    ArrayRef<int64_t> rhsShape, Type outputType) {
+    ArrayRef<int64_t> rhsShape, Type outputType, std::vector<char> &res) {
   auto outputShape = outputType.cast<ShapedType>().getShape();
   int lhsRank = lhsShape.size();
   int rhsRank = rhsShape.size();
   int outputRank = outputShape.size();
-  std::vector<T> lhsVt = convertToVectorType<T>(lhsOmt);
-  std::vector<T> rhsVt = convertToVectorType<T>(rhsOmt);
+  std::vector<T> lhsVt;
+  convertToVectorType<T>(lhsOmt, lhsVt);
+  std::vector<T> rhsVt;
+  convertToVectorType<T>(rhsOmt, rhsVt);
 
   // Check broadcasting.
   bool broadcasting = false;
@@ -426,7 +367,7 @@ std::vector<char> IterateConstPropElementwiseBinary(std::vector<char> lhsOmt,
         lhsValue, rhsValue);
     resOmt.emplace_back(res);
   }
-  return convertFromVectorType<T>(resOmt);
+  convertFromVectorType<T>(resOmt, res);
 }
 
 /// Do element-wise binary calculation of 'lhs' and 'rhs' values and create an
@@ -442,8 +383,10 @@ ONNXConstantOp ConstPropElementwiseBinary(
   ArrayRef<int64_t> rhsShape = rhs.getType().cast<ShapedType>().getShape();
 
   // Get lhs and rhs values as OMTensors.
-  std::vector<char> lhsOmt = ConstantPoolcreateOrGet(rewriter, lhsOp);
-  std::vector<char> rhsOmt = ConstantPoolcreateOrGet(rewriter, rhsOp);
+  std::vector<char> lhsOmt;
+  ConstantPoolcreateOrGet(rewriter, lhsOp, lhsOmt);
+  std::vector<char> rhsOmt;
+  ConstantPoolcreateOrGet(rewriter, rhsOp, rhsOmt);
 
   // Do calculation.
   std::vector<char> resOmt;
@@ -451,37 +394,35 @@ ONNXConstantOp ConstPropElementwiseBinary(
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
     if (floatTy.getWidth() == 32) {
-      resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, float>(
-          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType);
+      IterateConstPropElementwiseBinary<ElementwiseBinaryOp, float>(
+          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType, resOmt);
     }
     if (floatTy.getWidth() == 64) {
-      resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, double>(
-          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType);
+      IterateConstPropElementwiseBinary<ElementwiseBinaryOp, double>(
+          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType, resOmt);
     }
   } else if (elementType.isa<IntegerType>()) {
     // IntegerType
     IntegerType intTy = elementType.cast<IntegerType>();
     if (intTy.getWidth() == 32) {
-      resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int32_t>(
-          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType);
+      IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int32_t>(
+          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType, resOmt);
     }
     if (intTy.getWidth() == 64) {
-      resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int64_t>(
-          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType);
+      IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int64_t>(
+          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType, resOmt);
     }
   } else
     llvm_unreachable("Unknown data type");
 
-  // Add the result to the constant pool.
-  unsigned constantID = ConstantPoolput(resOmt);
-
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
-      CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
+      CreateDenseONNXConstantOp(rewriter, replacingValue, resOmt);
 
-  // Clean up memory for lhs and rhs if they are only used here.
-  ConstantPoolupdate(rewriter, lhsOp);
-  ConstantPoolupdate(rewriter, rhsOp);
+  // Clean
+  lhsOmt = std::vector<char>();
+  rhsOmt = std::vector<char>();
+  resOmt = std::vector<char>();
 
   return res;
 }
@@ -510,11 +451,12 @@ T ComputeConstPropElementwiseUnary(T val) {
 }
 
 template <typename ElementwiseUnaryOp, typename T>
-std::vector<char> IterateConstPropElementwiseUnary(
-    std::vector<char> omt, Type outputType) {
+void IterateConstPropElementwiseUnary(
+    std::vector<char> omt, Type outputType, std::vector<char> &res) {
   auto outputShape = outputType.cast<ShapedType>().getShape();
   int outputRank = outputShape.size();
-  std::vector<T> inputVt = convertToVectorType<T>(omt);
+  std::vector<T> inputVt;
+  convertToVectorType<T>(omt, inputVt);
 
   int64_t elementCount = 1;
   for (int i = outputRank - 1; i >= 0; i--) {
@@ -529,7 +471,7 @@ std::vector<char> IterateConstPropElementwiseUnary(
     T res = ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(value);
     resOmt.emplace_back(res);
   }
-  return convertFromVectorType<T>(resOmt);
+  convertFromVectorType<T>(resOmt, res);
 }
 
 /// Do element-wise unary calculation of 'input' value and create an
@@ -542,7 +484,8 @@ ONNXConstantOp ConstPropElementwiseUnary(
   Operation *inputOp = input.getDefiningOp();
 
   // Get input value as OMTensor.
-  std::vector<char> inputOmt = ConstantPoolcreateOrGet(rewriter, inputOp);
+  std::vector<char> inputOmt;
+  ConstantPoolcreateOrGet(rewriter, inputOp, inputOmt);
 
   // Do calculation.
   std::vector<char> resOmt;
@@ -550,36 +493,34 @@ ONNXConstantOp ConstPropElementwiseUnary(
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
     if (floatTy.getWidth() == 32) {
-      resOmt = IterateConstPropElementwiseUnary<ElementwiseUnaryOp, float>(
-          inputOmt, outputType);
+      IterateConstPropElementwiseUnary<ElementwiseUnaryOp, float>(
+          inputOmt, outputType, resOmt);
     }
     if (floatTy.getWidth() == 64) {
-      resOmt = IterateConstPropElementwiseUnary<ElementwiseUnaryOp, double>(
-          inputOmt, outputType);
+      IterateConstPropElementwiseUnary<ElementwiseUnaryOp, double>(
+          inputOmt, outputType, resOmt);
     }
   } else if (elementType.isa<IntegerType>()) {
     // IntegerType
     IntegerType intTy = elementType.cast<IntegerType>();
     if (intTy.getWidth() == 32) {
-      resOmt = IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int32_t>(
-          inputOmt, outputType);
+      IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int32_t>(
+          inputOmt, outputType, resOmt);
     }
     if (intTy.getWidth() == 64) {
-      resOmt = IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int64_t>(
-          inputOmt, outputType);
+      IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int64_t>(
+          inputOmt, outputType, resOmt);
     }
   } else
     llvm_unreachable("Unknown data type");
 
-  // Add the result to the constant pool.
-  unsigned constantID = ConstantPoolput(resOmt);
-
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
-      CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
+      CreateDenseONNXConstantOp(rewriter, replacingValue, resOmt);
 
-  // Clean up memory for input if it is only used here.
-  ConstantPoolupdate(rewriter, inputOp);
+  // Clean
+  inputOmt = std::vector<char>();
+  resOmt = std::vector<char>();
 
   return res;
 }
@@ -651,7 +592,8 @@ ONNXConstantOp ConstPropUnsqueeze(
   Operation *inputOp = input.getDefiningOp();
 
   // Get input value as OMTensor.
-  std::vector<char> inputOmt = ConstantPoolcreateOrGet(rewriter, inputOp);
+  std::vector<char> inputOmt;
+  ConstantPoolcreateOrGet(rewriter, inputOp, inputOmt);
 
   // Do calculation.
   std::vector<char> resOmt;
@@ -676,15 +618,13 @@ ONNXConstantOp ConstPropUnsqueeze(
   } else
     llvm_unreachable("Unknown data type");
 
-  // Add the result to the constant pool.
-  unsigned constantID = ConstantPoolput(resOmt);
-
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
-      CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
+      CreateDenseONNXConstantOp(rewriter, replacingValue, resOmt);
 
-  // Clean up memory for input if it is only used here.
-  ConstantPoolupdate(rewriter, inputOp);
+  // Clean
+  inputOmt = std::vector<char>();
+  resOmt = std::vector<char>();
 
   return res;
 }
@@ -854,20 +794,24 @@ void ConstPropONNXToONNXPass::runOnFunction() {
   // Create DenseElementsAttr and clean up helper attributes.
   function.walk([&](ONNXConstantOp constOp) {
     Operation *op = constOp.getOperation();
-    Attribute constantIDAttr =
-        op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
-    if (constantIDAttr) {
-      unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
-      std::vector<char> omt = ConstantPoolget(constantID);
+    Attribute fileNameAttr =
+        op->getAttrOfType<::mlir::Attribute>(FILE_NAME_ATTR);
+    if (fileNameAttr) {
+      Attribute fileNameAttr =
+          op->getAttrOfType<::mlir::Attribute>(FILE_NAME_ATTR);
+      StringRef fileName = fileNameAttr.cast<StringAttr>().getValue();
+      std::string pathStr = std::string(fileName.begin(), fileName.end());
+      std::ifstream file(pathStr, std::ios::binary);
+      std::vector<char> omt =
+          std::vector<char>((std::istreambuf_iterator<char>(file)),
+              std::istreambuf_iterator<char>());
       ShapedType outputType = constOp.getResult().getType().cast<ShapedType>();
       DenseElementsAttr denseAttr = createDenseElementsAttr(omt, outputType);
       op->setAttr("value", denseAttr);
-      op->removeAttr(CONSTANT_ID_ATTR_NAME);
-      ConstantPoolerase(constantID);
+      op->removeAttr(FILE_NAME_ATTR);
+      omt = std::vector<char>();
     }
   });
-  // Clean up the constant pool.
-  ConstantPoolreset();
 } // end anonymous namespace
 
 /*!
