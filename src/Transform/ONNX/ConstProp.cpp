@@ -23,14 +23,12 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/DenseMap.h"
 
-#include "onnx-mlir/Runtime/OMTensor.h"
 #include "src/Dialect/ONNX/ONNXOps.hpp"
 #include "src/Pass/Passes.hpp"
-#include "src/Runtime/OMTensorHelper.h"
 
-#include "llvm/ADT/SmallPtrSet.h"
 #include <alloca.h>
 #include <fstream>
+#include <iostream>
 #include <math.h>
 
 using namespace mlir;
@@ -82,19 +80,6 @@ int32_t getAttrValue(Attribute attr) {
   return attr.cast<IntegerAttr>().getInt();
 }
 
-template <typename T>
-void convertToVectorType(const std::vector<char> &vt, std::vector<T> &res) {
-  int size = vt.size() / sizeof(T);
-  const T *arrayPtr = reinterpret_cast<const T *>(&vt[0]);
-  res = std::vector<T>(arrayPtr, arrayPtr + size);
-}
-
-template <typename T>
-void convertFromVectorType(const std::vector<T> &vt, std::vector<char> &res) {
-  int size = vt.size() * sizeof(T);
-  const char *arrayPtr = reinterpret_cast<const char *>(&vt[0]);
-  res = std::vector<char>(arrayPtr, arrayPtr + size);
-}
 /// Get the element size in bytes.
 int64_t getEltSizeInBytes(Type ty) {
   auto elementType = ty.cast<ShapedType>().getElementType();
@@ -110,9 +95,9 @@ int64_t getEltSizeInBytes(Type ty) {
   return llvm::divideCeil(sizeInBits, 8);
 }
 
-/// Get the size of a static SSA value in bytes.
-int64_t getSizeInBytes(Value value) {
-  ShapedType shapedType = value.getType().dyn_cast<ShapedType>();
+/// Get the size of a tensor from its ranked type in bytes.
+int64_t getSizeInBytes(Type ty) {
+  ShapedType shapedType = ty.dyn_cast<ShapedType>();
   auto shape = shapedType.getShape();
   int64_t size = 1;
   for (int i = 0; i < shape.size(); i++)
@@ -121,14 +106,59 @@ int64_t getSizeInBytes(Value value) {
   return size;
 }
 
-/// Create or get a constant in the constant pool for a given ONNXConstantOp.
-/// Return the constant index in the pool.
-void ConstantPoolcreateOrGet(
-    PatternRewriter &rewriter, Operation *op, char *res) {
+/// Get the number of elements.
+int64_t getNumberOfElements(ArrayRef<int64_t> shape) {
+  int64_t count = 1;
+  for (int i = 0; i < shape.size(); ++i) {
+    count *= shape[i];
+  }
+  return count;
+}
+
+/// Compute strides for a given shape.
+std::vector<int64_t> getStrides(ArrayRef<int64_t> shape) {
+  int rank = shape.size();
+  std::vector<int64_t> strides;
+  int64_t count = 1;
+  for (int i = rank - 1; i >= 0; i--) {
+    strides.insert(strides.begin(), count);
+    count *= shape[i];
+  }
+  return strides;
+}
+
+/// Compute the linear access index.
+int64_t getLinearAccessIndex(
+    ArrayRef<int64_t> indices, ArrayRef<int64_t> strides) {
+  int64_t index = 0;
+  for (int i = 0; i < strides.size(); ++i)
+    index += indices[i] * strides[i];
+  return index;
+}
+
+// Compute the tensor access index from a linear index.
+std::vector<int64_t> getAccessIndex(
+    int64_t linearIndex, ArrayRef<int64_t> strides) {
+  std::vector<int64_t> res;
+  for (int i = 0; i < strides.size(); ++i) {
+    int64_t s = strides[i];
+    if (linearIndex < s) {
+      res.emplace_back(0);
+    } else {
+      res.emplace_back(floor(linearIndex / s));
+      linearIndex = linearIndex % s;
+    }
+  }
+  return res;
+}
+
+/// Get a data array from a given ONNXConstantOp. If data were stored to a file,
+/// get from the file. Otherwise, get from the dense attribute.
+void getArrayFromAttributeOrFile(Operation *op, char *res) {
   ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
   assert(constOp && "Not a constant operation");
 
-  int64_t size = getSizeInBytes(constOp.getResult());
+  int64_t size = getSizeInBytes(constOp.getResult().getType());
 
   Attribute fileNameAttr = op->getAttrOfType<::mlir::Attribute>(FILE_NAME_ATTR);
   if (fileNameAttr) {
@@ -151,48 +181,21 @@ RankedTensorType constructRankedTensorType(ShapedType type) {
   return RankedTensorType::get(type.getShape(), type.getElementType());
 }
 
-///  A helper function to construct a DenseElementsAttr from an OMTensor.
-static DenseElementsAttr createDenseElementsAttr(
-    const std::vector<char> &omt, ShapedType outputType) {
-  RankedTensorType resType = constructRankedTensorType(outputType);
-  // FloatType
-  if (resType.getElementType().isa<FloatType>()) {
-    FloatType floatTy = resType.getElementType().cast<FloatType>();
-    if (floatTy.getWidth() == 32) {
-      std::vector<float> res;
-      convertToVectorType<float>(omt, res);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
-    }
-    if (floatTy.getWidth() == 64) {
-      std::vector<double> res;
-      convertToVectorType<double>(omt, res);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
-    }
-  }
-
-  // IntegerType
-  if (resType.getElementType().isa<IntegerType>()) {
-    IntegerType intTy = resType.getElementType().cast<IntegerType>();
-    if (intTy.getWidth() == 32) {
-      std::vector<int32_t> res;
-      convertToVectorType<int32_t>(omt, res);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
-    }
-    if (intTy.getWidth() == 64) {
-      std::vector<int64_t> res;
-      convertToVectorType<int64_t>(omt, res);
-      return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
-    }
-  }
-
-  llvm_unreachable("Unknown data type");
-  return DenseElementsAttr();
+///  A helper function to construct a DenseElementsAttr from an array.
+static DenseElementsAttr createDenseElementsAttr(char *arr, Type outputType) {
+  int64_t size = getSizeInBytes(outputType);
+  RankedTensorType resType =
+      constructRankedTensorType(outputType.cast<ShapedType>());
+  return DenseElementsAttr::getFromRawBuffer(
+      resType, ArrayRef<char>(arr, size), /*isSplat=*/false);
 }
 
+/// A helper function to create an ONNXConstantOp for a given data array.
+/// This ONNXConstantOp is only used internally.
 ONNXConstantOp CreateDenseONNXConstantOp(
     PatternRewriter &rewriter, Value replacingValue, char *vt) {
   Location loc = replacingValue.getLoc();
-  int64_t size = getSizeInBytes(replacingValue);
+  int64_t size = getSizeInBytes(replacingValue.getType());
 
   ONNXConstantOp constOp = rewriter.create<ONNXConstantOp>(
       loc, replacingValue.getType(), Attribute(), Attribute());
@@ -215,9 +218,9 @@ ONNXConstantOp CreateDenseONNXConstantOp(
 // Code to perform constant propagation for binary in presence of broadcast.
 //===----------------------------------------------------------------------===//
 
-// Template to generate binary operation results. It takes as inupt
-// the element type as well as the two element attributes for the
-// operation, and return the result of the operation.
+// Template to generate binary operation results. It takes as inupt the element
+// type as well as the two element attributes for the operation, and return the
+// result of the operation.
 
 template <typename OP, typename T>
 struct ElementWiseBinaryOpImpl {
@@ -251,11 +254,17 @@ T ComputeConstPropElementwiseBinary(T lhs, T rhs) {
 
 template <typename ElementwiseBinaryOp, typename T>
 void IterateConstPropElementwiseBinary(char *lhs, char *rhs,
-    ArrayRef<int64_t> lhsShape, ArrayRef<int64_t> rhsShape,
-    ArrayRef<int64_t> outputShape, char *res) {
+    ArrayRef<int64_t> lhsShape, ArrayRef<int64_t> rhsShape, char *res,
+    ArrayRef<int64_t> outputShape) {
+  // Rank info.
   int lhsRank = lhsShape.size();
   int rhsRank = rhsShape.size();
   int outputRank = outputShape.size();
+  // Strides info.
+  std::vector<int64_t> outputStrides = getStrides(outputShape);
+  std::vector<int64_t> lhsStrides = getStrides(lhsShape);
+  std::vector<int64_t> rhsStrides = getStrides(rhsShape);
+  // Data pointers.
   T *lhsArray = reinterpret_cast<T *>(lhs);
   T *rhsArray = reinterpret_cast<T *>(rhs);
   T *resArray = reinterpret_cast<T *>(res);
@@ -271,76 +280,45 @@ void IterateConstPropElementwiseBinary(char *lhs, char *rhs,
         break;
       }
 
-  SmallVector<int64_t, 4> strides(outputRank, 0);
-  int64_t elementCount = 1;
-  for (int i = outputRank - 1; i >= 0; i--) {
-    strides[i] = elementCount;
-    elementCount *= outputShape[i];
-  }
-  SmallVector<int64_t, 4> lhsStrides(lhsRank, 0);
-  int64_t count = 1;
-  for (int i = lhsRank - 1; i >= 0; i--) {
-    lhsStrides[i] = count;
-    count *= lhsShape[i];
-  }
-  SmallVector<int64_t, 4> rhsStrides(rhsRank, 0);
-  count = 1;
-  for (int i = rhsRank - 1; i >= 0; i--) {
-    rhsStrides[i] = count;
-    count *= rhsShape[i];
-  }
-
-  // Initialize a result OMTensor.
-  for (int64_t i = 0; i < elementCount; ++i) {
+  // Do computation.
+  for (int64_t i = 0; i < getNumberOfElements(outputShape); ++i) {
     // Compute indices to access the output.
-    SmallVector<int64_t, 4> outputIndices(outputRank, 0);
-    int64_t x = i;
-    for (int j = 0; j < outputRank; ++j) {
-      int64_t s = strides[j];
-      if (x < s)
-        outputIndices[j] = 0;
-      else {
-        outputIndices[j] = floor(x / s);
-        x = x % s;
-      }
-    }
+    std::vector<int64_t> outputIndices = getAccessIndex(i, outputStrides);
 
     // Compute indices to access inputs.
-    SmallVector<int64_t, 4> lhsIndices, rhsIndices;
-    if (!broadcasting)
+    SmallVector<int64_t, 4> lhsIndices(lhsRank, 0);
+    SmallVector<int64_t, 4> rhsIndices(rhsRank, 0);
+    if (!broadcasting) {
       for (int k = 0; k < outputRank; ++k) {
-        lhsIndices.emplace_back(outputIndices[k]);
-        rhsIndices.emplace_back(outputIndices[k]);
+        lhsIndices[k] = outputIndices[k];
+        rhsIndices[k] = outputIndices[k];
       }
-    else
+    } else {
       for (int k = 0; k < outputRank; ++k) {
         // in the lhs index range.
         if (k >= outputRank - lhsRank) {
           int lhsIndex = k - outputRank + lhsRank;
           if (lhsShape[lhsIndex] == 1)
             // broadcast
-            lhsIndices.emplace_back(0);
+            lhsIndices[lhsIndex] = 0;
           else
-            lhsIndices.emplace_back(outputIndices[k]);
+            lhsIndices[lhsIndex] = outputIndices[k];
         }
         // in the rhs index range.
         if (k >= outputRank - rhsRank) {
           int rhsIndex = k - outputRank + rhsRank;
           if (rhsShape[rhsIndex] == 1)
             // broadcast
-            rhsIndices.emplace_back(0);
+            rhsIndices[rhsIndex] = 0;
           else
-            rhsIndices.emplace_back(outputIndices[k]);
+            rhsIndices[rhsIndex] = outputIndices[k];
         }
       }
+    }
 
     // Calculate element-wise binary result.
-    int64_t lhsOffset = 0;
-    for (int j = 0; j < lhsStrides.size(); ++j)
-      lhsOffset += lhsIndices[j] * lhsStrides[j];
-    int64_t rhsOffset = 0;
-    for (int j = 0; j < rhsStrides.size(); ++j)
-      rhsOffset += rhsIndices[j] * rhsStrides[j];
+    int64_t lhsOffset = getLinearAccessIndex(lhsIndices, lhsStrides);
+    int64_t rhsOffset = getLinearAccessIndex(rhsIndices, rhsStrides);
 
     T lhsValue = *(lhsArray + lhsOffset);
     T rhsValue = *(rhsArray + rhsOffset);
@@ -354,51 +332,47 @@ void IterateConstPropElementwiseBinary(char *lhs, char *rhs,
 template <typename ElementwiseBinaryOp>
 ONNXConstantOp ConstPropElementwiseBinary(
     PatternRewriter &rewriter, Value replacingValue, Value lhs, Value rhs) {
-  Type outputType = replacingValue.getType();
-  Type elementType = outputType.cast<ShapedType>().getElementType();
-  Operation *lhsOp = lhs.getDefiningOp();
-  Operation *rhsOp = rhs.getDefiningOp();
+  Type elementType =
+      replacingValue.getType().cast<ShapedType>().getElementType();
   ArrayRef<int64_t> lhsShape = lhs.getType().cast<ShapedType>().getShape();
   ArrayRef<int64_t> rhsShape = rhs.getType().cast<ShapedType>().getShape();
   ArrayRef<int64_t> outputShape =
       replacingValue.getType().cast<ShapedType>().getShape();
 
-  // Get lhs and rhs values as OMTensors.
-  char *lhsData = (char *)alloca(getSizeInBytes(lhs));
-  ConstantPoolcreateOrGet(rewriter, lhsOp, lhsData);
-  char *rhsData = (char *)alloca(getSizeInBytes(rhs));
-  ConstantPoolcreateOrGet(rewriter, rhsOp, rhsData);
+  // Get lhs and rhs values.
+  char *lhsArray = (char *)alloca(getSizeInBytes(lhs.getType()));
+  getArrayFromAttributeOrFile(lhs.getDefiningOp(), lhsArray);
+  char *rhsArray = (char *)alloca(getSizeInBytes(rhs.getType()));
+  getArrayFromAttributeOrFile(rhs.getDefiningOp(), rhsArray);
 
   // Do calculation.
-  char *resData = (char *)alloca(getSizeInBytes(replacingValue));
+  char *resArray = (char *)alloca(getSizeInBytes(replacingValue.getType()));
   if (elementType.isa<FloatType>()) {
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
     if (floatTy.getWidth() == 32) {
       IterateConstPropElementwiseBinary<ElementwiseBinaryOp, float>(
-          lhsData, rhsData, lhsShape, rhsShape, outputShape, resData);
-    }
-    if (floatTy.getWidth() == 64) {
+          lhsArray, rhsArray, lhsShape, rhsShape, resArray, outputShape);
+    } else if (floatTy.getWidth() == 64) {
       IterateConstPropElementwiseBinary<ElementwiseBinaryOp, double>(
-          lhsData, rhsData, lhsShape, rhsShape, outputShape, resData);
+          lhsArray, rhsArray, lhsShape, rhsShape, resArray, outputShape);
     }
   } else if (elementType.isa<IntegerType>()) {
     // IntegerType
     IntegerType intTy = elementType.cast<IntegerType>();
     if (intTy.getWidth() == 32) {
       IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int32_t>(
-          lhsData, rhsData, lhsShape, rhsShape, outputShape, resData);
-    }
-    if (intTy.getWidth() == 64) {
+          lhsArray, rhsArray, lhsShape, rhsShape, resArray, outputShape);
+    } else if (intTy.getWidth() == 64) {
       IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int64_t>(
-          lhsData, rhsData, lhsShape, rhsShape, outputShape, resData);
+          lhsArray, rhsArray, lhsShape, rhsShape, resArray, outputShape);
     }
   } else
     llvm_unreachable("Unknown data type");
 
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
-      CreateDenseONNXConstantOp(rewriter, replacingValue, resData);
+      CreateDenseONNXConstantOp(rewriter, replacingValue, resArray);
 
   return res;
 }
@@ -428,15 +402,13 @@ T ComputeConstPropElementwiseUnary(T val) {
 
 template <typename ElementwiseUnaryOp, typename T>
 void IterateConstPropElementwiseUnary(
-    char *input, ArrayRef<int64_t> outputShape, char *res) {
+    char *input, char *res, ArrayRef<int64_t> outputShape) {
+  // Data pointers.
   T *inputArray = reinterpret_cast<T *>(input);
   T *resArray = reinterpret_cast<T *>(res);
-  int64_t elementCount = 1;
-  for (int i = outputShape.size() - 1; i >= 0; i--) {
-    elementCount *= outputShape[i];
-  }
 
-  for (int64_t i = 0; i < elementCount; ++i) {
+  // Calculate element-wise unary result.
+  for (int64_t i = 0; i < getNumberOfElements(outputShape); ++i) {
     *(resArray + i) = ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(
         *(inputArray + i));
   }
@@ -447,46 +419,47 @@ void IterateConstPropElementwiseUnary(
 template <typename ElementwiseUnaryOp>
 ONNXConstantOp ConstPropElementwiseUnary(
     PatternRewriter &rewriter, Value replacingValue, Value input) {
-  Type outputType = replacingValue.getType();
-  Type elementType = outputType.cast<ShapedType>().getElementType();
   Operation *inputOp = input.getDefiningOp();
+  Type elementType =
+      replacingValue.getType().cast<ShapedType>().getElementType();
   ArrayRef<int64_t> outputShape =
       replacingValue.getType().cast<ShapedType>().getShape();
+  int64_t size = getSizeInBytes(input.getType());
 
-  // Get input value as OMTensor.
-  char *inputData = (char *)alloca(getSizeInBytes(input));
-  ConstantPoolcreateOrGet(rewriter, inputOp, inputData);
-  char *resData = (char *)alloca(getSizeInBytes(replacingValue));
+  // Get the input value.
+  char *inputArray = (char *)alloca(size);
+  getArrayFromAttributeOrFile(inputOp, inputArray);
 
   // Do calculation.
+  char *resArray = (char *)alloca(size);
   if (elementType.isa<FloatType>()) {
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
     if (floatTy.getWidth() == 32) {
       IterateConstPropElementwiseUnary<ElementwiseUnaryOp, float>(
-          inputData, outputShape, resData);
+          inputArray, resArray, outputShape);
     }
     if (floatTy.getWidth() == 64) {
       IterateConstPropElementwiseUnary<ElementwiseUnaryOp, double>(
-          inputData, outputShape, resData);
+          inputArray, resArray, outputShape);
     }
   } else if (elementType.isa<IntegerType>()) {
     // IntegerType
     IntegerType intTy = elementType.cast<IntegerType>();
     if (intTy.getWidth() == 32) {
       IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int32_t>(
-          inputData, outputShape, resData);
+          inputArray, resArray, outputShape);
     }
     if (intTy.getWidth() == 64) {
       IterateConstPropElementwiseUnary<ElementwiseUnaryOp, int64_t>(
-          inputData, outputShape, resData);
+          inputArray, resArray, outputShape);
     }
   } else
     llvm_unreachable("Unknown data type");
 
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
-      CreateDenseONNXConstantOp(rewriter, replacingValue, resData);
+      CreateDenseONNXConstantOp(rewriter, replacingValue, resArray);
 
   return res;
 }
@@ -551,12 +524,12 @@ ONNXConstantOp ConstPropUnsqueeze(
   Type elementType = outputType.cast<ShapedType>().getElementType();
   Operation *inputOp = input.getDefiningOp();
 
-  char *resData = (char *)alloca(getSizeInBytes(replacingValue));
-  ConstantPoolcreateOrGet(rewriter, inputOp, resData);
+  char *resArray = (char *)alloca(getSizeInBytes(replacingValue.getType()));
+  getArrayFromAttributeOrFile(inputOp, resArray);
 
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
-      CreateDenseONNXConstantOp(rewriter, replacingValue, resData);
+      CreateDenseONNXConstantOp(rewriter, replacingValue, resArray);
 
   return res;
 }
@@ -726,22 +699,14 @@ void ConstPropONNXToONNXPass::runOnFunction() {
   // Create DenseElementsAttr and clean up helper attributes.
   function.walk([&](ONNXConstantOp constOp) {
     Operation *op = constOp.getOperation();
-    Attribute fileNameAttr =
-        op->getAttrOfType<::mlir::Attribute>(FILE_NAME_ATTR);
-    if (fileNameAttr) {
-      Attribute fileNameAttr =
-          op->getAttrOfType<::mlir::Attribute>(FILE_NAME_ATTR);
-      StringRef fileName = fileNameAttr.cast<StringAttr>().getValue();
-      std::string pathStr = std::string(fileName.begin(), fileName.end());
-      std::ifstream file(pathStr, std::ios::binary);
-      std::vector<char> omt =
-          std::vector<char>((std::istreambuf_iterator<char>(file)),
-              std::istreambuf_iterator<char>());
-      ShapedType outputType = constOp.getResult().getType().cast<ShapedType>();
-      DenseElementsAttr denseAttr = createDenseElementsAttr(omt, outputType);
+    if (op->getAttrOfType<::mlir::Attribute>(FILE_NAME_ATTR)) {
+      int64_t size = getSizeInBytes(constOp.getResult().getType());
+      ShapedType type = constOp.getResult().getType().cast<ShapedType>();
+      char *arr = (char *)alloca(size);
+      getArrayFromAttributeOrFile(op, arr);
+      DenseElementsAttr denseAttr = createDenseElementsAttr(arr, type);
       op->setAttr("value", denseAttr);
       op->removeAttr(FILE_NAME_ATTR);
-      omt = std::vector<char>();
     }
   });
 } // end anonymous namespace
