@@ -53,6 +53,7 @@ namespace {
 //
 
 const StringRef CONSTANT_ID_ATTR_NAME = "constantID";
+const StringRef FILE_NAME_ATTR = "file_name";
 
 /// A helper function to get a value of a given type from an attribute.
 template <typename T>
@@ -80,79 +81,68 @@ int32_t getAttrValue(Attribute attr) {
   return attr.cast<IntegerAttr>().getInt();
 }
 
+template <typename T>
+std::vector<T> convertToVectorType(std::vector<char> vt) {
+  int size = vt.size() / sizeof(T);
+  T *arrayPtr = reinterpret_cast<T *>(&vt[0]);
+  std::vector<T> res = std::vector<T>(arrayPtr, arrayPtr + size);
+  return res;
+}
+
+template <typename T>
+std::vector<char> convertFromVectorType(std::vector<T> vt) {
+  int size = vt.size() * sizeof(T);
+  char *arrayPtr = reinterpret_cast<char *>(&vt[0]);
+  std::vector<char> res = std::vector<char>(arrayPtr, arrayPtr + size);
+  return res;
+}
+
 //===----------------------------------------------------------------------===//
 // Code for a constant pool to store intermediate constants.
 //===----------------------------------------------------------------------===//
-struct ConstantPool {
-  static unsigned header;
-  static int64_t size;
-  static int64_t nd;
-  static DenseMap<unsigned,
-      std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>>
-      storage;
-  static OMTensor *get(unsigned id);
-  static unsigned put(OMTensor *omt);
-  static unsigned createOrGet(PatternRewriter &rewriter, Operation *op);
-  static bool erase(unsigned id);
-  static bool update(PatternRewriter &rewriter, Operation *op);
-  static void reset();
-};
-unsigned ConstantPool::header = 0;
-int64_t ConstantPool::size = 0;
-int64_t ConstantPool::nd = 0;
-DenseMap<unsigned, std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>>
-    ConstantPool::storage;
+unsigned ConstantPoolheader = 0;
+std::map<unsigned, std::vector<char>> ConstantPoolstorage;
 
 /// Get a constant by index from the constant pool.
-OMTensor *ConstantPool::get(unsigned id) {
-  auto it = ConstantPool::storage.find(id);
-  if (it != ConstantPool::storage.end()) {
-    auto &res = it->second;
-    return res.get();
+std::vector<char> ConstantPoolget(unsigned id) {
+  auto it = ConstantPoolstorage.find(id);
+  if (it != ConstantPoolstorage.end()) {
+    return it->second;
   } else
-    return nullptr;
+    return {};
 }
 
 /// Put a constant to the constant pool.
 /// Return the constant index in the pool.
-unsigned ConstantPool::put(OMTensor *omt) {
-  unsigned constantID = ConstantPool::header;
-  auto resOmt = std::unique_ptr<OMTensor, decltype(&omTensorDestroy)>(
-      omt, omTensorDestroy);
-  ConstantPool::storage.insert({constantID, std::move(resOmt)});
+unsigned ConstantPoolput(std::vector<char> omt) {
+  unsigned constantID = ConstantPoolheader;
+  ConstantPoolstorage.insert(
+      std::pair<unsigned, std::vector<char>>(constantID, std::move(omt)));
   // Move header forward.
-  ConstantPool::header += 1;
-  std::cout << "id: " << constantID << ", put at " << omTensorGetDataPtr(omt)
-            << ", pool size: " << ConstantPool::storage.getMemorySize() << "\n";
-  ConstantPool::size += omTensorGetBufferSize(omt);
-  std::cout << "buffer size : " << ConstantPool::size << "\n";
+  ConstantPoolheader += 1;
+  std::cout << "put " << constantID << "\n";
   return constantID;
 }
 
-void ConstantPool::reset() {
-  ConstantPool::header = 0;
-  ConstantPool::storage.shrink_and_clear();
+void ConstantPoolreset() {
+  ConstantPoolheader = 0;
+  ConstantPoolstorage.clear();
+  std::map<unsigned, std::vector<char>>().swap(ConstantPoolstorage);
 }
 
 /// Erase a constant by index.
-bool ConstantPool::erase(unsigned id) {
-  OMTensor *omt = ConstantPool::get(id);
-  if (omt) {
-    std::cout << "id: " << id << ", erase at at " << omTensorGetDataPtr(omt)
-              << ", pool size: " << ConstantPool::storage.getMemorySize()
-              << "\n";
-    ConstantPool::size -= omTensorGetBufferSize(omt);
-    std::cout << "buffer size : " << ConstantPool::size << "\n";
-    ConstantPool::storage.erase(id);
-    return true;
-  }
-  return false;
+bool ConstantPoolerase(unsigned id) {
+  std::vector<char> vt = ConstantPoolget(id);
+  ConstantPoolstorage.erase(id);
+  std::vector<char>().swap(vt);
+  std::cout << "erase " << id << "\n";
+  return true;
 }
 
 /// Update an ONNXConstantOp.
 /// Erase its constant from the constant pool if the op has no other uses.
 /// Otherwise, update the ops's ref-count.
-bool ConstantPool::update(PatternRewriter &rewriter, Operation *op) {
+bool ConstantPoolupdate(PatternRewriter &rewriter, Operation *op) {
   ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
   assert(constOp && "Not a constant operation");
 
@@ -162,16 +152,70 @@ bool ConstantPool::update(PatternRewriter &rewriter, Operation *op) {
   if (constantIDAttr) {
     unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
     if (constOp.getResult().use_empty() || constOp.getResult().hasOneUse()) {
-      ConstantPool::erase(constantID);
+      ConstantPoolerase(constantID);
       updated = true;
     }
   }
   return updated;
 }
 
+std::vector<char> ConstantPoolcreate(PatternRewriter &rewriter, Operation *op) {
+  ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
+  assert(constOp && "Not a constant operation");
+  // Create a new OMTensor, and add it to the constant pool.
+  DenseElementsAttr dataAttr = op->getAttrOfType<::mlir::Attribute>("value")
+                                   .dyn_cast_or_null<mlir::DenseElementsAttr>();
+  Type elementType = dataAttr.getType().cast<ShapedType>().getElementType();
+  std::vector<int64_t> shape = dataAttr.getType().cast<ShapedType>().getShape();
+  int64_t elementCount = 1;
+  for (int i = 0; i < shape.size(); ++i)
+    elementCount *= shape[i];
+
+  std::vector<char> resOmt;
+  // copy data.
+  if (elementType.isa<FloatType>()) {
+    auto it = dataAttr.getValues<FloatAttr>().begin();
+    FloatType floatTy = elementType.cast<FloatType>();
+    if (floatTy.getWidth() == 32) {
+      std::vector<float> vt;
+      for (int64_t i = 0; i < elementCount; ++i) {
+        vt.emplace_back(getAttrValue<float>(*it++));
+      }
+      resOmt = convertFromVectorType<float>(vt);
+    } else if (floatTy.getWidth() == 64) {
+      std::vector<double> vt;
+      for (int64_t i = 0; i < elementCount; ++i) {
+        vt.emplace_back(getAttrValue<double>(*it++));
+      }
+      resOmt = convertFromVectorType<double>(vt);
+    } else
+      llvm_unreachable("Unsupported data type");
+  } else if (elementType.isa<IntegerType>()) {
+    auto it = dataAttr.getValues<IntegerAttr>().begin();
+    IntegerType intTy = elementType.cast<IntegerType>();
+    if (intTy.getWidth() == 32) {
+      std::vector<int32_t> vt;
+      for (int64_t i = 0; i < elementCount; ++i) {
+        vt.emplace_back(getAttrValue<int32_t>(*it++));
+      }
+      resOmt = convertFromVectorType<int32_t>(vt);
+    } else if (intTy.getWidth() == 64) {
+      std::vector<int64_t> vt;
+      for (int64_t i = 0; i < elementCount; ++i) {
+        vt.emplace_back(getAttrValue<int64_t>(*it++));
+      }
+      resOmt = convertFromVectorType<int64_t>(vt);
+    } else
+      llvm_unreachable("Unsupported data type");
+  } else
+    llvm_unreachable("Unsupported data type");
+  return resOmt;
+}
+
 /// Create or get a constant in the constant pool for a given ONNXConstantOp.
 /// Return the constant index in the pool.
-unsigned ConstantPool::createOrGet(PatternRewriter &rewriter, Operation *op) {
+std::vector<char> ConstantPoolcreateOrGet(
+    PatternRewriter &rewriter, Operation *op) {
   ONNXConstantOp constOp = llvm::dyn_cast_or_null<ONNXConstantOp>(op);
   assert(constOp && "Not a constant operation");
 
@@ -182,63 +226,10 @@ unsigned ConstantPool::createOrGet(PatternRewriter &rewriter, Operation *op) {
     // The OMTensor for this constant op existed in the constant pool.
     // Just get its index in the constant pool.
     constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
+    return ConstantPoolget(constantID);
   } else {
-    // Create a new OMTensor, and add it to the constant pool.
-    DenseElementsAttr dataAttr =
-        op->getAttrOfType<::mlir::Attribute>("value")
-            .dyn_cast_or_null<mlir::DenseElementsAttr>();
-    Type elementType = dataAttr.getType().cast<ShapedType>().getElementType();
-    std::vector<int64_t> shape =
-        dataAttr.getType().cast<ShapedType>().getShape();
-
-    OMTensor *resOmt;
-    // copy data.
-    if (elementType.isa<FloatType>()) {
-      auto it = dataAttr.getValues<FloatAttr>().begin();
-      FloatType floatTy = elementType.cast<FloatType>();
-      if (floatTy.getWidth() == 32) {
-        resOmt = omTensorCreateWithShape<float>(shape);
-        for (int64_t i = 0; i < omTensorGetNumElems(resOmt); ++i) {
-          omTensorGetElemByOffset<float>(resOmt, i) =
-              getAttrValue<float>(*it++);
-        }
-      } else if (floatTy.getWidth() == 64) {
-        resOmt = omTensorCreateWithShape<double>(shape);
-        for (int64_t i = 0; i < omTensorGetNumElems(resOmt); ++i) {
-          omTensorGetElemByOffset<double>(resOmt, i) =
-              getAttrValue<double>(*it++);
-        }
-      } else
-        llvm_unreachable("Unsupported data type");
-    } else if (elementType.isa<IntegerType>()) {
-      auto it = dataAttr.getValues<IntegerAttr>().begin();
-      IntegerType intTy = elementType.cast<IntegerType>();
-      if (intTy.getWidth() == 32) {
-        resOmt = omTensorCreateWithShape<int32_t>(shape);
-        for (int64_t i = 0; i < omTensorGetNumElems(resOmt); ++i) {
-          omTensorGetElemByOffset<int32_t>(resOmt, i) =
-              getAttrValue<int32_t>(*it++);
-        }
-      } else if (intTy.getWidth() == 64) {
-        resOmt = omTensorCreateWithShape<int64_t>(shape);
-        for (int64_t i = 0; i < omTensorGetNumElems(resOmt); ++i) {
-          omTensorGetElemByOffset<int64_t>(resOmt, i) =
-              getAttrValue<int64_t>(*it++);
-        }
-      } else
-        llvm_unreachable("Unsupported data type");
-    } else
-      llvm_unreachable("Unsupported data type");
-
-    constantID = ConstantPool::put(resOmt);
-    // Insert an Attribute to the constant op for keeping the constant index
-    // of the newly created OMTensor.
-    op->setAttr(CONSTANT_ID_ATTR_NAME,
-        IntegerAttr::get(
-            rewriter.getIntegerType(/*width=*/64, /*isSigned=*/false),
-            constantID));
+    return ConstantPoolcreate(rewriter, op);
   }
-  return constantID;
 }
 
 /// A helper function to contruct a RankedTensorType from a ShapedType.
@@ -249,21 +240,18 @@ RankedTensorType constructRankedTensorType(ShapedType type) {
 
 ///  A helper function to construct a DenseElementsAttr from an OMTensor.
 static DenseElementsAttr createDenseElementsAttr(
-    OMTensor *omt, ShapedType outputType) {
+    std::vector<char> omt, ShapedType outputType) {
   RankedTensorType resType = constructRankedTensorType(outputType);
-  int64_t numElements = omTensorGetNumElems(omt);
   // FloatType
   if (resType.getElementType().isa<FloatType>()) {
     FloatType floatTy = resType.getElementType().cast<FloatType>();
     if (floatTy.getWidth() == 32) {
-      float *res = (float *)omTensorGetDataPtr(omt);
-      return DenseElementsAttr::get<float>(
-          resType, ArrayRef<float>(res, numElements));
+      std::vector<float> res = convertToVectorType<float>(omt);
+      return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
     }
     if (floatTy.getWidth() == 64) {
-      double *res = (double *)omTensorGetDataPtr(omt);
-      return DenseElementsAttr::get<double>(
-          resType, ArrayRef<double>(res, numElements));
+      std::vector<double> res = convertToVectorType<double>(omt);
+      return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
     }
   }
 
@@ -271,14 +259,12 @@ static DenseElementsAttr createDenseElementsAttr(
   if (resType.getElementType().isa<IntegerType>()) {
     IntegerType intTy = resType.getElementType().cast<IntegerType>();
     if (intTy.getWidth() == 32) {
-      int32_t *res = (int32_t *)omTensorGetDataPtr(omt);
-      return DenseElementsAttr::get<int32_t>(
-          resType, ArrayRef<int32_t>(res, numElements));
+      std::vector<int32_t> res = convertToVectorType<int32_t>(omt);
+      return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
     }
     if (intTy.getWidth() == 64) {
-      int64_t *res = (int64_t *)omTensorGetDataPtr(omt);
-      return DenseElementsAttr::get<int64_t>(
-          resType, ArrayRef<int64_t>(res, numElements));
+      std::vector<int64_t> res = convertToVectorType<int64_t>(omt);
+      return DenseElementsAttr::get(resType, llvm::makeArrayRef(res));
     }
   }
 
@@ -290,9 +276,6 @@ ONNXConstantOp CreateDenseONNXConstantOp(
     PatternRewriter &rewriter, Value replacingValue, unsigned constantID) {
   Location loc = replacingValue.getLoc();
 
-  std::cout << "create a dense attr "
-            << "\n";
-  std::cout << "number of dense attrs: " << ++ConstantPool::nd << "\n";
   ONNXConstantOp constOp = rewriter.create<ONNXConstantOp>(
       loc, replacingValue.getType(), Attribute(), Attribute());
 
@@ -343,14 +326,15 @@ T ComputeConstPropElementwiseBinary(T lhs, T rhs) {
 }
 
 template <typename ElementwiseBinaryOp, typename T>
-OMTensor *IterateConstPropElementwiseBinary(
-    OMTensor *lhsOmt, OMTensor *rhsOmt, Type outputType) {
+std::vector<char> IterateConstPropElementwiseBinary(std::vector<char> lhsOmt,
+    std::vector<char> rhsOmt, ArrayRef<int64_t> lhsShape,
+    ArrayRef<int64_t> rhsShape, Type outputType) {
   auto outputShape = outputType.cast<ShapedType>().getShape();
-  int64_t *lhsShape = omTensorGetShape(lhsOmt);
-  int64_t *rhsShape = omTensorGetShape(rhsOmt);
-  int lhsRank = omTensorGetRank(lhsOmt);
-  int rhsRank = omTensorGetRank(rhsOmt);
+  int lhsRank = lhsShape.size();
+  int rhsRank = rhsShape.size();
   int outputRank = outputShape.size();
+  std::vector<T> lhsVt = convertToVectorType<T>(lhsOmt);
+  std::vector<T> rhsVt = convertToVectorType<T>(rhsOmt);
 
   // Check broadcasting.
   bool broadcasting = false;
@@ -358,16 +342,49 @@ OMTensor *IterateConstPropElementwiseBinary(
     broadcasting = true;
   else
     for (int i = 0; i < outputRank; ++i)
-      if (*(lhsShape + i) != *(rhsShape + i)) {
+      if (lhsShape[i] != rhsShape[i]) {
         broadcasting = true;
         break;
       }
 
+  SmallVector<int64_t, 4> strides(outputRank, 0);
+  int64_t elementCount = 1;
+  for (int i = outputRank - 1; i >= 0; i--) {
+    strides[i] = elementCount;
+    elementCount *= outputShape[i];
+  }
+  SmallVector<int64_t, 4> lhsStrides(lhsRank, 0);
+  int64_t count = 1;
+  for (int i = lhsRank - 1; i >= 0; i--) {
+    lhsStrides[i] = count;
+    count *= lhsShape[i];
+  }
+  SmallVector<int64_t, 4> rhsStrides(rhsRank, 0);
+  count = 1;
+  for (int i = rhsRank - 1; i >= 0; i--) {
+    rhsStrides[i] = count;
+    count *= rhsShape[i];
+  }
+
   // Initialize a result OMTensor.
-  auto resOmt = omTensorCreateWithShape<T>(outputShape);
-  for (const auto &outputIndices : omTensorComputeIndexSet(resOmt)) {
+  std::vector<T> resOmt;
+  resOmt.reserve(elementCount);
+  for (int64_t i = 0; i < elementCount; ++i) {
+    // Compute indices to access the output.
+    SmallVector<int64_t, 4> outputIndices(outputRank, 0);
+    int64_t x = i;
+    for (int j = 0; j < outputRank; ++j) {
+      int64_t s = strides[j];
+      if (x < s)
+        outputIndices[j] = 0;
+      else {
+        outputIndices[j] = floor(x / s);
+        x = x % s;
+      }
+    }
+
     // Compute indices to access inputs.
-    std::vector<int64_t> lhsIndices, rhsIndices;
+    SmallVector<int64_t, 4> lhsIndices, rhsIndices;
     if (!broadcasting)
       for (int k = 0; k < outputRank; ++k) {
         lhsIndices.emplace_back(outputIndices[k]);
@@ -378,7 +395,7 @@ OMTensor *IterateConstPropElementwiseBinary(
         // in the lhs index range.
         if (k >= outputRank - lhsRank) {
           int lhsIndex = k - outputRank + lhsRank;
-          if (*(lhsShape + lhsIndex) == 1)
+          if (lhsShape[lhsIndex] == 1)
             // broadcast
             lhsIndices.emplace_back(0);
           else
@@ -387,7 +404,7 @@ OMTensor *IterateConstPropElementwiseBinary(
         // in the rhs index range.
         if (k >= outputRank - rhsRank) {
           int rhsIndex = k - outputRank + rhsRank;
-          if (*(rhsShape + rhsIndex) == 1)
+          if (rhsShape[rhsIndex] == 1)
             // broadcast
             rhsIndices.emplace_back(0);
           else
@@ -396,13 +413,20 @@ OMTensor *IterateConstPropElementwiseBinary(
       }
 
     // Calculate element-wise binary result.
-    T lhsValue = omTensorGetElem<T>(lhsOmt, lhsIndices);
-    T rhsValue = omTensorGetElem<T>(rhsOmt, rhsIndices);
-    omTensorGetElem<T>(resOmt, outputIndices) =
-        ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
-            lhsValue, rhsValue);
+    int64_t lhsOffset = 0;
+    for (int j = 0; j < lhsStrides.size(); ++j)
+      lhsOffset += lhsIndices[j] * lhsStrides[j];
+    int64_t rhsOffset = 0;
+    for (int j = 0; j < rhsStrides.size(); ++j)
+      rhsOffset += rhsIndices[j] * rhsStrides[j];
+
+    T lhsValue = lhsVt[lhsOffset];
+    T rhsValue = rhsVt[rhsOffset];
+    T res = ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
+        lhsValue, rhsValue);
+    resOmt.emplace_back(res);
   }
-  return resOmt;
+  return convertFromVectorType<T>(resOmt);
 }
 
 /// Do element-wise binary calculation of 'lhs' and 'rhs' values and create an
@@ -414,52 +438,50 @@ ONNXConstantOp ConstPropElementwiseBinary(
   Type elementType = outputType.cast<ShapedType>().getElementType();
   Operation *lhsOp = lhs.getDefiningOp();
   Operation *rhsOp = rhs.getDefiningOp();
+  ArrayRef<int64_t> lhsShape = lhs.getType().cast<ShapedType>().getShape();
+  ArrayRef<int64_t> rhsShape = rhs.getType().cast<ShapedType>().getShape();
 
   // Get lhs and rhs values as OMTensors.
-  unsigned lhsId = ConstantPool::createOrGet(rewriter, lhsOp);
-  OMTensor *lhsOmt = ConstantPool::get(lhsId);
-  assert(lhsOmt && "LHS null pointer");
-  unsigned rhsId = ConstantPool::createOrGet(rewriter, rhsOp);
-  OMTensor *rhsOmt = ConstantPool::get(rhsId);
-  assert(rhsOmt && "RHS null pointer");
+  std::vector<char> lhsOmt = ConstantPoolcreateOrGet(rewriter, lhsOp);
+  std::vector<char> rhsOmt = ConstantPoolcreateOrGet(rewriter, rhsOp);
 
   // Do calculation.
-  OMTensor *resOmt;
+  std::vector<char> resOmt;
   if (elementType.isa<FloatType>()) {
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
     if (floatTy.getWidth() == 32) {
       resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, float>(
-          lhsOmt, rhsOmt, outputType);
+          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType);
     }
     if (floatTy.getWidth() == 64) {
       resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, double>(
-          lhsOmt, rhsOmt, outputType);
+          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType);
     }
   } else if (elementType.isa<IntegerType>()) {
     // IntegerType
     IntegerType intTy = elementType.cast<IntegerType>();
     if (intTy.getWidth() == 32) {
       resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int32_t>(
-          lhsOmt, rhsOmt, outputType);
+          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType);
     }
     if (intTy.getWidth() == 64) {
       resOmt = IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int64_t>(
-          lhsOmt, rhsOmt, outputType);
+          lhsOmt, rhsOmt, lhsShape, rhsShape, outputType);
     }
   } else
     llvm_unreachable("Unknown data type");
 
   // Add the result to the constant pool.
-  unsigned constantID = ConstantPool::put(resOmt);
+  unsigned constantID = ConstantPoolput(resOmt);
 
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
       CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
 
   // Clean up memory for lhs and rhs if they are only used here.
-  ConstantPool::update(rewriter, lhsOp);
-  ConstantPool::update(rewriter, rhsOp);
+  ConstantPoolupdate(rewriter, lhsOp);
+  ConstantPoolupdate(rewriter, rhsOp);
 
   return res;
 }
@@ -488,17 +510,26 @@ T ComputeConstPropElementwiseUnary(T val) {
 }
 
 template <typename ElementwiseUnaryOp, typename T>
-OMTensor *IterateConstPropElementwiseUnary(OMTensor *omt, Type outputType) {
-  // Initialize a result OMTensor.
+std::vector<char> IterateConstPropElementwiseUnary(
+    std::vector<char> omt, Type outputType) {
   auto outputShape = outputType.cast<ShapedType>().getShape();
-  OMTensor *resOmt = omTensorCreateWithShape<T>(outputShape);
-  // Calculate element-wise unary result.
-  for (const auto &idx : omTensorComputeIndexSet(resOmt)) {
-    T value = omTensorGetElem<T>(omt, idx);
-    omTensorGetElem<T>(resOmt, idx) =
-        ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(value);
+  int outputRank = outputShape.size();
+  std::vector<T> inputVt = convertToVectorType<T>(omt);
+
+  int64_t elementCount = 1;
+  for (int i = outputRank - 1; i >= 0; i--) {
+    elementCount *= outputShape[i];
   }
-  return resOmt;
+
+  // Initialize a result OMTensor.
+  std::vector<T> resOmt;
+  resOmt.reserve(elementCount);
+  for (int64_t i = 0; i < elementCount; ++i) {
+    T value = inputVt[i];
+    T res = ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(value);
+    resOmt.emplace_back(res);
+  }
+  return convertFromVectorType<T>(resOmt);
 }
 
 /// Do element-wise unary calculation of 'input' value and create an
@@ -511,11 +542,10 @@ ONNXConstantOp ConstPropElementwiseUnary(
   Operation *inputOp = input.getDefiningOp();
 
   // Get input value as OMTensor.
-  unsigned inputId = ConstantPool::createOrGet(rewriter, inputOp);
-  OMTensor *inputOmt = ConstantPool::get(inputId);
+  std::vector<char> inputOmt = ConstantPoolcreateOrGet(rewriter, inputOp);
 
   // Do calculation.
-  OMTensor *resOmt;
+  std::vector<char> resOmt;
   if (elementType.isa<FloatType>()) {
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
@@ -542,14 +572,14 @@ ONNXConstantOp ConstPropElementwiseUnary(
     llvm_unreachable("Unknown data type");
 
   // Add the result to the constant pool.
-  unsigned constantID = ConstantPool::put(resOmt);
+  unsigned constantID = ConstantPoolput(resOmt);
 
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
       CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
 
   // Clean up memory for input if it is only used here.
-  ConstantPool::update(rewriter, inputOp);
+  ConstantPoolupdate(rewriter, inputOp);
 
   return res;
 }
@@ -609,15 +639,9 @@ DenseElementsAttr ConstPropTranspose(PatternRewriter &rewriter,
 //===----------------------------------------------------------------------===//
 
 template <typename T>
-OMTensor *IterateConstPropUnsqueeze(OMTensor *omt, Type outputType) {
-  // Initialize a result OMTensor.
-  auto outputShape = outputType.cast<ShapedType>().getShape();
-  OMTensor *resOmt = omTensorCreateWithShape<T>(outputShape);
-  for (int64_t i = 0; i < omTensorGetNumElems(resOmt); ++i) {
-    T value = omTensorGetElemByOffset<T>(omt, i);
-    omTensorGetElemByOffset<T>(resOmt, i) = value;
-  }
-  return resOmt;
+std::vector<char> IterateConstPropUnsqueeze(
+    std::vector<char> omt, Type outputType) {
+  return omt;
 }
 
 ONNXConstantOp ConstPropUnsqueeze(
@@ -627,11 +651,10 @@ ONNXConstantOp ConstPropUnsqueeze(
   Operation *inputOp = input.getDefiningOp();
 
   // Get input value as OMTensor.
-  unsigned inputId = ConstantPool::createOrGet(rewriter, inputOp);
-  OMTensor *inputOmt = ConstantPool::get(inputId);
+  std::vector<char> inputOmt = ConstantPoolcreateOrGet(rewriter, inputOp);
 
   // Do calculation.
-  OMTensor *resOmt;
+  std::vector<char> resOmt;
   if (elementType.isa<FloatType>()) {
     // FloatType
     FloatType floatTy = elementType.cast<FloatType>();
@@ -654,14 +677,14 @@ ONNXConstantOp ConstPropUnsqueeze(
     llvm_unreachable("Unknown data type");
 
   // Add the result to the constant pool.
-  unsigned constantID = ConstantPool::put(resOmt);
+  unsigned constantID = ConstantPoolput(resOmt);
 
   // Construct a new ONNXConstantOp.
   ONNXConstantOp res =
       CreateDenseONNXConstantOp(rewriter, replacingValue, constantID);
 
   // Clean up memory for input if it is only used here.
-  ConstantPool::update(rewriter, inputOp);
+  ConstantPoolupdate(rewriter, inputOp);
 
   return res;
 }
@@ -835,16 +858,16 @@ void ConstPropONNXToONNXPass::runOnFunction() {
         op->getAttrOfType<::mlir::Attribute>(CONSTANT_ID_ATTR_NAME);
     if (constantIDAttr) {
       unsigned constantID = constantIDAttr.cast<IntegerAttr>().getUInt();
-      OMTensor *omt = ConstantPool::get(constantID);
+      std::vector<char> omt = ConstantPoolget(constantID);
       ShapedType outputType = constOp.getResult().getType().cast<ShapedType>();
       DenseElementsAttr denseAttr = createDenseElementsAttr(omt, outputType);
       op->setAttr("value", denseAttr);
       op->removeAttr(CONSTANT_ID_ATTR_NAME);
-      ConstantPool::erase(constantID);
+      ConstantPoolerase(constantID);
     }
   });
   // Clean up the constant pool.
-  ConstantPool::reset();
+  ConstantPoolreset();
 } // end anonymous namespace
 
 /*!
