@@ -26,13 +26,39 @@
 #include "src/Dialect/ONNX/ONNXOps.hpp"
 #include "src/Pass/Passes.hpp"
 
+#include <algorithm>
 #include <fstream>
+#include <functional>
 #include <math.h>
 #include <stdlib.h>
+#include <thread>
+#include <vector>
 
 using namespace mlir;
 
 namespace {
+
+const unsigned NUM_THREADS = 4;
+
+static void parallel_for(
+    int64_t numElements, std::function<void(int start, int end)> functor) {
+  unsigned batchSize = numElements / NUM_THREADS;
+  unsigned remainder = numElements % NUM_THREADS;
+
+  SmallVector<std::thread, 4> threads;
+  for (unsigned i = 0; i < NUM_THREADS; ++i) {
+    int64_t start = i * batchSize;
+    threads.emplace_back(std::thread(functor, start, start + batchSize));
+  }
+
+  // The remaining elements.
+  int start = NUM_THREADS * batchSize;
+  functor(start, start + remainder);
+
+  // Wait for the other threads fininshed.
+  std::for_each(
+      threads.begin(), threads.end(), std::mem_fn(&std::thread::join));
+}
 
 //===----------------------------------------------------------------------===//
 // Instructions to add a constant operation.
@@ -280,50 +306,53 @@ void IterateConstPropElementwiseBinary(char *lhs, char *rhs,
       }
 
   // Do computation.
-  for (int64_t i = 0; i < getNumberOfElements(outputShape); ++i) {
-    // Compute indices to access the output.
-    std::vector<int64_t> outputIndices = getAccessIndex(i, outputStrides);
+  parallel_for(getNumberOfElements(outputShape), [&](int start, int end) {
+    for (int64_t i = start; i < end; ++i) {
+      // Compute indices to access the output.
+      std::vector<int64_t> outputIndices = getAccessIndex(i, outputStrides);
 
-    // Compute indices to access inputs.
-    SmallVector<int64_t, 4> lhsIndices(lhsRank, 0);
-    SmallVector<int64_t, 4> rhsIndices(rhsRank, 0);
-    if (!broadcasting) {
-      for (int k = 0; k < outputRank; ++k) {
-        lhsIndices[k] = outputIndices[k];
-        rhsIndices[k] = outputIndices[k];
-      }
-    } else {
-      for (int k = 0; k < outputRank; ++k) {
-        // in the lhs index range.
-        if (k >= outputRank - lhsRank) {
-          int lhsIndex = k - outputRank + lhsRank;
-          if (lhsShape[lhsIndex] == 1)
-            // broadcast
-            lhsIndices[lhsIndex] = 0;
-          else
-            lhsIndices[lhsIndex] = outputIndices[k];
+      // Compute indices to access inputs.
+      SmallVector<int64_t, 4> lhsIndices(lhsRank, 0);
+      SmallVector<int64_t, 4> rhsIndices(rhsRank, 0);
+      if (!broadcasting) {
+        for (int k = 0; k < outputRank; ++k) {
+          lhsIndices[k] = outputIndices[k];
+          rhsIndices[k] = outputIndices[k];
         }
-        // in the rhs index range.
-        if (k >= outputRank - rhsRank) {
-          int rhsIndex = k - outputRank + rhsRank;
-          if (rhsShape[rhsIndex] == 1)
-            // broadcast
-            rhsIndices[rhsIndex] = 0;
-          else
-            rhsIndices[rhsIndex] = outputIndices[k];
+      } else {
+        for (int k = 0; k < outputRank; ++k) {
+          // in the lhs index range.
+          if (k >= outputRank - lhsRank) {
+            int lhsIndex = k - outputRank + lhsRank;
+            if (lhsShape[lhsIndex] == 1)
+              // broadcast
+              lhsIndices[lhsIndex] = 0;
+            else
+              lhsIndices[lhsIndex] = outputIndices[k];
+          }
+          // in the rhs index range.
+          if (k >= outputRank - rhsRank) {
+            int rhsIndex = k - outputRank + rhsRank;
+            if (rhsShape[rhsIndex] == 1)
+              // broadcast
+              rhsIndices[rhsIndex] = 0;
+            else
+              rhsIndices[rhsIndex] = outputIndices[k];
+          }
         }
       }
+
+      // Calculate element-wise binary result.
+      int64_t lhsOffset = getLinearAccessIndex(lhsIndices, lhsStrides);
+      int64_t rhsOffset = getLinearAccessIndex(rhsIndices, rhsStrides);
+
+      T lhsValue = *(lhsArray + lhsOffset);
+      T rhsValue = *(rhsArray + rhsOffset);
+      *(resArray + i) =
+          ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
+              lhsValue, rhsValue);
     }
-
-    // Calculate element-wise binary result.
-    int64_t lhsOffset = getLinearAccessIndex(lhsIndices, lhsStrides);
-    int64_t rhsOffset = getLinearAccessIndex(rhsIndices, rhsStrides);
-
-    T lhsValue = *(lhsArray + lhsOffset);
-    T rhsValue = *(rhsArray + rhsOffset);
-    *(resArray + i) = ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
-        lhsValue, rhsValue);
-  }
+  });
 }
 
 /// Do element-wise binary calculation of 'lhs' and 'rhs' values and create an
@@ -414,10 +443,12 @@ void IterateConstPropElementwiseUnary(
   T *resArray = reinterpret_cast<T *>(res);
 
   // Calculate element-wise unary result.
-  for (int64_t i = 0; i < getNumberOfElements(outputShape); ++i) {
-    *(resArray + i) = ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(
-        *(inputArray + i));
-  }
+  parallel_for(getNumberOfElements(outputShape), [&](int start, int end) {
+    for (int64_t i = start; i < end; ++i) {
+      *(resArray + i) = ComputeConstPropElementwiseUnary<ElementwiseUnaryOp, T>(
+          *(inputArray + i));
+    }
+  });
 }
 
 /// Do element-wise unary calculation of 'input' value and create an
