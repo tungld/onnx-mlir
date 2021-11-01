@@ -478,6 +478,12 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
   Value XtWT = createONNX.matmul(matrixAllGatesType, Xt, weightPack.WT);
   Value HtRT = createONNX.matmul(matrixAllGatesType, Ht, weightPack.RT);
 
+  SmallVector<Type, 4> splitType(4, matrixType);
+  std::vector<Value> XtWiofc =
+      foldOrEmitONNXSplitOp(rewriter, loc, splitType, XtWT, 1);
+  std::vector<Value> HtRiofc =
+      foldOrEmitONNXSplitOp(rewriter, loc, splitType, HtRT, 1);
+
   // Do element-wise computations. Fuse them into a single nested loop.
   // Lower and upper bounds derived from Ht tensor.
   unsigned HtRank = matrixType.getRank();
@@ -494,13 +500,11 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
         MathBuilder createMath(createKrnl);
         IndexExprScope ieScope(createKrnl);
         Value bs(indices[0]), hs(indices[1]);
-        SymbolIndexExpr bsie(bs), hsie(hs);
-        LiteralIndexExpr hsieLit(hiddenSize);
 
         Value CtVal = createKrnl.load(Ct, indices);
         // it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
-        Value XtWTiVal = createKrnl.loadIE(XtWT, {bsie, hsie});
-        Value HtRTiVal = createKrnl.loadIE(HtRT, {bsie, hsie});
+        Value XtWTiVal = createKrnl.load(XtWiofc[0], {bs, hs});
+        Value HtRTiVal = createKrnl.load(HtRiofc[0], {bs, hs});
         Value it = createMath.add(XtWTiVal, HtRTiVal);
         if (biasPack.hasBias) {
           Value WbiVal = createKrnl.load(biasPack.Wbi, {hs});
@@ -517,8 +521,8 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
             applyActivation(createKrnl.getBuilder(), loc, activationPack.f, it);
 
         // ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
-        Value XtWTfVal = createKrnl.loadIE(XtWT, {bsie, hsie + 2 * hsieLit});
-        Value HtRTfVal = createKrnl.loadIE(HtRT, {bsie, hsie + 2 * hsieLit});
+        Value XtWTfVal = createKrnl.load(XtWiofc[2], {bs, hs});
+        Value HtRTfVal = createKrnl.load(HtRiofc[2], {bs, hs});
         Value ft = createMath.add(XtWTfVal, HtRTfVal);
         if (biasPack.hasBias) {
           Value WbfVal = createKrnl.load(biasPack.Wbf, {hs});
@@ -535,8 +539,8 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
             applyActivation(createKrnl.getBuilder(), loc, activationPack.f, ft);
 
         // ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
-        Value XtWTcVal = createKrnl.loadIE(XtWT, {bsie, hsie + 3 * hsieLit});
-        Value HtRTcVal = createKrnl.loadIE(HtRT, {bsie, hsie + 3 * hsieLit});
+        Value XtWTcVal = createKrnl.load(XtWiofc[3], {bs, hs});
+        Value HtRTcVal = createKrnl.load(HtRiofc[3], {bs, hs});
         Value ct = createMath.add(XtWTcVal, HtRTcVal);
         if (biasPack.hasBias) {
           Value WbcVal = createKrnl.load(biasPack.Wbc, {hs});
@@ -553,8 +557,8 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
         Value nextCt = createMath.add(ftCt, itct);
 
         // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
-        Value XtWToVal = createKrnl.loadIE(XtWT, {bsie, hsie + hsieLit});
-        Value HtRToVal = createKrnl.loadIE(HtRT, {bsie, hsie + hsieLit});
+        Value XtWToVal = createKrnl.load(XtWiofc[1], {bs, hs});
+        Value HtRToVal = createKrnl.load(HtRiofc[1], {bs, hs});
         Value ot = createMath.add(XtWToVal, HtRToVal);
         if (biasPack.hasBias) {
           Value WboVal = createKrnl.load(biasPack.Wbo, {hs});
