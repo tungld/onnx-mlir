@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "mlir/Dialect/Vector/VectorOps.h"
 #include "src/Conversion/ONNXToKrnl/RNN/RNNBase.hpp"
 #include "src/Dialect/ONNX/MLIRDialectBuilder.hpp"
 
@@ -449,7 +450,6 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
   // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
   // Ht = ot (.) h(Ct)
 
-  // TODO remove scope
   KrnlBuilder createKrnl(rewriter, loc);
   MemRefBuilder createMemRef(createKrnl);
   MathBuilder createMath(createKrnl);
@@ -478,12 +478,6 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
   Value XtWT = createONNX.matmul(matrixAllGatesType, Xt, weightPack.WT);
   Value HtRT = createONNX.matmul(matrixAllGatesType, Ht, weightPack.RT);
 
-  SmallVector<Type, 4> splitType(4, matrixType);
-  std::vector<Value> XtWiofc =
-      foldOrEmitONNXSplitOp(rewriter, loc, splitType, XtWT, 1);
-  std::vector<Value> HtRiofc =
-      foldOrEmitONNXSplitOp(rewriter, loc, splitType, HtRT, 1);
-
   // Do element-wise computations. Fuse them into a single nested loop.
   // Lower and upper bounds derived from Ht tensor.
   unsigned HtRank = matrixType.getRank();
@@ -494,98 +488,281 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
     HtUbs.emplace_back(createMemRef.dim(Ht, r));
   }
 
-  ValueRange loops = createKrnl.defineLoops(HtRank);
-  createKrnl.iterate(loops, loops, HtLbs, HtUbs,
-      [&](KrnlBuilder &createKrnl, ValueRange indices) {
-        MathBuilder createMath(createKrnl);
-        IndexExprScope ieScope(createKrnl);
-        Value bs(indices[0]), hs(indices[1]);
+  bool simdize = true;
+  if (simdize) {
+    llvm::outs() << "Running simd version\n";
+    int64_t VL(4);
+    VectorType vecType = VectorType::get({VL}, elementType);
 
-        Value CtVal = createKrnl.load(Ct, indices);
-        // it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
-        Value XtWTiVal = createKrnl.load(XtWiofc[0], {bs, hs});
-        Value HtRTiVal = createKrnl.load(HtRiofc[0], {bs, hs});
-        Value it = createMath.add(XtWTiVal, HtRTiVal);
-        if (biasPack.hasBias) {
-          Value WbiVal = createKrnl.load(biasPack.Wbi, {hs});
-          Value RbiVal = createKrnl.load(biasPack.Rbi, {hs});
-          it = createMath.add(it, WbiVal);
-          it = createMath.add(it, RbiVal);
-        }
-        if (biasPack.hasPeephole) {
-          Value PiVal = createKrnl.load(biasPack.Pi, {hs});
-          Value PiCt = createMath.mul(PiVal, CtVal);
-          it = createMath.add(it, PiCt);
-        }
-        it =
-            applyActivation(createKrnl.getBuilder(), loc, activationPack.f, it);
+    auto zero = emitConstantOp(rewriter, loc, elementType, 0);
+    auto one = emitConstantOp(rewriter, loc, elementType, 1);
+    auto two = emitConstantOp(rewriter, loc, elementType, 2);
+    Value vecZero = rewriter.create<vector::BroadcastOp>(loc, vecType, zero);
+    Value vecOne = rewriter.create<vector::BroadcastOp>(loc, vecType, one);
+    Value vecTwo = rewriter.create<vector::BroadcastOp>(loc, vecType, two);
 
-        // ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
-        Value XtWTfVal = createKrnl.load(XtWiofc[2], {bs, hs});
-        Value HtRTfVal = createKrnl.load(HtRiofc[2], {bs, hs});
-        Value ft = createMath.add(XtWTfVal, HtRTfVal);
-        if (biasPack.hasBias) {
-          Value WbfVal = createKrnl.load(biasPack.Wbf, {hs});
-          Value RbfVal = createKrnl.load(biasPack.Rbf, {hs});
-          ft = createMath.add(ft, WbfVal);
-          ft = createMath.add(ft, RbfVal);
-        }
-        if (biasPack.hasPeephole) {
-          Value PfVal = createKrnl.load(biasPack.Pf, {hs});
-          Value PfCt = createMath.mul(PfVal, CtVal);
-          ft = createMath.add(ft, PfCt);
-        }
-        ft =
-            applyActivation(createKrnl.getBuilder(), loc, activationPack.f, ft);
+    SmallVector<Type, 4> splitType(4, matrixType);
+    std::vector<Value> XtWiofc =
+        foldOrEmitONNXSplitOp(rewriter, loc, splitType, XtWT, 1);
+    std::vector<Value> HtRiofc =
+        foldOrEmitONNXSplitOp(rewriter, loc, splitType, HtRT, 1);
 
-        // ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
-        Value XtWTcVal = createKrnl.load(XtWiofc[3], {bs, hs});
-        Value HtRTcVal = createKrnl.load(HtRiofc[3], {bs, hs});
-        Value ct = createMath.add(XtWTcVal, HtRTcVal);
-        if (biasPack.hasBias) {
-          Value WbcVal = createKrnl.load(biasPack.Wbc, {hs});
-          Value RbcVal = createKrnl.load(biasPack.Rbc, {hs});
-          ct = createMath.add(ct, WbcVal);
-          ct = createMath.add(ct, RbcVal);
-        }
-        ct =
-            applyActivation(createKrnl.getBuilder(), loc, activationPack.g, ct);
+    //
+    Value vecHt = createKrnl.vectorTypeCast(Ht, VL);
+    Value vecCt = createKrnl.vectorTypeCast(Ct, VL);
+    Value vecAllH;
+    if (!isNoneType(state.allH))
+      vecAllH = createKrnl.vectorTypeCast(state.allH, VL);
+    //
+    SmallVector<Value, 4> vecXtWiofc;
+    for (Value v : XtWiofc)
+      vecXtWiofc.emplace_back(createKrnl.vectorTypeCast(v, VL));
+    //
+    SmallVector<Value, 4> vecHtRiofc;
+    for (Value v : HtRiofc)
+      vecHtRiofc.emplace_back(createKrnl.vectorTypeCast(v, VL));
+    //
+    Value vecWbi, vecWbo, vecWbf, vecWbc;
+    Value vecRbi, vecRbo, vecRbf, vecRbc;
+    if (biasPack.hasBias) {
+      vecWbi = createKrnl.vectorTypeCast(biasPack.Wbi, VL);
+      vecWbo = createKrnl.vectorTypeCast(biasPack.Wbo, VL);
+      vecWbf = createKrnl.vectorTypeCast(biasPack.Wbf, VL);
+      vecWbc = createKrnl.vectorTypeCast(biasPack.Wbc, VL);
+      //
+      vecRbi = createKrnl.vectorTypeCast(biasPack.Rbi, VL);
+      vecRbo = createKrnl.vectorTypeCast(biasPack.Rbo, VL);
+      vecRbf = createKrnl.vectorTypeCast(biasPack.Rbf, VL);
+      vecRbc = createKrnl.vectorTypeCast(biasPack.Rbc, VL);
+    }
+    //
+    Value vecPi, vecPo, vecPf;
+    if (biasPack.hasPeephole) {
+      vecPi = createKrnl.vectorTypeCast(biasPack.Pi, VL);
+      vecPo = createKrnl.vectorTypeCast(biasPack.Po, VL);
+      vecPf = createKrnl.vectorTypeCast(biasPack.Pf, VL);
+    }
 
-        // Ct = ft (.) Ct-1 + it (.) ct
-        Value ftCt = createMath.mul(ft, CtVal);
-        Value itct = createMath.mul(it, ct);
-        Value nextCt = createMath.add(ftCt, itct);
+    SmallVector<Value, 4> vecUbs;
+    for (unsigned r = 0; r < HtRank; ++r) {
+      vecUbs.emplace_back(createMemRef.dim(vecHt, r));
+    }
 
-        // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
-        Value XtWToVal = createKrnl.load(XtWiofc[1], {bs, hs});
-        Value HtRToVal = createKrnl.load(HtRiofc[1], {bs, hs});
-        Value ot = createMath.add(XtWToVal, HtRToVal);
-        if (biasPack.hasBias) {
-          Value WboVal = createKrnl.load(biasPack.Wbo, {hs});
-          Value RboVal = createKrnl.load(biasPack.Rbo, {hs});
-          ot = createMath.add(ot, WboVal);
-          ot = createMath.add(ot, RboVal);
-        }
-        if (biasPack.hasPeephole) {
-          Value PoVal = createKrnl.load(biasPack.Po, {hs});
-          Value PoCt = createMath.mul(PoVal, nextCt);
-          ot = createMath.add(ot, PoCt);
-        }
-        ot =
-            applyActivation(createKrnl.getBuilder(), loc, activationPack.f, ot);
+    ValueRange origLoop = createKrnl.defineLoops(HtRank);
+    createKrnl.iterate(origLoop, origLoop, HtLbs, vecUbs,
+        [&](KrnlBuilder &createKrnl, ValueRange indices) {
+          MathBuilder createMath(createKrnl);
+          IndexExprScope ieScope(createKrnl);
+          Value bs(indices[0]), hs(indices[1]);
 
-        // Ht = ot (.) h(Ct)
-        Value nextHt = applyActivation(
-            createKrnl.getBuilder(), loc, activationPack.h, nextCt);
-        nextHt = createMath.mul(ot, nextHt);
+          Value CtVal = createKrnl.load(vecCt, indices);
+          // it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
+          Value XtWTiVal = createKrnl.load(vecXtWiofc[0], {bs, hs});
+          Value HtRTiVal = createKrnl.load(vecHtRiofc[0], {bs, hs});
+          Value it = createMath.add(XtWTiVal, HtRTiVal);
+          if (biasPack.hasBias) {
+            Value WbiVal = createKrnl.load(vecWbi, {hs});
+            Value RbiVal = createKrnl.load(vecRbi, {hs});
+            it = createMath.add(it, WbiVal);
+            it = createMath.add(it, RbiVal);
+          }
+          if (biasPack.hasPeephole) {
+            Value PiVal = createKrnl.load(vecPi, {hs});
+            Value PiCt = createMath.mul(PiVal, CtVal);
+            it = createMath.add(it, PiCt);
+          }
+          // it = applyActivation(
+          //     createKrnl.getBuilder(), loc, activationPack.f, it);
+          // sigmoid
+          Value neg = rewriter.create<arith::SubFOp>(loc, vecZero, it);
+          Value negExp = rewriter.create<math::ExpOp>(loc, neg);
+          it = rewriter.create<arith::DivFOp>(
+              loc, vecOne, rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
 
-        // Store the intermediate Ht, Ct.
-        createKrnl.store(nextCt, Ct, indices);
-        createKrnl.store(nextHt, Ht, indices);
-        if (!isNoneType(state.allH))
-          createKrnl.store(
-              nextHt, state.allH, {sequenceIV, directionIV, bs, hs});
-      });
+          // ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
+          Value XtWTfVal = createKrnl.load(vecXtWiofc[2], {bs, hs});
+          Value HtRTfVal = createKrnl.load(vecHtRiofc[2], {bs, hs});
+          Value ft = createMath.add(XtWTfVal, HtRTfVal);
+          if (biasPack.hasBias) {
+            Value WbfVal = createKrnl.load(vecWbf, {hs});
+            Value RbfVal = createKrnl.load(vecRbf, {hs});
+            ft = createMath.add(ft, WbfVal);
+            ft = createMath.add(ft, RbfVal);
+          }
+          if (biasPack.hasPeephole) {
+            Value PfVal = createKrnl.load(vecPf, {hs});
+            Value PfCt = createMath.mul(PfVal, CtVal);
+            ft = createMath.add(ft, PfCt);
+          }
+          // ft = applyActivation(
+          //     createKrnl.getBuilder(), loc, activationPack.f, ft);
+          // sigmoid
+          neg = rewriter.create<arith::SubFOp>(loc, vecZero, ft);
+          negExp = rewriter.create<math::ExpOp>(loc, neg);
+          ft = rewriter.create<arith::DivFOp>(
+              loc, vecOne, rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
+
+          // ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
+          Value XtWTcVal = createKrnl.load(vecXtWiofc[3], {bs, hs});
+          Value HtRTcVal = createKrnl.load(vecHtRiofc[3], {bs, hs});
+          Value ct = createMath.add(XtWTcVal, HtRTcVal);
+          if (biasPack.hasBias) {
+            Value WbcVal = createKrnl.load(vecWbc, {hs});
+            Value RbcVal = createKrnl.load(vecRbc, {hs});
+            ct = createMath.add(ct, WbcVal);
+            ct = createMath.add(ct, RbcVal);
+          }
+          // ct = applyActivation(
+          //     createKrnl.getBuilder(), loc, activationPack.g, ct);
+          // tanh
+          Value ct2 = rewriter.create<arith::MulFOp>(loc, ct, vecTwo);
+          Value exp1 = rewriter.create<math::ExpOp>(loc, ct2);
+          Value d1 = rewriter.create<arith::SubFOp>(loc, exp1, vecOne);
+          Value d2 = rewriter.create<arith::AddFOp>(loc, exp1, vecOne);
+          ct = rewriter.create<arith::DivFOp>(loc, d1, d2);
+
+          // Ct = ft (.) Ct-1 + it (.) ct
+          Value ftCt = createMath.mul(ft, CtVal);
+          Value itct = createMath.mul(it, ct);
+          Value nextCt = createMath.add(ftCt, itct);
+
+          // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
+          Value XtWToVal = createKrnl.load(vecXtWiofc[1], {bs, hs});
+          Value HtRToVal = createKrnl.load(vecHtRiofc[1], {bs, hs});
+          Value ot = createMath.add(XtWToVal, HtRToVal);
+          if (biasPack.hasBias) {
+            Value WboVal = createKrnl.load(vecWbo, {hs});
+            Value RboVal = createKrnl.load(vecRbo, {hs});
+            ot = createMath.add(ot, WboVal);
+            ot = createMath.add(ot, RboVal);
+          }
+          if (biasPack.hasPeephole) {
+            Value PoVal = createKrnl.load(vecPo, {hs});
+            Value PoCt = createMath.mul(PoVal, nextCt);
+            ot = createMath.add(ot, PoCt);
+          }
+          // ot = applyActivation(
+          //     createKrnl.getBuilder(), loc, activationPack.f, ot);
+          // sigmoid
+          neg = rewriter.create<arith::SubFOp>(loc, vecZero, ot);
+          negExp = rewriter.create<math::ExpOp>(loc, neg);
+          ot = rewriter.create<arith::DivFOp>(
+              loc, vecOne, rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
+
+          // Ht = ot (.) h(Ct)
+          // Value nextHt = applyActivation(
+          //     createKrnl.getBuilder(), loc, activationPack.h, nextCt);
+          // tanh
+          ct2 = rewriter.create<arith::MulFOp>(loc, nextCt, vecTwo);
+          exp1 = rewriter.create<math::ExpOp>(loc, ct2);
+          d1 = rewriter.create<arith::SubFOp>(loc, exp1, vecOne);
+          d2 = rewriter.create<arith::AddFOp>(loc, exp1, vecOne);
+          nextHt = createMath.mul(ot, nextHt);
+
+          // Store the intermediate Ht, Ct.
+          createKrnl.store(nextCt, vecCt, {bs, hs});
+          createKrnl.store(nextHt, vecHt, {bs, hs});
+          if (!isNoneType(state.allH))
+            createKrnl.store(
+                nextHt, vecAllH, {sequenceIV, directionIV, bs, hs});
+        });
+  } else {
+    llvm::outs() << "Running the original version\n";
+    ValueRange loops = createKrnl.defineLoops(HtRank);
+    createKrnl.iterate(loops, loops, HtLbs, HtUbs,
+        [&](KrnlBuilder &createKrnl, ValueRange indices) {
+          MathBuilder createMath(createKrnl);
+          IndexExprScope ieScope(createKrnl);
+          Value bs(indices[0]), hs(indices[1]);
+          SymbolIndexExpr bsie(bs), hsie(hs);
+          LiteralIndexExpr hsieLit(hiddenSize);
+
+          Value CtVal = createKrnl.load(Ct, indices);
+          // it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
+          Value XtWTiVal = createKrnl.loadIE(XtWT, {bsie, hsie});
+          Value HtRTiVal = createKrnl.loadIE(HtRT, {bsie, hsie});
+          Value it = createMath.add(XtWTiVal, HtRTiVal);
+          if (biasPack.hasBias) {
+            Value WbiVal = createKrnl.load(biasPack.Wbi, {hs});
+            Value RbiVal = createKrnl.load(biasPack.Rbi, {hs});
+            it = createMath.add(it, WbiVal);
+            it = createMath.add(it, RbiVal);
+          }
+          if (biasPack.hasPeephole) {
+            Value PiVal = createKrnl.load(biasPack.Pi, {hs});
+            Value PiCt = createMath.mul(PiVal, CtVal);
+            it = createMath.add(it, PiCt);
+          }
+          it = applyActivation(
+              createKrnl.getBuilder(), loc, activationPack.f, it);
+
+          // ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
+          Value XtWTfVal = createKrnl.loadIE(XtWT, {bsie, hsie + 2 * hsieLit});
+          Value HtRTfVal = createKrnl.loadIE(HtRT, {bsie, hsie + 2 * hsieLit});
+          Value ft = createMath.add(XtWTfVal, HtRTfVal);
+          if (biasPack.hasBias) {
+            Value WbfVal = createKrnl.load(biasPack.Wbf, {hs});
+            Value RbfVal = createKrnl.load(biasPack.Rbf, {hs});
+            ft = createMath.add(ft, WbfVal);
+            ft = createMath.add(ft, RbfVal);
+          }
+          if (biasPack.hasPeephole) {
+            Value PfVal = createKrnl.load(biasPack.Pf, {hs});
+            Value PfCt = createMath.mul(PfVal, CtVal);
+            ft = createMath.add(ft, PfCt);
+          }
+          ft = applyActivation(
+              createKrnl.getBuilder(), loc, activationPack.f, ft);
+
+          // ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
+          Value XtWTcVal = createKrnl.loadIE(XtWT, {bsie, hsie + 3 * hsieLit});
+          Value HtRTcVal = createKrnl.loadIE(HtRT, {bsie, hsie + 3 * hsieLit});
+          Value ct = createMath.add(XtWTcVal, HtRTcVal);
+          if (biasPack.hasBias) {
+            Value WbcVal = createKrnl.load(biasPack.Wbc, {hs});
+            Value RbcVal = createKrnl.load(biasPack.Rbc, {hs});
+            ct = createMath.add(ct, WbcVal);
+            ct = createMath.add(ct, RbcVal);
+          }
+          ct = applyActivation(
+              createKrnl.getBuilder(), loc, activationPack.g, ct);
+
+          // Ct = ft (.) Ct-1 + it (.) ct
+          Value ftCt = createMath.mul(ft, CtVal);
+          Value itct = createMath.mul(it, ct);
+          Value nextCt = createMath.add(ftCt, itct);
+
+          // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
+          Value XtWToVal = createKrnl.loadIE(XtWT, {bsie, hsie + hsieLit});
+          Value HtRToVal = createKrnl.loadIE(HtRT, {bsie, hsie + hsieLit});
+          Value ot = createMath.add(XtWToVal, HtRToVal);
+          if (biasPack.hasBias) {
+            Value WboVal = createKrnl.load(biasPack.Wbo, {hs});
+            Value RboVal = createKrnl.load(biasPack.Rbo, {hs});
+            ot = createMath.add(ot, WboVal);
+            ot = createMath.add(ot, RboVal);
+          }
+          if (biasPack.hasPeephole) {
+            Value PoVal = createKrnl.load(biasPack.Po, {hs});
+            Value PoCt = createMath.mul(PoVal, nextCt);
+            ot = createMath.add(ot, PoCt);
+          }
+          ot = applyActivation(
+              createKrnl.getBuilder(), loc, activationPack.f, ot);
+
+          // Ht = ot (.) h(Ct)
+          Value nextHt = applyActivation(
+              createKrnl.getBuilder(), loc, activationPack.h, nextCt);
+          nextHt = createMath.mul(ot, nextHt);
+
+          // Store the intermediate Ht, Ct.
+          createKrnl.store(nextCt, Ct, indices);
+          createKrnl.store(nextHt, Ht, indices);
+          if (!isNoneType(state.allH))
+            createKrnl.store(
+                nextHt, state.allH, {sequenceIV, directionIV, bs, hs});
+        });
+  }
 }
 
 template <>
