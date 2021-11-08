@@ -288,6 +288,7 @@ struct KrnlBuilder : public DialectBuilder {
   ValueRange defineLoops(int64_t originalLoopNum);
   ValueRange block(Value loop, int64_t blockSize);
   void permute(ValueRange loops, ArrayRef<int64_t> map);
+  void unroll(Value loop);
   ValueRange getInductionVarValue(ValueRange loops);
 
   // Lambda passes loop indices as 2nd parameter.

@@ -433,6 +433,8 @@ void KrnlBuilder::permute(ValueRange loops, ArrayRef<int64_t> map) {
   b.create<KrnlPermuteOp>(loc, loops, map);
 }
 
+void KrnlBuilder::unroll(Value loop) { b.create<KrnlUnrollOp>(loc, loop); }
+
 ValueRange KrnlBuilder::getInductionVarValue(ValueRange loops) {
   return b.create<KrnlGetInductionVariableValueOp>(loc, loops).getResults();
 }
