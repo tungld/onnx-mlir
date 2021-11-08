@@ -27,7 +27,7 @@ namespace mlir {
 
 //====-------------------------- ONNX Builder ---------------------------===//
 
-struct OnnxBuilder final : DialectBuilder {
+struct OnnxBuilder : DialectBuilder {
   OnnxBuilder(OpBuilder &b, Location loc) : DialectBuilder(b, loc) {}
   OnnxBuilder(DialectBuilder &db) : DialectBuilder(db) {}
 
@@ -39,6 +39,8 @@ struct OnnxBuilder final : DialectBuilder {
 
   Value reshape(Type outputType, Value input, Value shape) const;
   Value transpose(Type outputType, Value input, ArrayAttr perm) const;
+
+  Value constant(Attribute denseAttr);
 };
 
 } // namespace mlir
@@ -112,8 +114,8 @@ mlir::DenseElementsAttr getDenseElementAttributeFromONNXValue(
     mlir::Value value);
 
 mlir::ONNXConstantOp getONNXConstantOp(mlir::Value value);
-mlir::Value getONNXConstantOpFromDenseAttr(
-    mlir::PatternRewriter &rewriter, mlir::Location loc, mlir::Attribute dense);
+mlir::Value createONNXConstantOpWithDenseAttr(
+    mlir::OpBuilder &builder, mlir::Location loc, mlir::Attribute dense);
 bool isFromNone(mlir::Value value);
 mlir::Type getBroadcastedRankedType(mlir::Type type1, mlir::Type type2);
 
@@ -191,9 +193,9 @@ mlir::ArrayAttr createArrayAttrFromConstantOp(
 // Check whether a value is produced by a dense ONNXConstantOp.
 bool isDenseONNXConstant(mlir::Value result);
 
-// Check if a value is a 16, 32 or 64 bit integer.
-bool isCommonInteger(mlir::RankedTensorType tensorType);
-
 // Get scalar value when it is a constant.
-double getScalarValue(
-    mlir::ONNXConstantOp constantOp, mlir::RankedTensorType tensorType);
+template <typename RESULT_TYPE>
+RESULT_TYPE getScalarValue(mlir::DenseElementsAttr &denseAttr, mlir::Type type);
+
+template <typename RESULT_TYPE>
+RESULT_TYPE getScalarValue(mlir::ONNXConstantOp constantOp, mlir::Type type);
