@@ -491,7 +491,7 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
   bool simdize = true;
   if (simdize) {
     llvm::outs() << "Running simd version\n";
-    int64_t bTile(16), hTile(8);
+    int64_t bTile(32), hTile(8);
     // Vectorize along hidden dimenssion.
     int64_t VL(hTile);
     VectorType vecType = VectorType::get({VL}, elementType);
@@ -503,26 +503,28 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
     Value vecOne = rewriter.create<vector::BroadcastOp>(loc, vecType, one);
     Value vecTwo = rewriter.create<vector::BroadcastOp>(loc, vecType, two);
 
-    SmallVector<Type, 4> splitType(4, matrixType);
-    std::vector<Value> XtWiofc =
-        foldOrEmitONNXSplitOp(rewriter, loc, splitType, XtWT, 1);
-    std::vector<Value> HtRiofc =
-        foldOrEmitONNXSplitOp(rewriter, loc, splitType, HtRT, 1);
-
-    //
+    Value vecXtWT = createKrnl.vectorTypeCast(XtWT, VL);
+    Value vecHtRT = createKrnl.vectorTypeCast(HtRT, VL);
     Value vecHt = createKrnl.vectorTypeCast(Ht, VL);
     Value vecCt = createKrnl.vectorTypeCast(Ct, VL);
     Value vecAllH;
     if (!isNoneType(state.allH))
       vecAllH = createKrnl.vectorTypeCast(state.allH, VL);
+
+    // SmallVector<Type, 4> splitType(4, matrixType);
+    // std::vector<Value> XtWiofc =
+    //     foldOrEmitONNXSplitOp(rewriter, loc, splitType, XtWT, 1);
+    // std::vector<Value> HtRiofc =
+    //     foldOrEmitONNXSplitOp(rewriter, loc, splitType, HtRT, 1);
+
     //
-    SmallVector<Value, 4> vecXtWiofc;
-    for (Value v : XtWiofc)
-      vecXtWiofc.emplace_back(createKrnl.vectorTypeCast(v, VL));
-    //
-    SmallVector<Value, 4> vecHtRiofc;
-    for (Value v : HtRiofc)
-      vecHtRiofc.emplace_back(createKrnl.vectorTypeCast(v, VL));
+    // SmallVector<Value, 4> vecXtWiofc;
+    // for (Value v : XtWiofc)
+    //   vecXtWiofc.emplace_back(createKrnl.vectorTypeCast(v, VL));
+    // //
+    // SmallVector<Value, 4> vecHtRiofc;
+    // for (Value v : HtRiofc)
+    //   vecHtRiofc.emplace_back(createKrnl.vectorTypeCast(v, VL));
     //
     Value vecWbi, vecWbo, vecWbf, vecWbc;
     Value vecRbi, vecRbo, vecRbf, vecRbc;
@@ -553,34 +555,32 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
     ValueRange hBlock = createKrnl.block(hh, hTile);
     Value hh1(hBlock[0]), hh2(hBlock[1]);
     createKrnl.permute({bb1, bb2, hh1, hh2}, {0, 2, 1, 3});
-    // got error when lowering to affine.
     // createKrnl.unroll(bb2);
 
     createKrnl.iterate(origLoop, {bb1, hh1}, HtLbs, HtUbs,
         [&](KrnlBuilder &createKrnl, ValueRange indices) {
           Value hi(indices[1]);
-
           createKrnl.iterate({}, {bb2}, {}, {},
               [&](KrnlBuilder &createKrnl, ValueRange indices) {
                 Value bi(indices[0]);
-                SmallVector<Value, 2> accessInd = {bi, hi};
-
                 MathBuilder createMath(createKrnl);
-                IndexExprScope ieScope(createKrnl);
+                IndexExprScope innerScope(createKrnl);
+                SymbolIndexExpr bie(bi), hie(hi);
+                LiteralIndexExpr hsie(hiddenSize);
 
-                Value CtVal = createKrnl.load(vecCt, accessInd);
+                Value CtVal = createKrnl.loadIE(vecCt, {bie, hie});
                 // it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
-                Value XtWTiVal = createKrnl.load(vecXtWiofc[0], accessInd);
-                Value HtRTiVal = createKrnl.load(vecHtRiofc[0], accessInd);
+                Value XtWTiVal = createKrnl.loadIE(vecXtWT, {bie, hie});
+                Value HtRTiVal = createKrnl.loadIE(vecHtRT, {bie, hie});
                 Value it = createMath.add(XtWTiVal, HtRTiVal);
                 if (biasPack.hasBias) {
-                  Value WbiVal = createKrnl.load(vecWbi, {hi});
-                  Value RbiVal = createKrnl.load(vecRbi, {hi});
+                  Value WbiVal = createKrnl.loadIE(vecWbi, {hie});
+                  Value RbiVal = createKrnl.loadIE(vecRbi, {hie});
                   it = createMath.add(it, WbiVal);
                   it = createMath.add(it, RbiVal);
                 }
                 if (biasPack.hasPeephole) {
-                  Value PiVal = createKrnl.load(vecPi, {hi});
+                  Value PiVal = createKrnl.loadIE(vecPi, {hie});
                   Value PiCt = createMath.mul(PiVal, CtVal);
                   it = createMath.add(it, PiCt);
                 }
@@ -593,12 +593,14 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                     rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
 
                 // ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
-                Value XtWTfVal = createKrnl.load(vecXtWiofc[2], accessInd);
-                Value HtRTfVal = createKrnl.load(vecHtRiofc[2], accessInd);
+                Value XtWTfVal =
+                    createKrnl.loadIE(vecXtWT, {bie, hie + 2 * hsie});
+                Value HtRTfVal =
+                    createKrnl.loadIE(vecHtRT, {bie, hie + 2 * hsie});
                 Value ft = createMath.add(XtWTfVal, HtRTfVal);
                 if (biasPack.hasBias) {
-                  Value WbfVal = createKrnl.load(vecWbf, {hi});
-                  Value RbfVal = createKrnl.load(vecRbf, {hi});
+                  Value WbfVal = createKrnl.loadIE(vecWbf, {hie});
+                  Value RbfVal = createKrnl.loadIE(vecRbf, {hie});
                   ft = createMath.add(ft, WbfVal);
                   ft = createMath.add(ft, RbfVal);
                 }
@@ -616,12 +618,14 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                     rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
 
                 // ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
-                Value XtWTcVal = createKrnl.load(vecXtWiofc[3], accessInd);
-                Value HtRTcVal = createKrnl.load(vecHtRiofc[3], accessInd);
+                Value XtWTcVal =
+                    createKrnl.loadIE(vecXtWT, {bie, hie + 3 * hsie});
+                Value HtRTcVal =
+                    createKrnl.loadIE(vecHtRT, {bie, hie + 3 * hsie});
                 Value ct = createMath.add(XtWTcVal, HtRTcVal);
                 if (biasPack.hasBias) {
-                  Value WbcVal = createKrnl.load(vecWbc, {hi});
-                  Value RbcVal = createKrnl.load(vecRbc, {hi});
+                  Value WbcVal = createKrnl.loadIE(vecWbc, {hie});
+                  Value RbcVal = createKrnl.loadIE(vecRbc, {hie});
                   ct = createMath.add(ct, WbcVal);
                   ct = createMath.add(ct, RbcVal);
                 }
@@ -640,17 +644,17 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                 Value nextCt = createMath.add(ftCt, itct);
 
                 // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
-                Value XtWToVal = createKrnl.load(vecXtWiofc[1], accessInd);
-                Value HtRToVal = createKrnl.load(vecHtRiofc[1], accessInd);
+                Value XtWToVal = createKrnl.loadIE(vecXtWT, {bie, hie + hsie});
+                Value HtRToVal = createKrnl.loadIE(vecHtRT, {bie, hie + hsie});
                 Value ot = createMath.add(XtWToVal, HtRToVal);
                 if (biasPack.hasBias) {
-                  Value WboVal = createKrnl.load(vecWbo, {hi});
-                  Value RboVal = createKrnl.load(vecRbo, {hi});
+                  Value WboVal = createKrnl.loadIE(vecWbo, {hie});
+                  Value RboVal = createKrnl.loadIE(vecRbo, {hie});
                   ot = createMath.add(ot, WboVal);
                   ot = createMath.add(ot, RboVal);
                 }
                 if (biasPack.hasPeephole) {
-                  Value PoVal = createKrnl.load(vecPo, {hi});
+                  Value PoVal = createKrnl.loadIE(vecPo, {hie});
                   Value PoCt = createMath.mul(PoVal, nextCt);
                   ot = createMath.add(ot, PoCt);
                 }
@@ -674,8 +678,8 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                 nextHt = createMath.mul(ot, nextHt);
 
                 // Store the intermediate Ht, Ct.
-                createKrnl.store(nextCt, vecCt, accessInd);
-                createKrnl.store(nextHt, vecHt, accessInd);
+                createKrnl.storeIE(nextCt, vecCt, {bie, hie});
+                createKrnl.storeIE(nextHt, vecHt, {bie, hie});
                 if (!isNoneType(state.allH))
                   createKrnl.store(
                       nextHt, vecAllH, {sequenceIV, directionIV, bi, hi});
