@@ -87,6 +87,11 @@ Value MathBuilder::log2(Value val) const {
   return b.create<math::Log2Op>(loc, val);
 }
 
+Value MathBuilder::sqrt(Value val) const {
+  assert(val.getType().isa<FloatType>() && "Data type must be float.");
+  return b.create<math::SqrtOp>(loc, val);
+}
+
 Value MathBuilder::min(Value lhs, Value rhs) const {
   assert(lhs.getType() == rhs.getType() && "expected same type");
   if (lhs.getType().isa<IntegerType>() || lhs.getType().isa<IndexType>())
@@ -229,10 +234,10 @@ Value MathBuilder::cast(Type destType, Value src) const {
   // Only support Integer or Float type at this stage. Index were transformed to
   // signless int.
   // TODO: add support for shaped tensor (MemRef, Vector, Tensor?) if needed.
-  assert(srcType.isa<IntegerType>() ||
-         srcType.isa<FloatType>() && "support only float or int");
-  assert(destType.isa<IntegerType>() ||
-         destType.isa<FloatType>() && "support only float or int");
+  assert((srcType.isa<IntegerType>() || srcType.isa<FloatType>()) &&
+         "support only float or int");
+  assert((destType.isa<IntegerType>() || destType.isa<FloatType>()) &&
+         "support only float or int");
   // Get source and dest type width.
   int64_t srcWidth = srcType.getIntOrFloatBitWidth();
   int64_t destWidth = destType.getIntOrFloatBitWidth();

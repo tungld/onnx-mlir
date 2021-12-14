@@ -40,7 +40,17 @@ struct OnnxBuilder : DialectBuilder {
   Value reshape(Type outputType, Value input, Value shape) const;
   Value transpose(Type outputType, Value input, ArrayAttr perm) const;
 
-  Value constant(Attribute denseAttr);
+  Value constant(Attribute denseAttr) const;
+};
+
+// Recursive class specialized for OnnxBuilder refereed to as onnx.
+template <class... Ts>
+struct MultiDialectBuilder<OnnxBuilder, Ts...> : MultiDialectBuilder<Ts...> {
+  MultiDialectBuilder(OpBuilder &b, Location loc)
+      : MultiDialectBuilder<Ts...>(b, loc), onnx(b, loc) {}
+  MultiDialectBuilder(DialectBuilder &db)
+      : MultiDialectBuilder<Ts...>(db), onnx(db) {}
+  OnnxBuilder onnx;
 };
 
 } // namespace mlir

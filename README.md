@@ -75,9 +75,9 @@ RUN apt-get install -y vim
 # WORKDIR /workdir/workspace
 # ADD workspace /workdir/workspace
 
-# 5) Fix git by reattaching head and making git see other branches than master.
+# 5) Fix git by reattaching head and making git see other branches than main.
 WORKDIR /workdir/onnx-mlir
-RUN git checkout master
+RUN git checkout main
 RUN git fetch --unshallow
 
 # 6) Set the PATH environment vars for make/debug mode. Replace Debug
@@ -154,7 +154,7 @@ git clone --recursive https://github.com/onnx/onnx-mlir.git
 export MLIR_DIR=$(pwd)/llvm-project/build/lib/cmake/mlir
 
 mkdir onnx-mlir/build && cd onnx-mlir/build
-cmake -G Ninja ..
+cmake -G Ninja -DCMAKE_CXX_COMPILER=/usr/bin/c++ ..
 cmake --build .
 
 # Run lit tests:
@@ -332,7 +332,7 @@ These are frontend options.
       --EmitLib       - Lower model to LLVM IR, emit (to file) LLVM bitcode for model, compile and link it to a shared library.
 ```
 
-## Example
+## Simple Example
 
 For example, to lower an ONNX model (e.g., add.onnx) to ONNX dialect, use the following command:
 ```shell
@@ -347,6 +347,13 @@ module {
   }
 }
 ```
+
+An example based on the add operation is found [here](docs/doc_example), which build an ONNX model using a python script, and then provide a main program to load the model's value, compute, and print the models output.
+
+## End to end example
+
+An end to end example is provided [here](docs/mnist_example/README.md), which train, compile, and execute a simple MNIST example using both the C++ or Python interface.
+
 
 ## Troubleshooting
 

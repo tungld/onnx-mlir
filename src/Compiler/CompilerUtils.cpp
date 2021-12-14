@@ -2,9 +2,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===--------------------------- MainUtils.cpp ---------------------------===//
+//===-------------------------- CompilerUtils.cpp -------------------------===//
 //
-// Copyright 2019-2020 The IBM Research Authors.
+// Copyright 2019-2021 The IBM Research Authors.
 //
 // =============================================================================
 //
@@ -17,12 +17,16 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
+#include "llvm/IR/DataLayout.h"
+#include "llvm/MC/TargetRegistry.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Target/TargetMachine.h"
 
-#include "CompilerUtils.hpp"
 #include "ExternalUtil.hpp"
+#include "src/Compiler/CompilerUtils.hpp"
 #include "src/Support/OMOptions.hpp"
 
 using namespace std;
@@ -34,7 +38,7 @@ llvm::cl::OptionCategory OnnxMlirOptions(
 
 namespace {
 
-llvm::Optional<std::string> getEnvVar(std::string name) {
+static llvm::Optional<std::string> getEnvVar(std::string name) {
   if (const char *envVerbose = std::getenv(name.c_str()))
     return std::string(envVerbose);
   return llvm::None;
@@ -45,38 +49,39 @@ llvm::Optional<std::string> getEnvVar(std::string name) {
 // TODO: Find a respectable home for the wain
 
 // the option is used in this file, so defined here
-llvm::cl::opt<bool> invokeOnnxVersionConverter("invokeOnnxVersionConverter",
+static llvm::cl::opt<bool> invokeOnnxVersionConverter(
+    "invokeOnnxVersionConverter",
     llvm::cl::desc(
         "call onnx vesion converter to convert ONNX model to current version"),
     llvm::cl::init(false), llvm::cl::cat(OnnxMlirOptions));
 
-llvm::cl::opt<bool> preserveLocations("preserveLocations",
+static llvm::cl::opt<bool> preserveLocations("preserveLocations",
     llvm::cl::desc("emit location data:"), llvm::cl::init(false),
     llvm::cl::cat(OnnxMlirOptions));
 
-llvm::cl::opt<bool> printIR("printIR",
+static llvm::cl::opt<bool> printIR("printIR",
     llvm::cl::desc("print the IR to stdout:"), llvm::cl::init(false),
     llvm::cl::cat(OnnxMlirOptions));
 
-llvm::cl::opt<bool> preserveBitcode("preserveBitcode",
+static llvm::cl::opt<bool> preserveBitcode("preserveBitcode",
     llvm::cl::desc(
         "dont delete the bitcode files (optimized and unoptimized):"),
     llvm::cl::init(false), llvm::cl::cat(OnnxMlirOptions));
 
-llvm::cl::opt<bool> preserveMLIR("preserveMLIR",
+static llvm::cl::opt<bool> preserveMLIR("preserveMLIR",
     llvm::cl::desc("dont delete the MLIR files (input and llvm):"),
     llvm::cl::init(false), llvm::cl::cat(OnnxMlirOptions));
 
-llvm::cl::opt<bool> useOnnxModelTypes("useOnnxModelTypes",
+static llvm::cl::opt<bool> useOnnxModelTypes("useOnnxModelTypes",
     llvm::cl::desc("use types and shapes from ONNX model"),
     llvm::cl::init(false), llvm::cl::cat(OnnxMlirOptions));
 
-llvm::cl::opt<int> repeatOnnxTransform("repeatOnnxTransform",
+static llvm::cl::opt<int> repeatOnnxTransform("repeatOnnxTransform",
     llvm::cl::desc(
         "invoke extra onnx transform pass(shape infernce, constant and etc.)"),
     llvm::cl::init(0), llvm::cl::cat(OnnxMlirOptions));
 
-llvm::cl::opt<string> shapeInformation("shapeInformation",
+static llvm::cl::opt<string> shapeInformation("shapeInformation",
     llvm::cl::desc(
         "Custom shapes for the inputs of the ONNX model, e.g. setting static "
         "shapes for dynamic inputs.\n"
@@ -88,13 +93,27 @@ llvm::cl::opt<string> shapeInformation("shapeInformation",
         "unknown dimensions)"),
     llvm::cl::value_desc("value"), llvm::cl::cat(OnnxMlirOptions));
 
-llvm::cl::opt<string> mtriple("mtriple", llvm::cl::desc("Target architecture"),
-    llvm::cl::value_desc("<llvm target triple>"),
+static llvm::cl::opt<std::string> mtriple("mtriple",
+    llvm::cl::desc("Target architecture"),
+    llvm::cl::value_desc("LLVM target triple>"), llvm::cl::cat(OnnxMlirOptions),
+    llvm::cl::ValueRequired);
+
+static llvm::cl::opt<std::string> mcpu("mcpu", llvm::cl::desc("Target cpu"),
+    llvm::cl::value_desc("Target a specific CPU type"),
     llvm::cl::cat(OnnxMlirOptions), llvm::cl::ValueRequired);
 
-llvm::cl::opt<string> mcpu("mcpu", llvm::cl::desc("Target cpu"),
-    llvm::cl::value_desc("<llvm cpu value>"), llvm::cl::cat(OnnxMlirOptions),
-    llvm::cl::ValueRequired);
+enum OptLevel { O0, O1, O2, O3 };
+static llvm::cl::opt<OptLevel> OptimizationLevel(
+    llvm::cl::desc("Optimization levels:"),
+    llvm::cl::values(clEnumVal(O0, "Optimization level 0 (default)."),
+        clEnumVal(O1, "Optimization level 1."),
+        clEnumVal(O2, "Optimization level 2."),
+        clEnumVal(O3, "Optimization level 3.")),
+    llvm::cl::init(O0), llvm::cl::cat(OnnxMlirOptions));
+
+static llvm::cl::opt<bool> VerboseOutput("v",
+    llvm::cl::desc("Use verbose output"), llvm::cl::init(false),
+    llvm::cl::cat(OnnxMlirOptions));
 
 // Make a function that forces preserving all files using the runtime arguments
 // and/or the overridePreserveFiles enum.
@@ -124,15 +143,16 @@ static bool keepFiles(KeepFilesOfType preserve) {
   return false;
 }
 
-string getExecPath() {
+static std::string getExecPath() {
   // argv0 is only used as a fallback for rare environments
   // where /proc isn't mounted and mainExecAddr is only needed for
   // unknown unix-like platforms
   auto execPath = llvm::sys::fs::getMainExecutable(nullptr, nullptr);
   if (execPath.empty()) {
-    std::cerr << "Warning: Could not find path to current executable, falling "
-                 "back to default install path: "
-              << kExecPath << std::endl;
+    llvm::errs()
+        << "Warning: Could not find path to current executable, falling "
+           "back to default install path: "
+        << kExecPath << "\n";
     return kExecPath;
   }
   return execPath;
@@ -149,7 +169,7 @@ string getExecPath() {
 //     correctly resolve to /usr/local/lib), but some systems still have
 //     lib64 so we check that first. If neither exists, then
 //   - use CMAKE_INSTALL_PREFIX/lib, which is typically /usr/local/lib
-string getRuntimeDir() {
+static std::string getRuntimeDir() {
   const auto &envDir = getEnvVar("ONNX_MLIR_RUNTIME_DIR");
   if (envDir && llvm::sys::fs::exists(envDir.getValue()))
     return envDir.getValue();
@@ -191,7 +211,7 @@ string getRuntimeDir() {
 // installed system wide but to different places and their sources have been
 // removed. So we force CMAKE_INSTALL_PREFIX to be the same as that of
 // llvm-project.
-string getToolPath(string tool) {
+static std::string getToolPath(string tool) {
   string execDir = llvm::sys::path::parent_path(getExecPath()).str();
   llvm::SmallString<8> toolPath(execDir);
   llvm::sys::path::append(toolPath, tool);
@@ -239,16 +259,33 @@ struct Command {
     return *this;
   }
 
-  // Execute command.
-  void exec() {
+  // Execute command in current work directory.
+  //
+  // If the optional wdir is specified, the command will be executed
+  // in the specified work directory. Current work directory is
+  // restored after the command is executed.
+  void exec(std::string wdir = "") const {
     auto argsRef = std::vector<llvm::StringRef>(_args.begin(), _args.end());
     bool verbose = false;
     if (const auto &verboseStr = getEnvVar("ONNX_MLIR_VERBOSE"))
       istringstream(verboseStr.getValue()) >> verbose;
 
+    // If a work directory is specified, save the current work directory
+    // and switch into it. Note that if wdir is empty, new_wdir will be
+    // cur_wdir.
+    SmallString<8> cur_wdir;
+    SmallString<8> new_wdir(wdir);
+    llvm::sys::fs::current_path(cur_wdir);
+    llvm::sys::fs::make_absolute(cur_wdir, new_wdir);
+    if (std::error_code ec = llvm::sys::fs::set_current_path(new_wdir)) {
+      llvm::errs() << StringRef(new_wdir).str() << ": " << ec.message() << "\n";
+      exit(ec.value());
+    }
+
     // If in verbose mode, print out command before execution.
-    if (verbose)
-      cout << _path << ": " << llvm::join(argsRef, " ") << "\n";
+    if (VerboseOutput || verbose)
+      llvm::errs() << "[" << StringRef(new_wdir).str() << "]" << _path << ": "
+                   << llvm::join(argsRef, " ") << "\n";
 
     std::string errMsg;
     int rc = llvm::sys::ExecuteAndWait(_path, llvm::makeArrayRef(argsRef),
@@ -256,12 +293,16 @@ struct Command {
         /*SecondsToWait=*/0, /*MemoryLimit=*/0, &errMsg);
 
     if (rc != 0) {
-      fprintf(stderr, "%s\n", llvm::join(argsRef, " ").c_str());
-      fprintf(stderr, "Error message: %s\n", errMsg.c_str());
-      fprintf(stderr, "Program path: %s\n", _path.c_str());
-      fprintf(stderr, "Command execution failed.");
+      llvm::errs() << llvm::join(argsRef, " ") << "\n"
+                   << "Error message: " << errMsg << "\n"
+                   << "Program path: " << _path << "\n"
+                   << "Command execution failed."
+                   << "\n";
       exit(rc);
     }
+
+    // Restore saved work directory.
+    llvm::sys::fs::set_current_path(cur_wdir);
   }
 };
 } // namespace
@@ -291,16 +332,16 @@ void LoadMLIR(string inputFilename, mlir::MLIRContext &context,
   }
 }
 
-string getTargetCpuOption() {
+static std::string getTargetCpuOption() {
   string targetOptions = "";
   if (mcpu != "")
     targetOptions += "--mcpu=" + mcpu;
   return targetOptions;
 }
 
-string getTargetTripleOption() {
+static std::string getTargetTripleOption() {
   string targetOptions = "";
-  // Comand cannot tolerate extra spaces. Add only when needed.
+  // Command cannot tolerate extra spaces. Add only when needed.
   if (mtriple != "")
     targetOptions = "--mtriple=" + mtriple;
   else if (kDefaultTriple != "")
@@ -308,8 +349,23 @@ string getTargetTripleOption() {
   return targetOptions;
 }
 
+static std::string getOptimizationLevelOption() {
+  switch (OptimizationLevel) {
+  case OptLevel::O0:
+    return "-O0";
+  case OptLevel::O1:
+    return "-O1";
+  case OptLevel::O2:
+    return "-O2";
+  case OptLevel::O3:
+    return "-O3";
+  }
+  llvm_unreachable("Unexpected optimization level");
+  return "";
+}
+
 // Write LLVM optimized bitcode.
-void genLLVMBitcode(const mlir::OwningModuleRef &module,
+static void genLLVMBitcode(const mlir::OwningModuleRef &module,
     string optimizedBitcodePath, string outputBaseName) {
   error_code error;
 
@@ -318,8 +374,14 @@ void genLLVMBitcode(const mlir::OwningModuleRef &module,
   llvm::FileRemover unoptimzedBitcodeRemover(
       unoptimizedBitcodePath, !keepFiles(KeepFilesOfType::Bitcode));
 
+  // outputBaseName might contain a directory, which must exist.
+  // Otherwise, a "No such file or directory" error will be returned.
   llvm::raw_fd_ostream moduleBitcodeStream(
       unoptimizedBitcodePath, error, llvm::sys::fs::OF_None);
+  if (error) {
+    llvm::errs() << unoptimizedBitcodePath << ": " << error.message() << "\n";
+    exit(error.value());
+  }
 
   llvm::LLVMContext llvmContext;
   mlir::registerLLVMDialectTranslation(*(module.get().getContext()));
@@ -334,7 +396,7 @@ void genLLVMBitcode(const mlir::OwningModuleRef &module,
   // Use the LLVM's 'opt' command to optimize the bitcode.
   string optPath = getToolPath("opt");
   Command optBitcode(/*exePath=*/!optPath.empty() ? optPath : kOptPath);
-  optBitcode.appendStr("-O3")
+  optBitcode.appendStr(getOptimizationLevelOption())
       .appendStr(getTargetTripleOption())
       .appendStr(getTargetCpuOption())
       .appendList({"-o", optimizedBitcodePath})
@@ -343,7 +405,7 @@ void genLLVMBitcode(const mlir::OwningModuleRef &module,
 }
 
 // Compile LLVM bitcode to object file.
-string genModelObject(string bitcodePath, string outputBaseName) {
+static std::string genModelObject(string bitcodePath, string outputBaseName) {
 
 #ifdef _WIN32
   string modelObjPath = outputBaseName + ".obj";
@@ -353,7 +415,8 @@ string genModelObject(string bitcodePath, string outputBaseName) {
 
   string llcPath = getToolPath("llc");
   Command llvmToObj(/*exePath=*/!llcPath.empty() ? llcPath : kLlcPath);
-  llvmToObj.appendStr("-filetype=obj")
+  llvmToObj.appendStr(getOptimizationLevelOption())
+      .appendStr("-filetype=obj")
       .appendStr("-relocation-model=pic")
       .appendList({"-o", modelObjPath})
       .appendStr(bitcodePath)
@@ -361,14 +424,22 @@ string genModelObject(string bitcodePath, string outputBaseName) {
   return modelObjPath;
 }
 
-void genJniObject(const mlir::OwningModuleRef &module, string jniSharedLibPath,
-    string jniObjPath) {
+static void genJniObject(const mlir::OwningModuleRef &module,
+    string jniSharedLibPath, string jniObjPath) {
   Command ar(/*exePath=*/kArPath);
-  ar.appendStr("x").appendStr(jniSharedLibPath).appendStr(jniObjPath).exec();
+  ar.appendStr("x")
+      // old version of ar does not support --output so comment out
+      // for now and use the optional wdir for exec() to get around
+      // the problem.
+      //.appendStr("--output")
+      //.appendStr(llvm::sys::path::parent_path(jniObjPath).str())
+      .appendStr(jniSharedLibPath)
+      .appendStr(llvm::sys::path::filename(jniObjPath).str())
+      .exec(llvm::sys::path::parent_path(jniObjPath).str());
 }
 
 // Link everything into a shared object.
-string genSharedLib(string outputBaseName, std::vector<string> opts,
+static std::string genSharedLib(string outputBaseName, std::vector<string> opts,
     std::vector<string> objs, std::vector<string> libs,
     std::vector<string> libDirs) {
 
@@ -378,7 +449,7 @@ string genSharedLib(string outputBaseName, std::vector<string> opts,
   // link has to be before def and libpath since they need to be passed through
   // to the linker
   std::vector<string> sharedLibOpts = {
-      "/LD", "/link", "/def:" + outputBaseName + ".def"};
+      "/LD", "/link", "/NOLOGO", "/def:" + outputBaseName + ".def"};
 
   llvm::for_each(libs, [](string &lib) { lib = lib + ".lib"; });
   llvm::for_each(
@@ -405,8 +476,8 @@ string genSharedLib(string outputBaseName, std::vector<string> opts,
 
 // Create jar containing java runtime and model shared library (which includes
 // jni runtime).
-void genJniJar(const mlir::OwningModuleRef &module, string modelSharedLibPath,
-    string modelJniJarPath) {
+static void genJniJar(const mlir::OwningModuleRef &module,
+    string modelSharedLibPath, string modelJniJarPath) {
   llvm::SmallString<8> runtimeDir(getRuntimeDir());
   llvm::sys::path::append(runtimeDir, "javaruntime.jar");
   string javaRuntimeJarPath = llvm::StringRef(runtimeDir).str();
@@ -416,10 +487,15 @@ void genJniJar(const mlir::OwningModuleRef &module, string modelSharedLibPath,
 
   // Add shared library to model jar.
   Command jar(kJarPath);
-  jar.appendList({"uf", modelJniJarPath}).appendStr(modelSharedLibPath).exec();
+  jar.appendStr("uf")
+      .appendStr(modelJniJarPath)
+      .appendStr("-C")
+      .appendStr(llvm::sys::path::parent_path(modelSharedLibPath).str())
+      .appendStr(llvm::sys::path::filename(modelSharedLibPath).str())
+      .exec();
 }
 
-string compileModuleToSharedLibrary(
+std::string compileModuleToSharedLibrary(
     const mlir::OwningModuleRef &module, std::string outputBaseName) {
 
   string bitcodePath = outputBaseName + ".bc";
@@ -447,13 +523,25 @@ void compileModuleToJniJar(
   llvm::FileRemover modelObjRemover(
       modelObjPath, !keepFiles(KeepFilesOfType::Object));
 
+  StringRef outputDir = llvm::sys::path::parent_path(outputBaseName);
+  if (outputDir.empty())
+    outputDir = StringRef(".");
+
   string jniSharedLibPath = getRuntimeDir() + "/libjniruntime.a";
-  string jniObjPath = "jnidummy.c.o";
+
+  llvm::SmallString<8> jniObjDir(outputDir);
+  llvm::sys::path::append(jniObjDir, "jnidummy.c.o");
+  string jniObjPath = llvm::StringRef(jniObjDir).str();
+
   genJniObject(module, jniSharedLibPath, jniObjPath);
   llvm::FileRemover jniObjRemover(
       jniObjPath, !keepFiles(KeepFilesOfType::Object));
 
-  string modelSharedLibPath = genSharedLib("libmodel", {"-z", "noexecstack"},
+  llvm::SmallString<8> jniLibDir(outputDir);
+  llvm::sys::path::append(jniLibDir, "libmodel");
+  string jniLibBase = llvm::StringRef(jniLibDir).str();
+
+  string modelSharedLibPath = genSharedLib(jniLibBase, {"-z", "noexecstack"},
       {modelObjPath, jniObjPath}, {"jniruntime", "cruntime"},
       {getRuntimeDir()});
   llvm::FileRemover modelSharedLibRemover(
@@ -626,9 +714,6 @@ void outputCode(
 
   module->print(output->os(), flags);
   output->keep();
-
-  if (printIR)
-    module->print(llvm::outs(), flags);
 }
 
 void emitOutputFiles(string outputBaseName, EmissionTargetType emissionTarget,
@@ -691,8 +776,50 @@ void emitOutputFiles(string outputBaseName, EmissionTargetType emissionTarget,
   }
 }
 
+/// Return the module datalayout string. The datalayout string is determined by
+/// creating a target machine using the target triple and target cpu.
+static std::string getDataLayout(const Location &loc) {
+  const std::string targetTriple =
+      (mtriple != "") ? mtriple.getValue() : kDefaultTriple;
+  const std::string targetCpu = (mcpu != "") ? mcpu.getValue() : "";
+
+  std::string error;
+  const llvm::Target *LLVMTarget =
+      llvm::TargetRegistry::lookupTarget(targetTriple, error);
+  if (!LLVMTarget) {
+    emitError(loc, Twine("Target architecture is unknown: ") + error);
+    return nullptr;
+  }
+
+  llvm::TargetOptions ops;
+  llvm::TargetMachine *targetMachine = LLVMTarget->createTargetMachine(
+      targetTriple, targetCpu, "" /*features*/, ops, None);
+  if (!targetMachine) {
+    emitError(loc, "failed to create target machine");
+    return nullptr;
+  }
+
+  const llvm::DataLayout &dl = targetMachine->createDataLayout();
+  std::string dataLayoutString = dl.getStringRepresentation();
+  assert(dataLayoutString != "" && "Expecting a valid target datalayout");
+
+  return dataLayoutString;
+}
+
 int compileModule(mlir::OwningModuleRef &module, mlir::MLIRContext &context,
     std::string outputBaseName, EmissionTargetType emissionTarget) {
+  // Initialize the targets support for all targets LLVM was configured for.
+  llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  llvm::InitializeAllAsmPrinters();
+  llvm::InitializeAllAsmParsers();
+
+  // Set the module datalayout.
+  Operation &moduleOp = *(module->getOperation());
+  Location loc = moduleOp.getLoc();
+  moduleOp.setAttr(LLVM::LLVMDialect::getDataLayoutAttrName(),
+      StringAttr::get(&context, getDataLayout(loc)));
+
   mlir::PassManager pm(&context, mlir::OpPassManager::Nesting::Implicit);
 
   if (keepFiles(KeepFilesOfType::MLIR)) {
@@ -703,9 +830,8 @@ int compileModule(mlir::OwningModuleRef &module, mlir::MLIRContext &context,
 
   InputIRLevelType inputIRLevel = determineInputIRLevel(module);
 
-  if (inputIRLevel <= ONNXLevel && emissionTarget >= EmitONNXIR) {
+  if (inputIRLevel <= ONNXLevel && emissionTarget >= EmitONNXIR)
     addONNXToMLIRPasses(pm);
-  }
 
   if (emissionTarget >= EmitMLIR) {
     if (inputIRLevel <= ONNXLevel)
@@ -721,6 +847,13 @@ int compileModule(mlir::OwningModuleRef &module, mlir::MLIRContext &context,
   if (mlir::failed(pm.run(*module)))
     return 4;
 
-  emitOutputFiles(outputBaseName, emissionTarget, context, module);
+  if (printIR) {
+    mlir::OpPrintingFlags flags;
+    if (preserveLocations)
+      flags.enableDebugInfo();
+    module->print(llvm::outs(), flags);
+  } else
+    emitOutputFiles(outputBaseName, emissionTarget, context, module);
+
   return 0;
 }

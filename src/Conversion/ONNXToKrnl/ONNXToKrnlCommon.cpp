@@ -108,16 +108,24 @@ bool hasAllScalarValues(ArrayRef<Value> values) {
 
 /// Get the corresponding MemRefType of a given TensorType/MemRefType.
 MemRefType convertToMemRefType(Type type) {
-  MemRefType memRefType;
-  auto tensorType = type.dyn_cast<TensorType>();
-  if (tensorType) {
+  // Convert the element type of the (tensor or memref) to a valid Krnl type.
+  auto convertElemType = [](Type elemType) -> Type {
+    if (elemType.isa<onnxmlir::StringType>())
+      return StringType::get(elemType.getContext());
+    return elemType;
+  };
+
+  if (auto tensorType = type.dyn_cast_or_null<TensorType>()) {
     assert(tensorType.hasRank() && "expected only ranked shapes");
-    memRefType =
-        MemRefType::get(tensorType.getShape(), tensorType.getElementType());
-  } else {
-    memRefType = type.dyn_cast<MemRefType>();
+    MemRefType memRefType = MemRefType::get(
+        tensorType.getShape(), convertElemType(tensorType.getElementType()));
+    return memRefType;
   }
-  return memRefType;
+
+  assert(type.isa<MemRefType>() && "Expecting a MemRefType");
+  auto memRefType = type.cast<MemRefType>();
+  return MemRefType::get(
+      memRefType.getShape(), convertElemType(memRefType.getElementType()));
 }
 
 /// Insert an allocation and deallocation for the given MemRefType.
@@ -455,13 +463,12 @@ Value getDimOrConstant(ConversionPatternRewriter &rewriter, Location loc,
     Value operand, int64_t axis, Type type) {
   ArrayRef<int64_t> shape = operand.getType().cast<ShapedType>().getShape();
   Value dimVal;
+  MultiDialectBuilder<MathBuilder, MemRefBuilder> create(rewriter, loc);
   if (shape[axis] < 0) {
-    MemRefBuilder createMemRef(rewriter, loc);
-    MathBuilder createMath(createMemRef);
-    Value dim = createMemRef.dim(operand, axis);
-    dimVal = createMath.cast(type, dim);
+    Value dim = create.mem.dim(operand, axis);
+    dimVal = create.math.cast(type, dim);
   } else {
-    dimVal = emitConstantOp(rewriter, loc, type, shape[axis]);
+    dimVal = create.math.constant(type, shape[axis]);
   }
   return dimVal;
 }
@@ -641,8 +648,6 @@ Value emitMemRefReinterpretCastOp(ConversionPatternRewriter &rewriter,
 Value emitArgSort(ConversionPatternRewriter &rewriter, Location loc,
     Value input, int64_t axis, bool ascending) {
   KrnlBuilder createKrnl(rewriter, loc);
-  MathBuilder createMath(createKrnl);
-  SCFBuilder createSCF(createKrnl);
   IndexExprScope scope(createKrnl);
 
   MemRefType inputMemRefType = input.getType().cast<MemRefType>();
@@ -678,26 +683,29 @@ Value emitArgSort(ConversionPatternRewriter &rewriter, Location loc,
         ValueRange swapLoopDef = createKrnl.defineLoops(1);
         createKrnl.iterateIE(swapLoopDef, swapLoopDef, {i1}, {ubs[axis]},
             [&](KrnlBuilder &createKrnl, ValueRange swapLoopInd) {
+              MultiDialectBuilder<KrnlBuilder, MathBuilder, SCFBuilder> create(
+                  createKrnl);
               SmallVector<Value> kLoopInd(iLoopInd);
               kLoopInd[axis] = swapLoopInd[0];
               // Load current indices.
-              Value iOrd = createKrnl.load(order, iLoopInd);
-              Value kOrd = createKrnl.load(order, kLoopInd);
+              Value iOrd = create.krnl.load(order, iLoopInd);
+              Value kOrd = create.krnl.load(order, kLoopInd);
               // Load x.
               SmallVector<Value> xLoopInd(iLoopInd);
               xLoopInd[axis] = iOrd;
-              Value x = createKrnl.load(input, xLoopInd);
+              Value x = create.krnl.load(input, xLoopInd);
               // Load y.
               SmallVector<Value> yLoopInd(iLoopInd);
               yLoopInd[axis] = kOrd;
-              Value y = createKrnl.load(input, yLoopInd);
+              Value y = create.krnl.load(input, yLoopInd);
               // Compare values and swap indices.
               Value cond;
               if (ascending)
-                cond = createMath.sgt(x, y);
+                cond = create.math.sgt(x, y);
               else
-                cond = createMath.slt(x, y);
-              createSCF.ifThenElse(cond, [&](SCFBuilder &createSCF) {
+                cond = create.math.slt(x, y);
+              create.scf.ifThenElse(cond, [&](SCFBuilder &createSCF) {
+                KrnlBuilder createKrnl(createSCF);
                 createKrnl.store(kOrd, order, iLoopInd);
                 createKrnl.store(iOrd, order, kLoopInd);
               });
@@ -728,14 +736,55 @@ DenseElementsAttr getDenseElementAttributeFromConstantValue(Value value) {
 /// value is used in case of NoneType.
 Value getOptionalScalarValue(ConversionPatternRewriter &rewriter, Location loc,
     Value optionalScalar, Type elementType, double defaultValue) {
-  KrnlBuilder createKrnl(rewriter, loc);
-  MathBuilder createMath(createKrnl);
+  MultiDialectBuilder<KrnlBuilder, MathBuilder> create(rewriter, loc);
   if (optionalScalar.getType().isa<NoneType>()) {
-    return createMath.constant(elementType, defaultValue);
+    return create.math.constant(elementType, defaultValue);
   } else if (optionalScalar.getType().cast<ShapedType>().getRank() == 0) {
-    return createKrnl.load(optionalScalar, {});
+    return create.krnl.load(optionalScalar, {});
   } else {
-    Value zero = createMath.constantIndex(0);
-    return createKrnl.load(optionalScalar, {zero});
+    Value zero = create.math.constantIndex(0);
+    return create.krnl.load(optionalScalar, {zero});
   }
+}
+
+//===----------------------------------------------------------------------===//
+// Type conversion from Onnx types to Krnl types.
+//===----------------------------------------------------------------------===//
+
+KrnlTypeConverter::KrnlTypeConverter() {
+  // The order of type conversion is important: later ones are tried earlier.
+  addConversion([](Type type) { return type; });
+
+  addConversion([](onnxmlir::StringType stringType) {
+    return StringType::get(stringType.getContext());
+  });
+
+  addConversion([](TensorType tensorType) {
+    assert(tensorType.hasRank() && "expected only ranked shapes");
+    if (tensorType.getElementType().isa<onnxmlir::StringType>()) {
+      Type elementType = StringType::get(tensorType.getContext());
+      return MemRefType::get(tensorType.getShape(), elementType);
+    }
+    return MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+  });
+
+  addSourceMaterialization([&](OpBuilder &builder, Type resultType,
+                               ValueRange inputs,
+                               Location loc) -> Optional<Value> {
+    if (inputs.size() != 1)
+      return llvm::None;
+
+    return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs)
+        .getResult(0);
+  });
+
+  addTargetMaterialization([&](OpBuilder &builder, Type resultType,
+                               ValueRange inputs,
+                               Location loc) -> Optional<Value> {
+    if (inputs.size() != 1)
+      return llvm::None;
+
+    return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs)
+        .getResult(0);
+  });
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //===------------------ KrnlOps.td - MLIR Operations ---------*- tablegen -===//
 //
 // Copyright 2019-2020 The IBM Research Authors.
@@ -25,6 +27,8 @@ def Krnl_Dialect : Dialect {
   let name = "krnl";
   let cppNamespace = "::mlir";
 }
+
+def StringType : Type<CPred<"$_self.isa<::mlir::StringType>()">, "string type">;
 
 // Require regions to have krnl.terminate terminator operation.
 def ImplicitKrnlTerminator : SingleBlockImplicitTerminator<"KrnlTerminatorOp">;
@@ -331,7 +335,7 @@ def KrnlUnrollOp : Op<Krnl_Dialect, "unroll"> {
   }];
 }
 
-def KrnlDimOp : Op<Krnl_Dialect, "dim"> {
+def KrnlDimOp : Op<Krnl_Dialect, "dim", [MemRefsNormalizable]> {
   let summary = "Krnl dimensions operation.";
   let description = [{
     Emits the dimension of a MemRef independent of the MemRef alloc:
@@ -352,7 +356,7 @@ def KrnlDimOp : Op<Krnl_Dialect, "dim"> {
   let printer = ?;
 }
 
-def KrnlShapeOp : Op<Krnl_Dialect, "shape"> {
+def KrnlShapeOp : Op<Krnl_Dialect, "shape", [MemRefsNormalizable]> {
   let summary = "Krnl operation to retreieve the shape of a MemRef.";
   let description = [{
     Extracts the shape of a MemRef:
@@ -369,7 +373,7 @@ def KrnlShapeOp : Op<Krnl_Dialect, "shape"> {
   let printer = ?;
 }
 
-def KrnlDummyCastOp : Op<Krnl_Dialect, "dummy_cast"> {
+def KrnlDummyCastOp : Op<Krnl_Dialect, "dummy_cast", [MemRefsNormalizable]> {
   let summary = "A dummy Krnl operation to perform type casting.";
   let hasCanonicalizer = 1;
 
@@ -625,7 +629,7 @@ def KrnlGetInductionVariableValueOp : Op<Krnl_Dialect, "get_induction_var_value"
 
 // =============================================================================
 
-def KrnlVectorTypeCastOp : Op<Krnl_Dialect, "vector_type_cast", [NoSideEffect]> {
+def KrnlVectorTypeCastOp : Op<Krnl_Dialect, "vector_type_cast", [NoSideEffect, MemRefsNormalizable]> {
   let summary = "vector type cast operation";
   let description = [{
     The "vector_type_cast" operation converts a memref from an non-vector
@@ -684,7 +688,7 @@ def KrnlSpecializedKernel : Op<Krnl_Dialect, "specialized_kernel",
 // =============================================================================
 
 def KrnlMatMulOp : Op<Krnl_Dialect, "matmul", [AttrSizedOperandSegments, 
-       DeclareOpInterfaceMethods<SpecializedKernelOpInterface>]> {
+       DeclareOpInterfaceMethods<SpecializedKernelOpInterface>, MemRefsNormalizable]> {
   let summary = "Matmul operation for a single pannel.";
   let description = [{
     Perform a matrix multiplication A * B + C
@@ -871,7 +875,8 @@ def KrnlCopyToBufferOp : Op<Krnl_Dialect, "copy_to_tile_buffer", [
                   "$_self.cast<MemRefType>().getElementType()">,
     TypesMatchWith<"type of 'padValue' matches element type of 'buffer'",
                   "buffer", "padValue",
-                  "$_self.cast<MemRefType>().getElementType()">]> {
+                   "$_self.cast<MemRefType>().getElementType()">,
+    MemRefsNormalizable]> {
   let summary = "Copy to buffer.";
   let description = [{
     Operation that copy a source memory to a buffer memory.
@@ -940,7 +945,7 @@ def KrnlCopyToBufferOp : Op<Krnl_Dialect, "copy_to_tile_buffer", [
 }
 
 def KrnlCopyFromBufferOp : Op<Krnl_Dialect, "copy_from_tile_buffer",
-    []> {
+    [MemRefsNormalizable]> {
   let summary = "Copy from buffer.";
   let description = [{
     Operation that copy a destination memory from a buffer memory.
@@ -997,8 +1002,28 @@ def KrnlMemsetOp : Op<Krnl_Dialect, "memset", [MemRefsNormalizable,
   let assemblyFormat = [{ $dest `,` $value attr-dict `:` type($dest) }];
 }
 
+def KrnlStrlenOp : Op<Krnl_Dialect, "strlen", [NoSideEffect]> {
+  let summary = "Compute the length of a string.";
+  let description = [{
+    Krnl operation that computes the length of a string.
+  }];
+
+  let arguments = (ins StringType:$str);
+  let results = (outs I64:$res);
+}
+
+def KrnlStrncmpOp : Op<Krnl_Dialect, "strncmp", [NoSideEffect]> {
+  let summary = "Perform string comparison up to N bytes.";
+  let description = [{
+    Krnl operation that performs a string comparison up to N bytes.
+  }];
+
+  let arguments = (ins StringType:$str1, StringType:$str2, I64:$len);
+  let results = (outs I32:$res);
+}
+
 def KrnlRandomNormalOp : Op<Krnl_Dialect, "random_normal",
-    []> {
+    [MemRefsNormalizable]> {
   let summary = "Generate a random normal tensor.";
   let description = [{
     Operation that generates a random normally distributed tensor.
@@ -1011,4 +1036,18 @@ def KrnlRandomNormalOp : Op<Krnl_Dialect, "random_normal",
     AnyFloat:$seed);
 
   let results = (outs );
+}
+
+def KrnlFindIndexOp : Op<Krnl_Dialect, "find_index",
+    [NoSideEffect, MemRefsNormalizable]> {
+  let summary = "Retrieve an index into a perfect hash table described by G and V.";
+  let description = [{
+    This operation can be used to generate a call to a runtime function which, 
+    given two arrays of int32_t values (G and V), whih are used to represent a perfect 
+    hash table for a dictionary, returns the index corresponding to the input value.
+    The index returned is valid only if 'input' is in the dictionary described by G and V.
+  }];
+
+  let arguments = (ins AnyTypeOf<[StringType, I64]>:$input, I32MemRef:$G, I32MemRef:$V, I32:$len);
+  let results = (outs Index:$index);
 }

@@ -63,9 +63,12 @@ namespace mlir {
 // Will put all the ONNXOps into this namespace
 namespace onnxmlir {
 class StringType
-    : public mlir::Type::TypeBase<StringType, mlir::Type, mlir::TypeStorage> {
+    : public mlir::Type::TypeBase<StringType, mlir::Type, mlir::TypeStorage,
+          mlir::MemRefElementTypeInterface::Trait> {
+
 public:
   using Base::Base;
+  using Base::getChecked;
 
   static StringType get(MLIRContext *ctx) { return Base::get(ctx); }
 };
@@ -79,13 +82,14 @@ class SeqType
 public:
   using Base::Base;
 
-  static SeqType get(llvm::ArrayRef<mlir::Type> elementTypes);
-
-  llvm::ArrayRef<mlir::Type> getElementTypes() const;
+  static SeqType get(mlir::Type elementType, int64_t length = -1);
 
   mlir::Type getElementType() const;
 
-  size_t getNumElementTypes() const { return getElementTypes().size(); }
+  // Return the length of the sequence.
+  // 0 : if the seq is empty
+  // -1  if unknown at compiler time
+  int64_t getLength() const;
 };
 
 } // end namespace onnxmlir

@@ -23,6 +23,7 @@
 #include "mlir/IR/PatternMatch.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #include "src/Dialect/ONNX/ONNXOps.hpp"
@@ -33,7 +34,6 @@
 
 using namespace mlir;
 using namespace mlir::OpTrait::util;
-using namespace mlir::onnxmlir;
 
 //===----------------------------------------------------------------------===//
 // ONNX Helper functions for shape helpers
@@ -576,8 +576,7 @@ ONNXOpsDialect::ONNXOpsDialect(mlir::MLIRContext *ctx)
 #define GET_OP_LIST
 #include "src/Dialect/ONNX/ONNXOps.cpp.inc"
       >();
-  addTypes<StringType>();
-  addTypes<SeqType>();
+  addTypes<onnxmlir::StringType, onnxmlir::SeqType>();
 }
 
 mlir::Type ONNXOpsDialect::parseType(mlir::DialectAsmParser &parser) const {
@@ -585,42 +584,37 @@ mlir::Type ONNXOpsDialect::parseType(mlir::DialectAsmParser &parser) const {
   if (parser.parseKeyword(&keyword))
     return Type();
 
+  MLIRContext *context = getContext();
   if (keyword == "String")
-    return StringType::get(getContext());
+    return onnxmlir::StringType::get(context);
   if (keyword == "Seq") {
     if (parser.parseLess())
       return Type();
 
     SmallVector<mlir::Type, 1> elementTypes;
-    do {
-      // llvm::SMLoc typeLoc = parser.getCurrentLocation();
-      mlir::Type elementType;
-      if (parser.parseType(elementType))
-        return Type();
-
-      // TOFIX: type limitation for Seq? similar but different shape??
-      elementTypes.push_back(elementType);
-    } while (succeeded(parser.parseOptionalComma()));
+    mlir::Type elementType;
+    if (parser.parseType(elementType))
+      return Type();
 
     if (parser.parseGreater())
       return Type();
-    return SeqType::get(elementTypes);
-  } else {
-    llvm_unreachable("Unexpected onnxmlir keyword");
+    return onnxmlir::SeqType::get(elementType);
   }
+
+  parser.emitError(parser.getNameLoc(), "unknown onnx type: " + keyword);
+  return Type();
 }
 
 void ONNXOpsDialect::printType(
-    mlir::Type type, mlir::DialectAsmPrinter &printer) const {
-  if (auto stringType = type.dyn_cast<StringType>()) {
-    printer << "String";
-  } else if (auto seqType = type.dyn_cast<SeqType>()) {
-    printer << "Seq<";
-    llvm::interleaveComma(seqType.getElementTypes(), printer);
-    printer << '>';
-  } else {
-    llvm_unreachable("Unexpected onnxmlir type");
-  }
+    mlir::Type type, mlir::DialectAsmPrinter &os) const {
+  TypeSwitch<Type>(type)
+      .Case<onnxmlir::StringType>([&](Type) { os << "String"; })
+      .Case<onnxmlir::SeqType>([&](onnxmlir::SeqType type) {
+        os << "Seq<";
+        os << type.getElementType();
+        os << '>';
+      })
+      .Default([](Type) { llvm_unreachable("Unexpected 'onnx' type kind"); });
 }
 
 void ONNXEntryPointOp::build(mlir::OpBuilder &builder,
@@ -864,6 +858,130 @@ LogicalResult ONNXLeakyReluOp::inferShapes(
 LogicalResult ONNXSeluOp::inferShapes(
     std::function<void(mlir::Region &)> doShapeInference) {
   getResult().setType(getOperand().getType());
+  return success();
+}
+
+// Sequence related operations
+// The general form for seq is seq<tensor<*xT>>
+// Tensors will be add or removed a seq dynamically.
+// The type of tensor should be a summary of all the tensors in the seq,
+// and can change after insertion.
+// It is possible seq<tensor<*xT>> can be refined into seq<RankedTensor>,
+// or even seq<StaticShapedTensor> if all the tensors have common shape info
+// A seq is started empty as the result of SequenceEmpty. We can track this
+// property with a tag in seq type or along dataflow.
+// When the an element is added, we can do some shape inference.
+// It is not easy to do anything when an element is removed.
+// Since the seq is usually used as a parameter of a graph (e.g. for LoopOp),
+// shape inference for region may need improvement.
+// However, the motivation for seq is to support tensors with
+// different shape in a seq. Otherwise a tensor with an extra dimension can
+// be used. The benefit to refine shape info for seq is unclear to me.
+// Therefore, the current implementation does not try to refine the shape info.
+
+LogicalResult ONNXSequenceInsertOp::inferShapes(
+    std::function<void(mlir::Region &)> doShapeInference) {
+  onnxmlir::SeqType seqType =
+      input_sequence().getType().dyn_cast<mlir::onnxmlir::SeqType>();
+  ShapedType tensorType = tensor().getType().dyn_cast<ShapedType>();
+
+  // When the input seq is empty, inherit the tensor type
+  if (seqType.getLength() == 0) {
+    getResult().setType(onnxmlir::SeqType::get(tensorType, 1));
+    return success();
+  }
+
+  // Merge the tensor type for the seq and the inserted tensor
+  // Pick the weaker attr: known dim > unknown dim > unranked tensor
+  // If inference gets an unranked tensor, no need to update the result
+  auto seqShape = seqType.getElementType().cast<ShapedType>().getShape();
+  auto seqRank = seqType.getElementType().cast<ShapedType>().getRank();
+  if (seqRank == -1)
+    return success();
+
+  auto tensorShape = tensorType.getShape();
+  auto tensorRank = tensorType.getRank();
+  if (tensorRank != seqRank)
+    return success();
+  SmallVector<int64_t, 4> dims;
+  for (auto i = 0; i < tensorRank; i++) {
+    dims.emplace_back(seqShape[i] != tensorShape[i] ? -1 : tensorShape[i]);
+  }
+  getResult().setType(onnxmlir::SeqType::get(
+      mlir::RankedTensorType::get(dims, tensorType.getElementType()),
+      seqType.getLength() == -1 ? -1 : seqType.getLength() + 1));
+
+  return success();
+}
+
+static LogicalResult verify(ONNXSequenceInsertOp op) {
+  ONNXSequenceInsertOpAdaptor operandAdaptor = ONNXSequenceInsertOpAdaptor(op);
+
+  // These cast should be guaranteed by default verifier
+  Type seqElementType = operandAdaptor.input_sequence()
+                            .getType()
+                            .dyn_cast<mlir::onnxmlir::SeqType>()
+                            .getElementType();
+  Type elementType1 = seqElementType.dyn_cast<ShapedType>().getElementType();
+  ShapedType insertType =
+      operandAdaptor.tensor().getType().dyn_cast<ShapedType>();
+  Type elementType2 = insertType.getElementType();
+
+  if (elementType1 != elementType2) {
+    return op.emitError("Element types of the tensor in seqence and input "
+                        "have to be the same");
+  }
+  return success();
+}
+
+LogicalResult ONNXConcatFromSequenceOp::inferShapes(
+    std::function<void(mlir::Region &)> doShapeInference) {
+  return success();
+}
+
+LogicalResult ONNXSequenceAtOp::inferShapes(
+    std::function<void(mlir::Region &)> doShapeInference) {
+  return success();
+}
+
+LogicalResult ONNXSequenceConstructOp::inferShapes(
+    std::function<void(mlir::Region &)> doShapeInference) {
+  return success();
+}
+
+LogicalResult ONNXSequenceEmptyOp::inferShapes(
+    std::function<void(mlir::Region &)> doShapeInference) {
+  auto originTy = getResult().getType().cast<onnxmlir::SeqType>();
+  auto elementTy = originTy.getElementType();
+  auto returnTy = onnxmlir::SeqType::get(elementTy, 0);
+  getResult().setType(returnTy);
+  return success();
+}
+
+LogicalResult ONNXSequenceEraseOp::inferShapes(
+    std::function<void(mlir::Region &)> doShapeInference) {
+  auto inputTy = input_sequence().getType().cast<onnxmlir::SeqType>();
+  int64_t length = inputTy.getLength();
+
+  if (length == 0)
+    return emitError("SequenceErase from an empty seq");
+  getResult().setType(onnxmlir::SeqType::get(
+      inputTy.getElementType(), length == -1 ? -1 : length - 1));
+  return success();
+}
+
+LogicalResult ONNXSequenceLengthOp::inferShapes(
+    std::function<void(mlir::Region &)> doShapeInference) {
+  Type outputTy = getResult().getType();
+  if (!outputTy.isa<RankedTensorType>() ||
+      outputTy.cast<RankedTensorType>().getRank() != 0) {
+    SmallVector<int64_t, 1> dims;
+    auto builder = mlir::Builder(getContext());
+    Type scalarTy =
+        mlir::RankedTensorType::get(dims, builder.getIntegerType(64));
+    getResult().setType(scalarTy);
+  }
+  // ElementType of I64 will be checked by verifier
   return success();
 }
 
@@ -3498,11 +3616,6 @@ LogicalResult ONNXCompressOp::inferShapes(
   return success();
 }
 
-LogicalResult ONNXConcatFromSequenceOp::inferShapes(
-    std::function<void(mlir::Region &)> doShapeInference) {
-  return emitError(NOT_IMPLEMENTED_MESSAGE);
-}
-
 LogicalResult ONNXCumSumOp::inferShapes(
     std::function<void(mlir::Region &)> doShapeInference) {
   getResult().setType(getOperand(0).getType());
@@ -4250,36 +4363,6 @@ LogicalResult ONNXScatterNDOp::inferShapes(
   return success();
 }
 
-LogicalResult ONNXSequenceAtOp::inferShapes(
-    std::function<void(mlir::Region &)> doShapeInference) {
-  return emitError(NOT_IMPLEMENTED_MESSAGE);
-}
-
-LogicalResult ONNXSequenceConstructOp::inferShapes(
-    std::function<void(mlir::Region &)> doShapeInference) {
-  return emitError(NOT_IMPLEMENTED_MESSAGE);
-}
-
-LogicalResult ONNXSequenceEmptyOp::inferShapes(
-    std::function<void(mlir::Region &)> doShapeInference) {
-  return emitError(NOT_IMPLEMENTED_MESSAGE);
-}
-
-LogicalResult ONNXSequenceEraseOp::inferShapes(
-    std::function<void(mlir::Region &)> doShapeInference) {
-  return emitError(NOT_IMPLEMENTED_MESSAGE);
-}
-
-LogicalResult ONNXSequenceInsertOp::inferShapes(
-    std::function<void(mlir::Region &)> doShapeInference) {
-  return emitError(NOT_IMPLEMENTED_MESSAGE);
-}
-
-LogicalResult ONNXSequenceLengthOp::inferShapes(
-    std::function<void(mlir::Region &)> doShapeInference) {
-  return emitError(NOT_IMPLEMENTED_MESSAGE);
-}
-
 LogicalResult ONNXShrinkOp::inferShapes(
     std::function<void(mlir::Region &)> doShapeInference) {
   return emitError(NOT_IMPLEMENTED_MESSAGE);
@@ -4455,9 +4538,9 @@ static LogicalResult verify(ONNXCategoryMapperOp op) {
     return success();
   }
 
-  ShapedType inputType = X.getType().dyn_cast<RankedTensorType>();
+  ShapedType inputType = X.getType().cast<ShapedType>();
   Type elementType = inputType.getElementType();
-  if (!elementType.isInteger(64) && !elementType.isa<StringType>())
+  if (!elementType.isInteger(64) && !elementType.isa<onnxmlir::StringType>())
     return op.emitError("input must be a tensor of int64 or string");
 
   // Check attributes.
@@ -4471,7 +4554,7 @@ static LogicalResult verify(ONNXCategoryMapperOp op) {
 
   if (elementType.isInteger(64) && !op.default_stringAttr())
     return op.emitError("'default_string' attribute is missing.");
-  if (elementType.isa<StringType>() && !op.default_int64Attr())
+  if (elementType.isa<onnxmlir::StringType>() && !op.default_int64Attr())
     return op.emitError("'default_int64' attribute is missing.");
   if (op.default_stringAttr() && op.default_int64Attr())
     return op.emitError("Only one of 'default_int64' or 'default_string' "
@@ -4487,9 +4570,9 @@ LogicalResult ONNXCategoryMapperOp::inferShapes(
     return success();
 
   Type inputElementType = X().getType().cast<ShapedType>().getElementType();
-  assert(
-      (inputElementType.isInteger(64) || inputElementType.isa<StringType>()) &&
-      "Input tensor must have int64 or string element type.");
+  assert((inputElementType.isInteger(64) ||
+             inputElementType.isa<onnxmlir::StringType>()) &&
+         "Input tensor must have int64 or string element type.");
 
   ONNXCategoryMapperOpAdaptor operandAdaptor(*this);
   ONNXCategoryMapperOpShapeHelper shapeHelper(this);
@@ -4498,7 +4581,7 @@ LogicalResult ONNXCategoryMapperOp::inferShapes(
 
   Type outputElementType;
   if (inputElementType.isInteger(64))
-    outputElementType = StringType::get(getContext());
+    outputElementType = onnxmlir::StringType::get(getContext());
   else
     outputElementType = IntegerType::get(getContext(), /*width=*/64);
 
@@ -4736,43 +4819,52 @@ namespace mlir {
 namespace onnxmlir {
 namespace detail {
 struct SeqTypeStorage : public mlir::TypeStorage {
-  using KeyTy = llvm::ArrayRef<mlir::Type>;
+  // std::tuple, instead of std::pair,  is used as the key for seq Type
+  // because the list of elements may be added later for lowering seq
+  using KeyTy = std::tuple<mlir::Type, int64_t>;
 
-  SeqTypeStorage(llvm::ArrayRef<mlir::Type> elementTypes)
-      : elementTypes(elementTypes) {}
+  SeqTypeStorage(mlir::Type elementType, int64_t length)
+      : elementType(elementType), seqLength(length) {}
 
-  bool operator==(const KeyTy &key) const { return key == elementTypes; }
+  bool operator==(const KeyTy &key) const {
+    return key == KeyTy(elementType, seqLength);
+  }
   static llvm::hash_code hasKey(const KeyTy &key) {
-    return llvm::hash_value(key);
+    mlir::Type eT;
+    int64_t l;
+    std::tie(eT, l) = key;
+    return llvm::hash_combine(eT, l);
   }
 
-  static KeyTy getKey(llvm::ArrayRef<mlir::Type> elementTypes) {
-    return KeyTy(elementTypes);
+  static KeyTy getKey(mlir::Type elementType, int64_t length) {
+    return KeyTy(elementType, length);
   }
 
   static SeqTypeStorage *construct(
       mlir::TypeStorageAllocator &allocator, const KeyTy &key) {
-    llvm::ArrayRef<mlir::Type> elementTypes = allocator.copyInto(key);
-    return new (allocator.allocate<SeqTypeStorage>())
-        SeqTypeStorage(elementTypes);
+    mlir::Type eT;
+    int64_t l;
+    std::tie(eT, l) = key;
+    return new (allocator.allocate<SeqTypeStorage>()) SeqTypeStorage(eT, l);
   }
-  llvm::ArrayRef<mlir::Type> elementTypes;
+  mlir::Type elementType; // Type for element of Seq
+  int64_t seqLength;      // Length of Seq. -1 when is not statically known
 };
 } // end namespace detail
 } // end namespace onnxmlir
 } // end namespace mlir
 
-SeqType SeqType::get(llvm::ArrayRef<mlir::Type> elementTypes) {
-  assert(!elementTypes.empty() && "expected non-empty seq");
-  mlir::MLIRContext *ctx = elementTypes.front().getContext();
-  return Base::get(ctx, elementTypes);
+onnxmlir::SeqType onnxmlir::SeqType::get(
+    mlir::Type elementType, int64_t length) {
+  mlir::MLIRContext *ctx = elementType.getContext();
+  return Base::get(ctx, elementType, length);
 }
 
-llvm::ArrayRef<mlir::Type> SeqType::getElementTypes() const {
-  return getImpl()->elementTypes;
+mlir::Type onnxmlir::SeqType::getElementType() const {
+  return getImpl()->elementType;
 }
 
-mlir::Type SeqType::getElementType() const { return getElementTypes()[0]; }
+int64_t onnxmlir::SeqType::getLength() const { return getImpl()->seqLength; }
 
 //===----------------------------------------------------------------------===//
 // TableGen'd op method definitions
@@ -4780,6 +4872,7 @@ mlir::Type SeqType::getElementType() const { return getElementTypes()[0]; }
 
 #define GET_OP_CLASSES
 
+using namespace onnxmlir;
 #include "src/Dialect/ONNX/ONNXOps.cpp.inc"
 
 template struct ONNXGenericPoolShapeHelper<ONNXMaxPoolSingleOutOp,

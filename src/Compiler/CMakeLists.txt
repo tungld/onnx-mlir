@@ -43,6 +43,14 @@ add_onnx_mlir_library(CompilerUtils
   MLIRAffineTransforms
   MLIRLinalgTransforms
   MLIRLLVMToLLVMIRTranslation
+
+  # Link LLVM libraries necessary to query which target architectures are configured.
+  LINK_COMPONENTS PRIVATE
+  AllTargetsAsmParsers
+  AllTargetsCodeGens
+  AllTargetsDescs
+  AllTargetsInfos
+  MC
   )
 
 # CompilerUtils does not require cruntime or jniruntime to build, however, they are
@@ -52,7 +60,7 @@ if (ONNX_MLIR_ENABLE_JNI)
   add_dependencies(CompilerUtils jniruntime)
 endif()
 
-add_onnx_mlir_library(OnnxMlirCompiler SHARED
+add_onnx_mlir_library(OnnxMlirCompiler
   OnnxMlirCompiler.cpp
 
   EXCLUDE_FROM_OM_LIBS

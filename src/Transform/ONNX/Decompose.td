@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 //===- ONNXDecompose.td - Rewriting for decomposing ONNX Ops -*- tablegen -===//
 //
 // Copyright 2019-2020 The IBM Research Authors.
@@ -78,6 +80,9 @@ def IsDenseONNXConstant:
 // Create an ArrayAttr from a dense ConstantOp
 def createArrayAttrFromConstantOp : NativeCodeCall<
   "createArrayAttrFromConstantOp($_builder, $0)">;
+
+def createSequenceConstructOp : NativeCodeCall<
+  "createSequenceConstructOp($_builder, $0, $1)">;
 
 //===----------------------------------------------------------------------===//
 // ONNXReduceL1Op %X = ONNXReduceSumOp (ONNXAbsOp %X)
@@ -303,6 +308,13 @@ def ResizeV11Pattern: Pat<
                     $coordinate_transformation_node, $cubic_coeff_a,
                     $exclude_outside, $exttrapolation_value, $mode,
                     $nearest_mode)
+>;
+
+def SequenceConstructPattern1: Pat<
+    (ONNXSequenceConstructOp:$res $x1),
+    (createSequenceConstructOp
+        (ONNXSequenceEmptyOp (GetNullIntegerAttr), (returnType $res)),
+        $x1)
 >;
 
 #endif // ONNX_DECOMPOSE

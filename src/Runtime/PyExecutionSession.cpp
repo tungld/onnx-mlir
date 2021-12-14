@@ -2,19 +2,18 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//===----- PyExecusionSession.hpp - PyExecutionSession Implementation -----===//
+//===----- PyExecutionSession.hpp - PyExecutionSession Implementation -----===//
 //
 // Copyright 2019-2020 The IBM Research Authors.
 //
 // =============================================================================
 //
-// This file contains implementations of PyExecusionSession class, which helps
+// This file contains implementations of PyExecutionSession class, which helps
 // python programs interact with compiled binary model libraries.
 //
 //===----------------------------------------------------------------------===//
 
 #include "onnx/onnx_pb.h"
-#include <third_party/onnx/onnx/onnx_pb.h>
 
 #include "PyExecutionSession.hpp"
 
@@ -30,7 +29,7 @@ std::vector<py::array> PyExecutionSession::pyRun(
            "Expect contiguous python array.");
 
     void *dataPtr;
-    int ownData = 0;
+    int64_t ownData = 0;
     if (inputPyArray.writeable()) {
       dataPtr = inputPyArray.mutable_data();
     } else {
@@ -76,7 +75,7 @@ std::vector<py::array> PyExecutionSession::pyRun(
 
     auto *inputOMTensor = omTensorCreateWithOwnership(dataPtr,
         (int64_t *)(const_cast<ssize_t *>(inputPyArray.shape())),
-        inputPyArray.ndim(), dtype, ownData);
+        (int64_t)inputPyArray.ndim(), dtype, ownData);
     omTensorSetStridesWithPyArrayStrides(inputOMTensor,
         (int64_t *)const_cast<ssize_t *>(inputPyArray.strides()));
 
@@ -87,7 +86,7 @@ std::vector<py::array> PyExecutionSession::pyRun(
   auto *wrappedOutput = _entryPointFunc(wrappedInput);
 
   std::vector<py::array> outputPyArrays;
-  for (int i = 0; i < omTensorListGetSize(wrappedOutput); i++) {
+  for (int64_t i = 0; i < omTensorListGetSize(wrappedOutput); i++) {
     auto *omt = omTensorListGetOmtByIndex(wrappedOutput, i);
     auto shape = std::vector<int64_t>(
         omTensorGetShape(omt), omTensorGetShape(omt) + omTensorGetRank(omt));
@@ -135,4 +134,15 @@ std::vector<py::array> PyExecutionSession::pyRun(
 
   return outputPyArrays;
 }
+
+std::string PyExecutionSession::pyInputSignature() {
+  assert(_inputSignatureFunc && "Input signature entry point not loaded.");
+  return inputSignature();
+}
+
+std::string PyExecutionSession::pyOutputSignature() {
+  assert(_outputSignatureFunc && "Output signature entry point not loaded.");
+  return outputSignature();
+}
+
 } // namespace onnx_mlir

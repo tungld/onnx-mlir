@@ -450,9 +450,9 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
   // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
   // Ht = ot (.) h(Ct)
 
-  KrnlBuilder createKrnl(rewriter, loc);
-  MemRefBuilder createMemRef(createKrnl);
-  MathBuilder createMath(createKrnl);
+  // TODO remove scope
+  MultiDialectBuilder<KrnlBuilder, MathBuilder, MemRefBuilder, OnnxBuilder>
+      create(rewriter, loc);
 
   ArrayRef<int64_t> xtShape = Xt.getType().cast<ShapedType>().getShape();
   int64_t batchSize = xtShape[0];
@@ -474,18 +474,17 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
   // Xt * (Wi^T ++ Wo^T ++ Wf^T ++ Wc^T)
   // Ht * (Ri^T ++ Ro^T ++ Rf^T ++ Rc^T)
   // where '++' is matrix concatenation.
-  OnnxBuilder createONNX(createKrnl);
-  Value XtWT = createONNX.matmul(matrixAllGatesType, Xt, weightPack.WT);
-  Value HtRT = createONNX.matmul(matrixAllGatesType, Ht, weightPack.RT);
+  Value XtWT = create.onnx.matmul(matrixAllGatesType, Xt, weightPack.WT);
+  Value HtRT = create.onnx.matmul(matrixAllGatesType, Ht, weightPack.RT);
 
   // Do element-wise computations. Fuse them into a single nested loop.
   // Lower and upper bounds derived from Ht tensor.
   unsigned HtRank = matrixType.getRank();
-  Value iZero = createMath.constantIndex(0);
+  Value iZero = create.math.constantIndex(0);
   SmallVector<Value, 2> HtLbs(HtRank, iZero);
   SmallVector<Value, 2> HtUbs;
   for (unsigned r = 0; r < HtRank; ++r) {
-    HtUbs.emplace_back(createMemRef.dim(Ht, r));
+    HtUbs.emplace_back(create.mem.dim(Ht, r));
   }
 
   bool simdize = true;
@@ -503,13 +502,13 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
     Value vecOne = rewriter.create<vector::BroadcastOp>(loc, vecType, one);
     Value vecTwo = rewriter.create<vector::BroadcastOp>(loc, vecType, two);
 
-    Value vecXtWT = createKrnl.vectorTypeCast(XtWT, VL);
-    Value vecHtRT = createKrnl.vectorTypeCast(HtRT, VL);
-    Value vecHt = createKrnl.vectorTypeCast(Ht, VL);
-    Value vecCt = createKrnl.vectorTypeCast(Ct, VL);
+    Value vecXtWT = create.krnl.vectorTypeCast(XtWT, VL);
+    Value vecHtRT = create.krnl.vectorTypeCast(HtRT, VL);
+    Value vecHt = create.krnl.vectorTypeCast(Ht, VL);
+    Value vecCt = create.krnl.vectorTypeCast(Ct, VL);
     Value vecAllH;
     if (!isNoneType(state.allH))
-      vecAllH = createKrnl.vectorTypeCast(state.allH, VL);
+      vecAllH = create.krnl.vectorTypeCast(state.allH, VL);
 
     // SmallVector<Type, 4> splitType(4, matrixType);
     // std::vector<Value> XtWiofc =
@@ -520,44 +519,44 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
     //
     // SmallVector<Value, 4> vecXtWiofc;
     // for (Value v : XtWiofc)
-    //   vecXtWiofc.emplace_back(createKrnl.vectorTypeCast(v, VL));
+    //   vecXtWiofc.emplace_back(create.krnl.vectorTypeCast(v, VL));
     // //
     // SmallVector<Value, 4> vecHtRiofc;
     // for (Value v : HtRiofc)
-    //   vecHtRiofc.emplace_back(createKrnl.vectorTypeCast(v, VL));
+    //   vecHtRiofc.emplace_back(create.krnl.vectorTypeCast(v, VL));
     //
     Value vecWbi, vecWbo, vecWbf, vecWbc;
     Value vecRbi, vecRbo, vecRbf, vecRbc;
     if (biasPack.hasBias) {
-      vecWbi = createKrnl.vectorTypeCast(biasPack.Wbi, VL);
-      vecWbo = createKrnl.vectorTypeCast(biasPack.Wbo, VL);
-      vecWbf = createKrnl.vectorTypeCast(biasPack.Wbf, VL);
-      vecWbc = createKrnl.vectorTypeCast(biasPack.Wbc, VL);
+      vecWbi = create.krnl.vectorTypeCast(biasPack.Wbi, VL);
+      vecWbo = create.krnl.vectorTypeCast(biasPack.Wbo, VL);
+      vecWbf = create.krnl.vectorTypeCast(biasPack.Wbf, VL);
+      vecWbc = create.krnl.vectorTypeCast(biasPack.Wbc, VL);
       //
-      vecRbi = createKrnl.vectorTypeCast(biasPack.Rbi, VL);
-      vecRbo = createKrnl.vectorTypeCast(biasPack.Rbo, VL);
-      vecRbf = createKrnl.vectorTypeCast(biasPack.Rbf, VL);
-      vecRbc = createKrnl.vectorTypeCast(biasPack.Rbc, VL);
+      vecRbi = create.krnl.vectorTypeCast(biasPack.Rbi, VL);
+      vecRbo = create.krnl.vectorTypeCast(biasPack.Rbo, VL);
+      vecRbf = create.krnl.vectorTypeCast(biasPack.Rbf, VL);
+      vecRbc = create.krnl.vectorTypeCast(biasPack.Rbc, VL);
     }
     //
     Value vecPi, vecPo, vecPf;
     if (biasPack.hasPeephole) {
-      vecPi = createKrnl.vectorTypeCast(biasPack.Pi, VL);
-      vecPo = createKrnl.vectorTypeCast(biasPack.Po, VL);
-      vecPf = createKrnl.vectorTypeCast(biasPack.Pf, VL);
+      vecPi = create.krnl.vectorTypeCast(biasPack.Pi, VL);
+      vecPo = create.krnl.vectorTypeCast(biasPack.Po, VL);
+      vecPf = create.krnl.vectorTypeCast(biasPack.Pf, VL);
     }
 
-    ValueRange origLoop = createKrnl.defineLoops(HtRank);
+    ValueRange origLoop = create.krnl.defineLoops(HtRank);
     Value bb(origLoop[0]), hh(origLoop[1]);
     // Define blocked loop and permute.
-    ValueRange bBlock = createKrnl.block(bb, bTile);
+    ValueRange bBlock = create.krnl.block(bb, bTile);
     Value bb1(bBlock[0]), bb2(bBlock[1]);
-    ValueRange hBlock = createKrnl.block(hh, hTile);
+    ValueRange hBlock = create.krnl.block(hh, hTile);
     Value hh1(hBlock[0]), hh2(hBlock[1]);
-    createKrnl.permute({bb1, bb2, hh1, hh2}, {0, 2, 1, 3});
-    // createKrnl.unroll(bb2);
+    create.krnl.permute({bb1, bb2, hh1, hh2}, {0, 2, 1, 3});
+    // create.krnl.unroll(bb2);
 
-    createKrnl.iterate(origLoop, {bb1, hh1}, HtLbs, HtUbs,
+    create.krnl.iterate(origLoop, {bb1, hh1}, HtLbs, HtUbs,
         [&](KrnlBuilder &createKrnl, ValueRange indices) {
           Value hi(indices[1]);
           createKrnl.iterate({}, {bb2}, {}, {},
@@ -588,7 +587,7 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                 //     createKrnl.getBuilder(), loc, activationPack.f, it);
                 // sigmoid
                 Value neg = rewriter.create<arith::SubFOp>(loc, vecZero, it);
-                Value negExp = rewriter.create<math::ExpOp>(loc, neg);
+                Value negExp = rewriter.create<math::ExpOp > (loc, neg);
                 it = rewriter.create<arith::DivFOp>(loc, vecOne,
                     rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
 
@@ -687,8 +686,8 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
         });
   } else {
     llvm::outs() << "Running the original version\n";
-    ValueRange loops = createKrnl.defineLoops(HtRank);
-    createKrnl.iterate(loops, loops, HtLbs, HtUbs,
+    ValueRange loops = create.krnl.defineLoops(HtRank);
+    create.krnl.iterate(loops, loops, HtLbs, HtUbs,
         [&](KrnlBuilder &createKrnl, ValueRange indices) {
           MathBuilder createMath(createKrnl);
           IndexExprScope ieScope(createKrnl);
