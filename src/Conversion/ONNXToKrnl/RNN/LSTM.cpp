@@ -450,7 +450,6 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
   // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
   // Ht = ot (.) h(Ct)
 
-  // TODO remove scope
   MultiDialectBuilder<KrnlBuilder, MathBuilder, MemRefBuilder, OnnxBuilder>
       create(rewriter, loc);
 
@@ -490,17 +489,9 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
   bool simdize = true;
   if (simdize) {
     llvm::outs() << "Running simd version\n";
-    int64_t bTile(32), hTile(8);
+    int64_t bTile(4), hTile(8);
     // Vectorize along hidden dimenssion.
     int64_t VL(hTile);
-    VectorType vecType = VectorType::get({VL}, elementType);
-
-    auto zero = emitConstantOp(rewriter, loc, elementType, 0);
-    auto one = emitConstantOp(rewriter, loc, elementType, 1);
-    auto two = emitConstantOp(rewriter, loc, elementType, 2);
-    Value vecZero = rewriter.create<vector::BroadcastOp>(loc, vecType, zero);
-    Value vecOne = rewriter.create<vector::BroadcastOp>(loc, vecType, one);
-    Value vecTwo = rewriter.create<vector::BroadcastOp>(loc, vecType, two);
 
     Value vecXtWT = create.krnl.vectorTypeCast(XtWT, VL);
     Value vecHtRT = create.krnl.vectorTypeCast(HtRT, VL);
@@ -545,18 +536,16 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
       vecPo = create.krnl.vectorTypeCast(biasPack.Po, VL);
       vecPf = create.krnl.vectorTypeCast(biasPack.Pf, VL);
     }
-
     ValueRange origLoop = create.krnl.defineLoops(HtRank);
     Value bb(origLoop[0]), hh(origLoop[1]);
     // Define blocked loop and permute.
     ValueRange bBlock = create.krnl.block(bb, bTile);
     Value bb1(bBlock[0]), bb2(bBlock[1]);
-    ValueRange hBlock = create.krnl.block(hh, hTile);
-    Value hh1(hBlock[0]), hh2(hBlock[1]);
-    create.krnl.permute({bb1, bb2, hh1, hh2}, {0, 2, 1, 3});
+    create.krnl.permute({bb1, bb2, hh}, {0, 2, 1});
     // create.krnl.unroll(bb2);
 
-    create.krnl.iterate(origLoop, {bb1, hh1}, HtLbs, HtUbs,
+    HtUbs[1] = create.math.div(HtUbs[1], create.math.constantIndex(VL));
+    create.krnl.iterate(origLoop, {bb1, hh}, HtLbs, HtUbs,
         [&](KrnlBuilder &createKrnl, ValueRange indices) {
           Value hi(indices[1]);
           createKrnl.iterate({}, {bb2}, {}, {},
@@ -565,7 +554,7 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                 MathBuilder createMath(createKrnl);
                 IndexExprScope innerScope(createKrnl);
                 SymbolIndexExpr bie(bi), hie(hi);
-                LiteralIndexExpr hsie(hiddenSize);
+                LiteralIndexExpr hsie(hiddenSize / VL);
 
                 Value CtVal = createKrnl.loadIE(vecCt, {bie, hie});
                 // it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
@@ -583,13 +572,8 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                   Value PiCt = createMath.mul(PiVal, CtVal);
                   it = createMath.add(it, PiCt);
                 }
-                // it = applyActivation(
-                //     createKrnl.getBuilder(), loc, activationPack.f, it);
-                // sigmoid
-                Value neg = rewriter.create<arith::SubFOp>(loc, vecZero, it);
-                Value negExp = rewriter.create<math::ExpOp > (loc, neg);
-                it = rewriter.create<arith::DivFOp>(loc, vecOne,
-                    rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
+                it = applyActivation(
+                    createKrnl.getBuilder(), loc, activationPack.f, it);
 
                 // ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
                 Value XtWTfVal =
@@ -608,13 +592,8 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                   Value PfCt = createMath.mul(PfVal, CtVal);
                   ft = createMath.add(ft, PfCt);
                 }
-                // ft = applyActivation(
-                //     createKrnl.getBuilder(), loc, activationPack.f, ft);
-                // sigmoid
-                neg = rewriter.create<arith::SubFOp>(loc, vecZero, ft);
-                negExp = rewriter.create<math::ExpOp>(loc, neg);
-                ft = rewriter.create<arith::DivFOp>(loc, vecOne,
-                    rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
+                ft = applyActivation(
+                    createKrnl.getBuilder(), loc, activationPack.f, ft);
 
                 // ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
                 Value XtWTcVal =
@@ -628,14 +607,8 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                   ct = createMath.add(ct, WbcVal);
                   ct = createMath.add(ct, RbcVal);
                 }
-                // ct = applyActivation(
-                //     createKrnl.getBuilder(), loc, activationPack.g, ct);
-                // tanh
-                Value ct2 = rewriter.create<arith::MulFOp>(loc, ct, vecTwo);
-                Value exp1 = rewriter.create<math::ExpOp>(loc, ct2);
-                Value d1 = rewriter.create<arith::SubFOp>(loc, exp1, vecOne);
-                Value d2 = rewriter.create<arith::AddFOp>(loc, exp1, vecOne);
-                ct = rewriter.create<arith::DivFOp>(loc, d1, d2);
+                ct = applyActivation(
+                    createKrnl.getBuilder(), loc, activationPack.g, ct);
 
                 // Ct = ft (.) Ct-1 + it (.) ct
                 Value ftCt = createMath.mul(ft, CtVal);
@@ -657,23 +630,12 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
                   Value PoCt = createMath.mul(PoVal, nextCt);
                   ot = createMath.add(ot, PoCt);
                 }
-                // ot = applyActivation(
-                //     createKrnl.getBuilder(), loc, activationPack.f, ot);
-                // sigmoid
-                neg = rewriter.create<arith::SubFOp>(loc, vecZero, ot);
-                negExp = rewriter.create<math::ExpOp>(loc, neg);
-                ot = rewriter.create<arith::DivFOp>(loc, vecOne,
-                    rewriter.create<arith::AddFOp>(loc, vecOne, negExp));
+                ot = applyActivation(
+                    createKrnl.getBuilder(), loc, activationPack.f, ot);
 
                 // Ht = ot (.) h(Ct)
-                // Value nextHt = applyActivation(
-                //     createKrnl.getBuilder(), loc, activationPack.h, nextCt);
-                // tanh
-                ct2 = rewriter.create<arith::MulFOp>(loc, nextCt, vecTwo);
-                exp1 = rewriter.create<math::ExpOp>(loc, ct2);
-                d1 = rewriter.create<arith::SubFOp>(loc, exp1, vecOne);
-                d2 = rewriter.create<arith::AddFOp>(loc, exp1, vecOne);
-                Value nextHt = rewriter.create<arith::DivFOp>(loc, d1, d2);
+                Value nextHt = applyActivation(
+                    createKrnl.getBuilder(), loc, activationPack.h, nextCt);
                 nextHt = createMath.mul(ot, nextHt);
 
                 // Store the intermediate Ht, Ct.

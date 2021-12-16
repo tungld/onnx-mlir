@@ -244,13 +244,13 @@ Value applyActivation(OpBuilder &rewriter, Location loc,
     RNNActivation activation, Value operand) {
   Value res;
 
-  bool isScalar = !operand.getType().isa<ShapedType>();
-  assert(isScalar && "Not a scalar operand");
+  // bool isScalar = !operand.getType().isa<ShapedType>();
+  // assert(isScalar && "Not a scalar operand");
 
   MemRefType memRefType = MemRefType::get({}, operand.getType(), {}, 0);
   // Single scalar, no need for default alignment.
   MemRefBuilder createMemRef(rewriter, loc);
-  Value alloc = createMemRef.alloca(memRefType);
+  Value alloc = createMemRef.alignedAlloca(memRefType, 16);
   rewriter.create<KrnlStoreOp>(loc, operand, alloc, ArrayRef<Value>{});
 
   std::vector<mlir::NamedAttribute> attributes;

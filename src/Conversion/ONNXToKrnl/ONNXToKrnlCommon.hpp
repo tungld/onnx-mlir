@@ -204,13 +204,17 @@ Value getIdentityValue(
 //===----------------------------------------------------------------------===//
 template <typename Op>
 Value emitScalarOpFor(ConversionPatternRewriter &rewriter, Location loc,
-    Operation *op, Type elementType, ArrayRef<Value> scalarOperands) {
+    Operation *op, Type type, ArrayRef<Value> scalarOperands) {
+  Type elementType = type;
+  if (type.isa<VectorType>())
+    elementType = type.cast<VectorType>().getElementType();
+
   if (elementType.isa<IntegerType>()) {
     return rewriter.create<ScalarIOp<Op>>(
-        loc, elementType, scalarOperands, mlir::None);
+        loc, type, scalarOperands, mlir::None);
   } else if (elementType.isa<FloatType>()) {
     return rewriter.create<ScalarFOp<Op>>(
-        loc, elementType, scalarOperands, mlir::None);
+        loc, type, scalarOperands, mlir::None);
   } else {
     llvm_unreachable("unsupported element type");
   }

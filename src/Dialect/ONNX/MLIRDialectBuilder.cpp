@@ -13,6 +13,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/SCF.h"
 #include "mlir/Dialect/StandardOps/IR/Ops.h"
+#include "mlir/Dialect/Vector/VectorOps.h"
 #include "mlir/IR/BlockAndValueMapping.h"
 #include "llvm/ADT/TypeSwitch.h"
 
@@ -165,6 +166,12 @@ Value MathBuilder::select(Value cmp, Value lhs, Value rhs) const {
 
 Value MathBuilder::constant(Type type, double val) const {
   Attribute constantAttr;
+  if (type.isa<VectorType>()) {
+    Type elementType = type.cast<VectorType>().getElementType();
+    Value c = MathBuilder::constant(elementType, val);
+    return b.create<vector::BroadcastOp>(loc, type, c);
+  }
+
   TypeSwitch<Type>(type)
       .Case<Float16Type>(
           [&](Type) { constantAttr = b.getF16FloatAttr((float)val); })
@@ -356,8 +363,8 @@ memref::AllocOp MemRefBuilder::alignedAlloc(
     MemRefType type, int64_t alignment) const {
   alignment = (alignment > gDefaultAllocAlign ? alignment : gDefaultAllocAlign);
   IntegerAttr alignmentAttr = b.getI64IntegerAttr(alignment);
-  if (type.getShape().size() == 0) // Drop align for scalars.
-    return b.create<memref::AllocOp>(loc, type);
+  // if (type.getShape().size() == 0) // Drop align for scalars.
+  //   return b.create<memref::AllocOp>(loc, type);
   return b.create<memref::AllocOp>(loc, type, alignmentAttr);
 }
 
@@ -365,8 +372,8 @@ memref::AllocOp MemRefBuilder::alignedAlloc(
     MemRefType type, ValueRange dynSymbols, int64_t alignment) const {
   alignment = (alignment > gDefaultAllocAlign ? alignment : gDefaultAllocAlign);
   IntegerAttr alignmentAttr = b.getI64IntegerAttr(alignment);
-  if (type.getShape().size() == 0) // Drop align for scalars.
-    return b.create<memref::AllocOp>(loc, type, dynSymbols);
+  // if (type.getShape().size() == 0) // Drop align for scalars.
+  //   return b.create<memref::AllocOp>(loc, type, dynSymbols);
   return b.create<memref::AllocOp>(loc, type, dynSymbols, alignmentAttr);
 }
 
@@ -378,8 +385,8 @@ memref::AllocaOp MemRefBuilder::alignedAlloca(
     MemRefType type, int64_t alignment) const {
   alignment = (alignment > gDefaultAllocAlign ? alignment : gDefaultAllocAlign);
   IntegerAttr alignmentAttr = b.getI64IntegerAttr(alignment);
-  if (type.getShape().size() == 0) // Drop align for scalars.
-    return b.create<memref::AllocaOp>(loc, type);
+  // if (type.getShape().size() == 0) // Drop align for scalars.
+  //   return b.create<memref::AllocaOp>(loc, type);
   return b.create<memref::AllocaOp>(loc, type, alignmentAttr);
 }
 

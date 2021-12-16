@@ -62,6 +62,12 @@ Value emitConstantOp(
     OpBuilder &rewriter, Location loc, Type type, double value) {
   Attribute constantAttr;
 
+  if (type.isa<VectorType>()) {
+    Type elementType = type.cast<VectorType>().getElementType();
+    Value c = emitConstantOp(rewriter, loc, elementType, value);
+    return rewriter.create<vector::BroadcastOp>(loc, type, c);
+  }
+
   TypeSwitch<Type>(type)
       .Case<Float16Type>(
           [&](Type) { constantAttr = rewriter.getF16FloatAttr((float)value); })
