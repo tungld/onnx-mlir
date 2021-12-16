@@ -61,13 +61,6 @@ FuncOp getContainingFunction(Operation *op) {
 Value emitConstantOp(
     OpBuilder &rewriter, Location loc, Type type, double value) {
   Attribute constantAttr;
-
-  if (type.isa<VectorType>()) {
-    Type elementType = type.cast<VectorType>().getElementType();
-    Value c = emitConstantOp(rewriter, loc, elementType, value);
-    return rewriter.create<vector::BroadcastOp>(loc, type, c);
-  }
-
   TypeSwitch<Type>(type)
       .Case<Float16Type>(
           [&](Type) { constantAttr = rewriter.getF16FloatAttr((float)value); })
@@ -86,6 +79,17 @@ Value emitConstantOp(
       })
       .Case<IndexType>([&](Type) {
         constantAttr = rewriter.getIntegerAttr(type, (int64_t)value);
+      })
+      .Case<VectorType>([&](Type) {
+        Type elementType = type.cast<VectorType>().getElementType();
+        if (elementType.isa<FloatType>())
+          constantAttr =
+              DenseElementsAttr::get(type.cast<VectorType>(), {(float)value});
+        else if (elementType.isa<IntegerType>())
+          constantAttr =
+              DenseElementsAttr::get(type.cast<VectorType>(), {(int64_t)value});
+        else
+          llvm_unreachable("unsupported element type");
       })
       .Default([](Type) { llvm_unreachable("unsupported element type"); });
   return rewriter.create<arith::ConstantOp>(loc, constantAttr);
