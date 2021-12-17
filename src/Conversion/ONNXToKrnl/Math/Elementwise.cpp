@@ -863,6 +863,13 @@ struct ONNXElementwiseUnaryOpLowering : public ConversionPattern {
     auto loc = ONNXLoc<ElementwiseUnaryOp>(op);
     auto X = operands[0];
 
+    if (!X.getType().isa<TensorType>() && !X.getType().isa<MemRefType>()) {
+      Value res = emitScalarOpFor<ElementwiseUnaryOp>(
+          rewriter, loc, op, X.getType(), {X});
+      rewriter.replaceOp(op, res);
+      return success();
+    }
+
     // Insert an allocation and deallocation for the result of this operation.
     auto memRefType = convertToMemRefType(*op->result_type_begin());
 

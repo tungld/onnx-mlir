@@ -247,11 +247,11 @@ Value applyActivation(OpBuilder &rewriter, Location loc,
   // bool isScalar = !operand.getType().isa<ShapedType>();
   // assert(isScalar && "Not a scalar operand");
 
-  MemRefType memRefType = MemRefType::get({}, operand.getType(), {}, 0);
-  // Single scalar, no need for default alignment.
-  MemRefBuilder createMemRef(rewriter, loc);
-  Value alloc = createMemRef.alloca(memRefType);
-  rewriter.create<KrnlStoreOp>(loc, operand, alloc, ArrayRef<Value>{});
+  // MemRefType memRefType = MemRefType::get({}, operand.getType(), {}, 0);
+  // // Single scalar, no need for default alignment.
+  // MemRefBuilder createMemRef(rewriter, loc);
+  // Value alloc = createMemRef.alloca(memRefType);
+  // rewriter.create<KrnlStoreOp>(loc, operand, alloc, ArrayRef<Value>{});
 
   std::vector<mlir::NamedAttribute> attributes;
   if (activation.alpha) {
@@ -262,6 +262,8 @@ Value applyActivation(OpBuilder &rewriter, Location loc,
     attributes.emplace_back(
         rewriter.getNamedAttr("beta", activation.beta.getValue()));
   }
+  Value alloc = operand;
+  Type memRefType = operand.getType();
 
   // Change equality to be case insensitive.
   if (activation.name.equals_insensitive("relu"))
@@ -291,7 +293,7 @@ Value applyActivation(OpBuilder &rewriter, Location loc,
   else
     llvm_unreachable("Unsupported activation");
 
-  res = rewriter.create<KrnlLoadOp>(loc, res);
+  // res = rewriter.create<KrnlLoadOp>(loc, res);
 
   return res;
 }

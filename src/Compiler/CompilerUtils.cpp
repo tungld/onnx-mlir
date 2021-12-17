@@ -616,7 +616,6 @@ void addONNXToKrnlPasses(mlir::PassManager &pm) {
 
 void addKrnlToAffinePasses(mlir::PassManager &pm) {
   pm.addNestedPass<FuncOp>(mlir::createConvertKrnlToAffinePass());
-  pm.addNestedPass<FuncOp>(mlir::createAffineScalarReplacementPass());
   // Fuse loops in Affine dialect.
   //  pm.addPass(mlir::createLoopFusionPass());
 }
