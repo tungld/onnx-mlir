@@ -592,7 +592,7 @@ void stateToOutput<ONNXLSTMOp, LstmState>(ConversionPatternRewriter &rewriter,
   // First output: all sequences.
   outputs.emplace_back((isNoneType(op->Y()) ? noneValue : state.allH));
   // Second output: hidden.
-  if (isNoneType(op->Y_h()))
+  if (isNoneType(op->Y_h()) || op->Y_h().use_empty())
     outputs.emplace_back(noneValue);
   else {
     stateToOutputForHiddenOrCell(
@@ -600,7 +600,7 @@ void stateToOutput<ONNXLSTMOp, LstmState>(ConversionPatternRewriter &rewriter,
     outputs.emplace_back(state.ht);
   }
   // Third output: cell.
-  if (isNoneType(op->Y_c()))
+  if (isNoneType(op->Y_c()) || op->Y_h().use_empty())
     outputs.emplace_back(noneValue);
   else {
     stateToOutputForHiddenOrCell(

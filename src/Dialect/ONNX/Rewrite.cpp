@@ -63,13 +63,52 @@ Type getReturnTypeForMatMulOpND2D(Value A, Value B) {
       resShape, A.getType().cast<ShapedType>().getElementType());
 }
 
+// Reshapes a value from ND (N > 2) to 2D, but keeps the first or last dim
+// unchanged.
+// keepFirstDim = true: keep the first dim.
+// keepFirstDim = false: keep the last dim.
+Value reshapeTo2D(PatternRewriter &rewriter, Location loc, Value val,
+    bool keepFirstDim = true) {
+  ShapedType tensorType = val.getType().cast<ShapedType>();
+  Type elementType = tensorType.getElementType();
+  ArrayRef<int64_t> dims = tensorType.getShape();
+  int64_t rank = dims.size();
+
+  // Compute a result type.
+  SmallVector<int64_t, 2> resShape;
+  if (keepFirstDim) {
+    resShape.emplace_back(dims[0]);
+    int64_t lastDim = 1;
+    for (int64_t i = 1; i < rank; ++i)
+      lastDim *= dims[i];
+    resShape.emplace_back(lastDim);
+  } else {
+    int64_t firstDim = 1;
+    for (int64_t i = 0; i < rank - 1; ++i)
+      firstDim *= dims[i];
+    resShape.emplace_back(firstDim);
+    resShape.emplace_back(dims[rank - 1]);
+  }
+  RankedTensorType resType = RankedTensorType::get(resShape, elementType);
+
+  // A value to keep the new shape.
+  DenseElementsAttr denseAtrr = DenseElementsAttr::get(
+      RankedTensorType::get({2}, rewriter.getIntegerType(64)),
+      makeArrayRef(resShape));
+  Value shape = rewriter.create<ONNXConstantOp>(loc, Attribute(), denseAtrr);
+
+  ONNXReshapeOp reshapeOp =
+      rewriter.create<ONNXReshapeOp>(loc, resType, val, shape);
+  return reshapeOp.getResult();
+}
+
 /// Include the patterns defined in the Declarative Rewrite framework.
 #include "src/Dialect/ONNX/ONNXRewrite.inc"
 
 } // end anonymous namespace
 
 /// Register optimization patterns as "canonicalization" patterns
-/// on the ONNXMatMultOp.
+/// on the ONNXAddOp.
 void ONNXAddOp::getCanonicalizationPatterns(
     RewritePatternSet &results, MLIRContext *context) {
   results.insert<NormalizeAddPattern>(context);
@@ -103,7 +142,7 @@ void ONNXReshapeOp::getCanonicalizationPatterns(
     RewritePatternSet &result, MLIRContext *context) {
   result.insert<FuseReshapePattern>(context);
   result.insert<RemoveIdentityReshapePattern>(context);
-  result.insert<SwapReshapeMatMulPattern>(context);
+  // result.insert<SwapReshapeMatMulPattern>(context);
 }
 
 /// on the ONNXDropoutOp.
@@ -175,4 +214,10 @@ void ONNXConstantOp::getCanonicalizationPatterns(
   results.insert<ConstantOpNormalizationPattern4>(context);
   results.insert<ConstantOpNormalizationPattern5>(context);
   results.insert<ConstantOpNormalizationPattern6>(context);
+}
+
+/// on the ONNXMatMulOp.
+void ONNXMatMulOp::getCanonicalizationPatterns(
+    RewritePatternSet &results, MLIRContext *context) {
+  results.insert<FlattenMatMulTo2DPattern>(context);
 }

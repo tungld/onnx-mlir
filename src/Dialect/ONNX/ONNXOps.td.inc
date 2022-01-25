@@ -2799,6 +2799,7 @@ def ONNXLpPoolOp:ONNX_Op<"LpPool",
 
 def ONNXMatMulOp:ONNX_Op<"MatMul",
   [NoSideEffect, DeclareOpInterfaceMethods<ShapeInferenceOpInterface>]> {
+  let hasCanonicalizer = 1;
   let summary = "ONNX MatMul operation";
   let description = [{
   "Matrix product that behaves like numpy.matmul: https://docs.scipy.org/doc/numpy-1.13.0/reference/generated/numpy.matmul.html"
