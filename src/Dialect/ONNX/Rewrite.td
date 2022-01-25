@@ -117,6 +117,12 @@ def HaveSameLastDim: Constraint<
         "[$1.getType().cast<RankedTensorType>().getRank() - 1])">,
   "Two tensors have the same last dimension">;
 
+def IsStaticShapeTensor:
+   Constraint<
+     CPred<
+       "$_self.getType().cast<::mlir::ShapedType>().hasStaticShape()">,
+     "hasStaticShape">;
+
 def GetUnitAttr: NativeCodeCall<"$_builder.getUnitAttr()">;
 
 def HasOneUse : Constraint<CPred<"$0.hasOneUse()">>;
@@ -515,12 +521,6 @@ def RewriteBatchNormInferenceModeConvPattern2: Pat<
 // Canonicalization for ONNXShapeOp
 //===----------------------------------------------------------------------===//
 
-def IsStaticShapeTensor:
-   Constraint<
-     CPred<
-       "$_self.getType().cast<::mlir::ShapedType>().hasStaticShape()">,
-     "hasStaticShape">;
-
 // TODO: this rules may need to be updated once ShapeOp has start/end.
 def ShapeToConstantPattern: Pat<
      (ONNXShapeOp $A),
@@ -606,6 +606,31 @@ def ConstantOpNormalizationPattern6: Pat<
        $intsAttr, $stringAttr, $stringsAttr),
    (ONNXConstantOpNormalize $res, $stringsAttr),
    [(AttributeIsNotNull:$stringsAttr)]
+>;
+
+//===----------------------------------------------------------------------===//
+// Canonicalization for ONNXMatMulOp
+//===----------------------------------------------------------------------===//
+
+def ReshapeTo2DKeepFirstDim: NativeCodeCall<
+  "reshapeTo2D($_builder, $_loc, $0, true)"
+>;
+
+def ReshapeTo2DKeepLastDim: NativeCodeCall<
+  "reshapeTo2D($_builder, $_loc, $0, false)"
+>;
+
+def FlattenMatMulTo2DPattern: Pattern<
+ // Flatten MatMul's inputs from ND (N > 2) to 2D for better performance.
+ (ONNXMatMulOp:$res $A, $B),
+ [(ONNXReshapeOp (ONNXMatMulOp 
+                    (ReshapeTo2DKeepLastDim:$reshapedA $A),
+                    $B,
+                    (returnType (GetReturnTypeForMatMulOpND2D $reshapedA, $B))),
+                 (ONNXConstantOpFromDenseAttr (createDenseElementsAttrFromShape $res)))],
+ [(HasRankGT<2> $A), // A's rank is greater than 2.
+  (IsStaticShapeTensor:$A)
+ ]
 >;
 
 #endif // ONNX_REWRITE

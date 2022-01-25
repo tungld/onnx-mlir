@@ -282,6 +282,7 @@ OpsWithCanonicalizer = [
     'GlobalAveragePool',
     'GlobalMaxPool',
     'Identity',
+    'MatMul',
     'Reshape',
     'Shape',
     'Size',
