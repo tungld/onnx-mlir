@@ -361,9 +361,10 @@ void stateToOutput<ONNXRNNOp, RnnState>(ConversionPatternRewriter &rewriter,
   auto direction = op->direction();
 
   // First output: all sequences.
-  outputs.emplace_back((isNoneType(op->Y()) ? noneValue : state.allH));
+  outputs.emplace_back(
+      ((isNoneType(op->Y()) || op->Y().use_empty()) ? noneValue : state.allH));
   // Second output: hidden.
-  if (isNoneType(op->Y_h()))
+  if (isNoneType(op->Y_h()) || op->Y_h().use_empty())
     outputs.emplace_back(noneValue);
   else {
     stateToOutputForHiddenOrCell(
