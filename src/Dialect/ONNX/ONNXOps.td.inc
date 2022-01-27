@@ -4070,6 +4070,7 @@ def ONNXRandomNormalLikeOp:ONNX_Op<"RandomNormalLike",
       return {-1};
     }
   }];
+  let verifier = [{ return ::verify(*this); }];
 }
 
 def ONNXRandomUniformOp:ONNX_Op<"RandomUniform",
