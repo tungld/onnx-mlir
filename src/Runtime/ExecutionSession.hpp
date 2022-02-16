@@ -53,11 +53,10 @@ protected:
   llvm::sys::DynamicLibrary _sharedLibraryHandle;
 
   // Entry point function.
+  std::string _entryPointName;
   entryPointFuncType _entryPointFunc = nullptr;
 
   // Entry point for input/output signatures
-  static const std::string _inputSignatureName;
-  static const std::string _outputSignatureName;
   signatureFuncType _inputSignatureFunc = nullptr;
   signatureFuncType _outputSignatureFunc = nullptr;
 };

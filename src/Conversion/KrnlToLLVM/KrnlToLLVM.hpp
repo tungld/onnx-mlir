@@ -29,7 +29,7 @@ void checkConstantOutputs(
 
 void populateAffineAndKrnlToLLVMConversion(RewritePatternSet &patterns,
     MLIRContext *ctx, LLVMTypeConverter &typeConverter,
-    ArrayRef<bool> constantOutputs);
+    ArrayRef<bool> constantOutputs, bool singleEntryPoint);
 
 } // namespace mlir
 

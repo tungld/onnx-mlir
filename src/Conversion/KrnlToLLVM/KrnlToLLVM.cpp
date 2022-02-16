@@ -1086,10 +1086,12 @@ class KrnlEntryPointOpLowering : public OpRewritePattern<KrnlEntryPointOp> {
 public:
   using OpRewritePattern<KrnlEntryPointOp>::OpRewritePattern;
   ArrayRef<bool> constantOutputs;
+  bool singleEntryPoint;
 
-  KrnlEntryPointOpLowering(MLIRContext *ctx, ArrayRef<bool> constantOutputs)
+  KrnlEntryPointOpLowering(
+      MLIRContext *ctx, ArrayRef<bool> constantOutputs, bool singleEntryPoint)
       : OpRewritePattern<KrnlEntryPointOp>(ctx),
-        constantOutputs(constantOutputs) {}
+        constantOutputs(constantOutputs), singleEntryPoint(singleEntryPoint) {}
 
   enum class API {
     CREATE_OMTENSOR_LIST,
@@ -1161,27 +1163,6 @@ public:
     auto opaquePtrTy = LLVM::LLVMPointerType::get(IntegerType::get(context, 8));
     auto int64Ty = IntegerType::get(context, 64);
 
-    // create global to hold signature
-    auto splitSig = signature.split('@');
-    llvm::StringRef inSig = splitSig.first;
-    llvm::StringRef outSig = splitSig.second;
-    mlir::StringAttr inSigAttr = mlir::StringAttr::get(context, inSig);
-    mlir::StringAttr outSigAttr = mlir::StringAttr::get(context, outSig);
-
-    auto inSigArrayType =
-        LLVM::LLVMArrayType::get(IntegerType::get(context, 8), inSig.size());
-    auto insig = rewriter.create<LLVM::GlobalOp>(loc, inSigArrayType,
-        /*isConstant=*/true, LLVM::Linkage::External, "_in_signature",
-        inSigAttr);
-
-    auto outSigArrayType =
-        LLVM::LLVMArrayType::get(IntegerType::get(context, 8), outSig.size());
-    auto outsig = rewriter.create<LLVM::GlobalOp>(loc, outSigArrayType,
-        /*isConstant=*/true, LLVM::Linkage::External, "_out_signature",
-        outSigAttr);
-    genSignatureFunction(rewriter, context, "omInputSignature", insig, loc);
-    genSignatureFunction(rewriter, context, "omOutputSignature", outsig, loc);
-
     // Rewrite Krnl Entry Point Operation to an LLVM function with a dynamic
     // signature. The signature is dynamic because it remains the same no matter
     // what the model input/output schema look like. Such dynamic signature
@@ -1194,19 +1175,41 @@ public:
               KrnlEntryPointOp::getEntryPointFuncAttrName())
             .getLeafReference()
             .getValue();
+    std::string dynEntryPointName = "run_" + staticEntryPointFuncName.str();
 
     // When there is only a single entry point function in a model, use
     // "run_main_graph" as the default name.
-    // TODO(tung): support multiple entry point functions.
-    std::string entryPointName = "run_main_graph";
-    assert(module.lookupSymbol(entryPointName) == nullptr &&
-           "Only support a single entry point function.");
+    if (singleEntryPoint)
+      dynEntryPointName = "run_main_graph";
+
+    // create global to hold signature
+    auto splitSig = signature.split('@');
+    llvm::StringRef inSig = splitSig.first;
+    llvm::StringRef outSig = splitSig.second;
+    mlir::StringAttr inSigAttr = mlir::StringAttr::get(context, inSig);
+    mlir::StringAttr outSigAttr = mlir::StringAttr::get(context, outSig);
+
+    auto inSigArrayType =
+        LLVM::LLVMArrayType::get(IntegerType::get(context, 8), inSig.size());
+    auto insig = rewriter.create<LLVM::GlobalOp>(loc, inSigArrayType,
+        /*isConstant=*/true, LLVM::Linkage::External,
+        "_" + dynEntryPointName + "_in_signature", inSigAttr);
+
+    auto outSigArrayType =
+        LLVM::LLVMArrayType::get(IntegerType::get(context, 8), outSig.size());
+    auto outsig = rewriter.create<LLVM::GlobalOp>(loc, outSigArrayType,
+        /*isConstant=*/true, LLVM::Linkage::External,
+        "_" + dynEntryPointName + "_out_signature", outSigAttr);
+    genSignatureFunction(
+        rewriter, context, dynEntryPointName + "_in_signature", insig, loc);
+    genSignatureFunction(
+        rewriter, context, dynEntryPointName + "_out_signature", outsig, loc);
 
     rewriter.eraseOp(op);
     auto dynEntryPointFuncTy =
         LLVM::LLVMFunctionType::get(opaquePtrTy, {opaquePtrTy}, false);
     auto dynamicEntryPointFunc = rewriter.create<LLVM::LLVMFuncOp>(
-        loc, entryPointName, dynEntryPointFuncTy);
+        loc, dynEntryPointName, dynEntryPointFuncTy);
     auto &entryPointEntryBlock =
         createEntryBlock(dynEntryPointFuncTy, dynamicEntryPointFunc, loc);
     rewriter.setInsertionPointToStart(&entryPointEntryBlock);
@@ -1869,7 +1872,7 @@ private:
 
 void mlir::populateAffineAndKrnlToLLVMConversion(RewritePatternSet &patterns,
     MLIRContext *ctx, LLVMTypeConverter &typeConverter,
-    ArrayRef<bool> constantOutputs) {
+    ArrayRef<bool> constantOutputs, bool singleEntryPoint) {
   // TODO: look at what is done in
   // mlir/lib/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.cpp in function
   // LowerVectorToLLVMPass::runOnOperation() and see what we should do about it.
@@ -1903,7 +1906,8 @@ void mlir::populateAffineAndKrnlToLLVMConversion(RewritePatternSet &patterns,
   patterns.insert<KrnlGlobalOpLowering, KrnlVectorTypeCastOpLowering>(
       ctx, typeConverter);
   patterns.insert<KrnlGetRefOpLowering>(ctx, typeConverter);
-  patterns.insert<KrnlEntryPointOpLowering>(ctx, constantOutputs);
+  patterns.insert<KrnlEntryPointOpLowering>(
+      ctx, constantOutputs, singleEntryPoint);
 
   patterns.insert<KrnlInstrumentOpLowering>(ctx);
 
@@ -2030,6 +2034,10 @@ void ConvertKrnlToLLVMPass::runOnOperation() {
   SmallVector<bool, 4> constantOutputs;
   checkConstantOutputs(module, constantOutputs);
 
+  // Count the number of entry points.
+  int numOfEntryPoints = 0;
+  module->walk([&](KrnlEntryPointOp op) { numOfEntryPoints++; });
+
   // Define the target for this lowering i.e. the LLVM dialect.
   ConversionTarget target(getContext());
   target.addLegalDialect<LLVM::LLVMDialect>();
@@ -2057,8 +2065,8 @@ void ConvertKrnlToLLVMPass::runOnOperation() {
   // We lower in stages until all the code is in the LLVM dialect.
   RewritePatternSet patterns(&getContext());
 
-  populateAffineAndKrnlToLLVMConversion(
-      patterns, &getContext(), typeConverter, constantOutputs);
+  populateAffineAndKrnlToLLVMConversion(patterns, &getContext(), typeConverter,
+      constantOutputs, /*singleEntryPoint=*/numOfEntryPoints == 1);
 
   // We want to completely lower to LLVM, so we use a `FullConversion`. This
   // ensures that only legal operations will remain after the conversion.

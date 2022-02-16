@@ -22,14 +22,13 @@
 #include "llvm/Support/ManagedStatic.h"
 
 namespace onnx_mlir {
-const std::string ExecutionSession::_inputSignatureName = "omInputSignature";
-const std::string ExecutionSession::_outputSignatureName = "omOutputSignature";
 
 ExecutionSession::ExecutionSession(std::string sharedLibPath)
     : ExecutionSession::ExecutionSession(sharedLibPath, "") {}
 
 ExecutionSession::ExecutionSession(
-    std::string sharedLibPath, std::string entryPointName) {
+    std::string sharedLibPath, std::string entryPointName)
+    : _entryPointName(entryPointName) {
 
   _sharedLibraryHandle =
       llvm::sys::DynamicLibrary::getPermanentLibrary(sharedLibPath.c_str());
@@ -41,31 +40,32 @@ ExecutionSession::ExecutionSession(
 
   // When entry point name is not given, use the default "run_main_graph".
   // TODO(tung): support multiple entry point functions.
-  if (entryPointName.empty())
-    entryPointName = "run_main_graph";
+  if (_entryPointName.empty())
+    _entryPointName = "run_main_graph";
 
   _entryPointFunc = reinterpret_cast<entryPointFuncType>(
-      _sharedLibraryHandle.getAddressOfSymbol(entryPointName.c_str()));
+      _sharedLibraryHandle.getAddressOfSymbol(_entryPointName.c_str()));
   if (!_entryPointFunc) {
     std::stringstream errStr;
-    errStr << "Cannot load symbol: '" << entryPointName << "'" << std::endl;
+    errStr << "Cannot load symbol: '" << _entryPointName << "'" << std::endl;
     throw std::runtime_error(errStr.str());
   }
 
+  std::string inputSignatureName = _entryPointName + "_in_signature";
   _inputSignatureFunc = reinterpret_cast<signatureFuncType>(
-      _sharedLibraryHandle.getAddressOfSymbol(_inputSignatureName.c_str()));
+      _sharedLibraryHandle.getAddressOfSymbol(inputSignatureName.c_str()));
   if (!_inputSignatureFunc) {
     std::stringstream errStr;
-    errStr << "Cannot load symbol: '" << _inputSignatureName << "'"
-           << std::endl;
+    errStr << "Cannot load symbol: '" << inputSignatureName << "'" << std::endl;
     throw std::runtime_error(errStr.str());
   }
 
+  std::string outputSignatureName = _entryPointName + "_out_signature";
   _outputSignatureFunc = reinterpret_cast<signatureFuncType>(
-      _sharedLibraryHandle.getAddressOfSymbol(_outputSignatureName.c_str()));
+      _sharedLibraryHandle.getAddressOfSymbol(outputSignatureName.c_str()));
   if (!_outputSignatureFunc) {
     std::stringstream errStr;
-    errStr << "Cannot load symbol: '" << _outputSignatureName << "'"
+    errStr << "Cannot load symbol: '" << outputSignatureName << "'"
            << std::endl;
     throw std::runtime_error(errStr.str());
   }
