@@ -286,7 +286,8 @@ static void genLLVMBitcode(const mlir::OwningOpRef<ModuleOp> &module,
 
   llvm::LLVMContext llvmContext;
   mlir::registerLLVMDialectTranslation(*(module.get().getContext()));
-  auto llvmModule = mlir::translateModuleToLLVMIR(*module, llvmContext);
+  std::unique_ptr<llvm::Module> llvmModule =
+      mlir::translateModuleToLLVMIR(*module, llvmContext);
   if (!llvmModule) {
     llvm::errs() << "Failed to translate module to LLVMIR.\n";
     exit(1);
@@ -307,6 +308,26 @@ static void genLLVMBitcode(const mlir::OwningOpRef<ModuleOp> &module,
   llvm::LLVMContext &ctx = llvmModule->getContext();
   llvm::Metadata *identNode[] = {llvm::MDString::get(ctx, OnnxMlirVersion)};
   identMetadata->addOperand(llvm::MDNode::get(ctx, identNode));
+
+  // Set functions to be accesible from DLL on Windows.
+  if (llvm::Triple(getTargetTripleOption()).isOSWindows()) {
+    auto ominput = StringRef("omInputSignature");
+    auto funcOmInputSignature = llvmModule->getFunction(ominput);
+    // print function
+    funcOmInputSignature->print(llvm::outs());
+    llvm::GlobalValue *F = llvmModule->getNamedValue(ominput);
+    F->setDSOLocal(true);
+    llvm::outs() << F->isDSOLocal() << "\n";
+    F->setDLLStorageClass(llvm::GlobalValue::DLLExportStorageClass);
+    funcOmInputSignature->print(llvm::outs());
+    // get meta data
+    if (funcOmInputSignature->hasMetadata())
+      llvm::outs() << "function has metadata\n";
+    else
+      llvm::outs() << "function does not has metadata\n";
+    llvm::outs() << "function type " << funcOmInputSignature->getFunctionType()
+                 << "\n";
+  }
 
   llvm::WriteBitcodeToFile(*llvmModule, moduleBitcodeStream);
   moduleBitcodeStream.flush();
