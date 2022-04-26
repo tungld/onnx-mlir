@@ -475,6 +475,43 @@ Value foldOrEmitONNXTransposeOp(ConversionPatternRewriter &rewriter,
         .getResult();
 }
 
+/// Emit an ONNX Binary Op. If the input is constant, do const propagation, and
+/// return a constant.
+template <typename OP>
+Value foldOrEmitONNXBinaryOp(ConversionPatternRewriter &rewriter, Location loc,
+    Type resultType, Value lhs, Value rhs) {
+  auto lhsType = lhs.getType().cast<ShapedType>();
+  auto lhsShape = lhsType.getShape();
+  auto rhsType = rhs.getType().cast<ShapedType>();
+  auto rhsShape = rhsType.getShape();
+  auto resultShape = resultType.cast<ShapedType>().getShape();
+  Type elementType = lhsType.getElementType();
+
+  if ((krnl::isKrnlGlobalConstant(lhs) || isDenseONNXConstant(lhs)) &&
+      (krnl::isKrnlGlobalConstant(rhs) || isDenseONNXConstant(rhs))) {
+    char *lhsBuffer = createArrayFromDenseElementsAttr(
+        lhs.getDefiningOp()
+            ->getAttrOfType<::mlir::Attribute>("value")
+            .dyn_cast_or_null<mlir::DenseElementsAttr>());
+    char *rhsBuffer = createArrayFromDenseElementsAttr(
+        rhs.getDefiningOp()
+            ->getAttrOfType<::mlir::Attribute>("value")
+            .dyn_cast_or_null<mlir::DenseElementsAttr>());
+
+    char *resBuffer = allocateBufferFor(resultType, /*useMaxSize=*/true);
+    ConstPropElementwiseBinaryImpl<OP>(elementType, lhsBuffer, lhsShape,
+        rhsBuffer, rhsShape, resultShape, resBuffer);
+    Value constVal = createDenseONNXConstantOp(
+        rewriter, loc, resultType.cast<ShapedType>(), resBuffer)
+                         .getResult();
+    free(resBuffer);
+    free(rhsBuffer);
+    free(lhsBuffer);
+    return constVal;
+  } else
+    return rewriter.create<OP>(loc, resultType, lhs, rhs).getResult();
+}
+
 /// Emit MemRef ReinterpretCastOp to create a new view for 'data'.
 /// The new view is created using the given 'memRefType' and 'outputDims'.
 Value emitMemRefReinterpretCastOp(ConversionPatternRewriter &rewriter,

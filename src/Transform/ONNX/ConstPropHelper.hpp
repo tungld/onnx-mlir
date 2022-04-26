@@ -86,3 +86,9 @@ void ConstPropSplitImpl(Type elementType, char *constArray,
 void ConstPropTransposeImpl(Type elementType, char *constArray,
     llvm::ArrayRef<int64_t> constShape, llvm::ArrayRef<uint64_t> perm,
     llvm::ArrayRef<int64_t> resShape, char *resArray);
+
+/// Constant propagation for binary operations.
+template <typename ElementwiseBinaryOp>
+void ConstPropElementwiseBinaryImpl(Type elementType, char *lhsArray,
+    ArrayRef<int64_t> lhsShape, char *rhsArray, ArrayRef<int64_t> rhsShape,
+    ArrayRef<int64_t> resShape, char *resArray);

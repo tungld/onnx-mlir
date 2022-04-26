@@ -326,3 +326,148 @@ void ConstPropTransposeImpl(Type elementType, char *constArray,
   } else
     llvm_unreachable("Unknown data type");
 }
+
+//===----------------------------------------------------------------------===//
+// Code to perform constant propagation for binary in presence of broadcast.
+//===----------------------------------------------------------------------===//
+
+// Template to generate binary operation results. It takes as input the element
+// type as well as the two element attributes for the operation, and return the
+// result of the operation.
+
+template <typename OP, typename T>
+struct ElementWiseBinaryOpImpl {
+  static T impl(T lhs, T rhs) { llvm_unreachable("unknown operation"); }
+};
+
+template <typename T>
+struct ElementWiseBinaryOpImpl<ONNXAddOp, T> {
+  static T impl(T lhs, T rhs) { return (lhs + rhs); }
+};
+
+template <typename T>
+struct ElementWiseBinaryOpImpl<ONNXSubOp, T> {
+  static T impl(T lhs, T rhs) { return (lhs - rhs); }
+};
+
+template <typename T>
+struct ElementWiseBinaryOpImpl<ONNXMulOp, T> {
+  static T impl(T lhs, T rhs) { return (lhs * rhs); }
+};
+
+template <typename T>
+struct ElementWiseBinaryOpImpl<ONNXDivOp, T> {
+  static T impl(T lhs, T rhs) { return (lhs / rhs); }
+};
+
+template <typename OP, typename T>
+T ComputeConstPropElementwiseBinary(T lhs, T rhs) {
+  return ElementWiseBinaryOpImpl<OP, T>::impl(lhs, rhs);
+}
+
+template <typename ElementwiseBinaryOp, typename T>
+void IterateConstPropElementwiseBinary(char *lhs, char *rhs,
+    ArrayRef<int64_t> lhsShape, ArrayRef<int64_t> rhsShape, char *res,
+    ArrayRef<int64_t> outputShape) {
+  // Rank info.
+  int lhsRank = lhsShape.size();
+  int rhsRank = rhsShape.size();
+  int outputRank = outputShape.size();
+  // Strides info.
+  std::vector<int64_t> outputStrides = getStrides(outputShape);
+  std::vector<int64_t> lhsStrides = getStrides(lhsShape);
+  std::vector<int64_t> rhsStrides = getStrides(rhsShape);
+  // Data pointers.
+  T *lhsArray = reinterpret_cast<T *>(lhs);
+  T *rhsArray = reinterpret_cast<T *>(rhs);
+  T *resArray = reinterpret_cast<T *>(res);
+
+  // Check broadcasting.
+  bool broadcasting = false;
+  if (lhsRank != rhsRank)
+    broadcasting = true;
+  else
+    for (int i = 0; i < outputRank; ++i)
+      if (lhsShape[i] != rhsShape[i]) {
+        broadcasting = true;
+        break;
+      }
+
+  // Do computation.
+  for (int64_t i = 0; i < getNumberOfElements(outputShape); ++i) {
+    // Compute indices to access the output.
+    std::vector<int64_t> outputIndices = getAccessIndex(i, outputStrides);
+
+    // Compute indices to access inputs.
+    SmallVector<int64_t, 4> lhsIndices(lhsRank, 0);
+    SmallVector<int64_t, 4> rhsIndices(rhsRank, 0);
+    if (!broadcasting) {
+      for (int k = 0; k < outputRank; ++k) {
+        lhsIndices[k] = outputIndices[k];
+        rhsIndices[k] = outputIndices[k];
+      }
+    } else {
+      for (int k = 0; k < outputRank; ++k) {
+        // in the lhs index range.
+        if (k >= outputRank - lhsRank) {
+          int lhsIndex = k - outputRank + lhsRank;
+          if (lhsShape[lhsIndex] == 1)
+            // broadcast
+            lhsIndices[lhsIndex] = 0;
+          else
+            lhsIndices[lhsIndex] = outputIndices[k];
+        }
+        // in the rhs index range.
+        if (k >= outputRank - rhsRank) {
+          int rhsIndex = k - outputRank + rhsRank;
+          if (rhsShape[rhsIndex] == 1)
+            // broadcast
+            rhsIndices[rhsIndex] = 0;
+          else
+            rhsIndices[rhsIndex] = outputIndices[k];
+        }
+      }
+    }
+
+    // Calculate element-wise binary result.
+    int64_t lhsOffset = getLinearAccessIndex(lhsIndices, lhsStrides);
+    int64_t rhsOffset = getLinearAccessIndex(rhsIndices, rhsStrides);
+
+    T lhsValue = *(lhsArray + lhsOffset);
+    T rhsValue = *(rhsArray + rhsOffset);
+    *(resArray + i) = ComputeConstPropElementwiseBinary<ElementwiseBinaryOp, T>(
+        lhsValue, rhsValue);
+  }
+}
+
+/// Do element-wise binary calculation of 'lhs' and 'rhs' values and create an
+/// ONNXConstantOp for the result.
+template <typename ElementwiseBinaryOp>
+void ConstPropElementwiseBinaryImpl(Type elementType, char *lhsArray,
+    ArrayRef<int64_t> lhsShape, char *rhsArray, ArrayRef<int64_t> rhsShape,
+    ArrayRef<int64_t> resShape, char *resArray) {
+  if (elementType.isa<FloatType>()) {
+    // Use double to avoid the precision loss during computation.
+    IterateConstPropElementwiseBinary<ElementwiseBinaryOp, double>(
+        lhsArray, rhsArray, lhsShape, rhsShape, resArray, resShape);
+  } else if (elementType.isa<IntegerType>()) {
+    // Use int64_t to avoid the precision loss during computation.
+    IterateConstPropElementwiseBinary<ElementwiseBinaryOp, int64_t>(
+        lhsArray, rhsArray, lhsShape, rhsShape, resArray, resShape);
+  } else
+    llvm_unreachable("Unknown data type");
+}
+
+/// Template initialization for ConstPropElementwiseBinaryImpl.
+template void ConstPropElementwiseBinaryImpl<ONNXAddOp>(Type elementType,
+    char *lhsArray, ArrayRef<int64_t> lhsShape, char *rhsArray,
+    ArrayRef<int64_t> rhsShape, ArrayRef<int64_t> resShape, char *resArray);
+template void ConstPropElementwiseBinaryImpl<ONNXDivOp>(Type elementType,
+    char *lhsArray, ArrayRef<int64_t> lhsShape, char *rhsArray,
+    ArrayRef<int64_t> rhsShape, ArrayRef<int64_t> resShape, char *resArray);
+template void ConstPropElementwiseBinaryImpl<ONNXMulOp>(Type elementType,
+    char *lhsArray, ArrayRef<int64_t> lhsShape, char *rhsArray,
+    ArrayRef<int64_t> rhsShape, ArrayRef<int64_t> resShape, char *resArray);
+template void ConstPropElementwiseBinaryImpl<ONNXSubOp>(Type elementType,
+    char *lhsArray, ArrayRef<int64_t> lhsShape, char *rhsArray,
+    ArrayRef<int64_t> rhsShape, ArrayRef<int64_t> resShape, char *resArray);
