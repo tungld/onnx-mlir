@@ -62,6 +62,19 @@ Value OnnxBuilder::matmul(Type Y, Value A, Value B, bool useGemm) const {
   return b.create<ONNXMatMulOp>(loc, Y, A, B);
 }
 
+Value OnnxBuilder::gemm(Type Y, Value A, Value B, Value C, float alpha,
+    float beta, bool transA, bool transB) const {
+  return b.create<ONNXGemmOp>(loc, Y, A, B,
+      (C) ? C : b.createOrFold<ONNXNoneOp>(loc),
+      /*alpha=*/b.getF32FloatAttr(alpha), /*beta=*/b.getF32FloatAttr(beta),
+      /*transA=*/
+      IntegerAttr::get(b.getIntegerType(64, /*isSigned=*/true),
+          APInt(64, transA, /*isSigned=*/true)),
+      /*transB=*/
+      IntegerAttr::get(b.getIntegerType(64, /*isSigned=*/true),
+          APInt(64, transB, /*isSigned=*/true)));
+}
+
 Value OnnxBuilder::reshape(Type outputType, Value input, Value shape) const {
   return b.create<ONNXReshapeOp>(loc, outputType, input, shape);
 }

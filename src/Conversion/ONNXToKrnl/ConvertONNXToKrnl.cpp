@@ -234,6 +234,7 @@ void FrontendToKrnlLoweringPass::runOnOperation() {
     // other ONNX operations. The following operations are prevented from being
     // lowered further. See the comment in the declaration of
     // 'emitIntermediateIR' for more details.
+    target.addLegalOp<ONNXGemmOp>();
     target.addLegalOp<ONNXMatMulOp>();
     target.addLegalOp<ONNXReshapeOp>();
     target.addLegalOp<ONNXSplitV11Op>();

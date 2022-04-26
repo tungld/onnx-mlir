@@ -32,6 +32,9 @@ struct OnnxBuilder : onnx_mlir::DialectBuilder {
   mlir::Value div(mlir::Value A, mlir::Value B) const;
   mlir::Value matmul(
       mlir::Type Y, mlir::Value A, mlir::Value B, bool useGemm = false) const;
+  mlir::Value gemm(mlir::Type Y, mlir::Value A, mlir::Value B,
+      mlir::Value C = nullptr, float alpha = 1.0, float beta = 1.0,
+      bool transA = false, bool transB = false) const;
 
   mlir::Value reshape(
       mlir::Type outputType, mlir::Value input, mlir::Value shape) const;

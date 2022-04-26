@@ -44,14 +44,8 @@ struct LstmWeightPack {
 
 struct LstmBiasPack {
   bool hasBias = false;
-  Value Wbi;
-  Value Wbo;
-  Value Wbf;
-  Value Wbc;
-  Value Rbi;
-  Value Rbo;
-  Value Rbf;
-  Value Rbc;
+  Value Wb;
+  Value Rb;
   // Put peephole here.
   bool hasPeephole = false;
   Value Pi;
@@ -289,8 +283,8 @@ std::tuple<LstmBiasPack, LstmBiasPack> getBiasPack<ONNXLSTMOp, LstmBiasPack>(
     // MemRef types.
     auto bType2D = MemRefType::get({1, 8 * hiddenSize}, elementType);
     auto bType1D = MemRefType::get({8 * hiddenSize}, elementType);
-    auto bSplitType1D = MemRefType::get({hiddenSize}, elementType);
-    SmallVector<Type, 4> split1D8Ty(8, bSplitType1D);
+    auto bSplitType1D = MemRefType::get({4 * hiddenSize}, elementType);
+    SmallVector<Type, 2> split1D2Ty(2, bSplitType1D);
     SmallVector<Type, 4> split2D2Ty(2, bType2D);
 
     // Squeeze the direction axis from B.
@@ -311,28 +305,16 @@ std::tuple<LstmBiasPack, LstmBiasPack> getBiasPack<ONNXLSTMOp, LstmBiasPack>(
     // Split B into individual bias tensors.
     if (direction == FORWARD || direction == BIDIRECTIONAL) {
       std::vector<Value> vals =
-          foldOrEmitONNXSplitOp(rewriter, loc, split1D8Ty, fB, 0);
-      biasForward.Wbi = vals[0];
-      biasForward.Wbo = vals[1];
-      biasForward.Wbf = vals[2];
-      biasForward.Wbc = vals[3];
-      biasForward.Rbi = vals[4];
-      biasForward.Rbo = vals[5];
-      biasForward.Rbf = vals[6];
-      biasForward.Rbc = vals[7];
+          foldOrEmitONNXSplitOp(rewriter, loc, split1D2Ty, fB, 0);
+      biasForward.Wb = vals[0];
+      biasForward.Rb = vals[1];
       biasForward.hasBias = true;
     }
     if (direction == REVERSE || direction == BIDIRECTIONAL) {
       std::vector<Value> vals =
-          foldOrEmitONNXSplitOp(rewriter, loc, split1D8Ty, bB, 0);
-      biasReverse.Wbi = vals[0];
-      biasReverse.Wbo = vals[1];
-      biasReverse.Wbf = vals[2];
-      biasReverse.Wbc = vals[3];
-      biasReverse.Rbi = vals[4];
-      biasReverse.Rbo = vals[5];
-      biasReverse.Rbf = vals[6];
-      biasReverse.Rbc = vals[7];
+          foldOrEmitONNXSplitOp(rewriter, loc, split1D2Ty, bB, 0);
+      biasReverse.Wb = vals[0];
+      biasReverse.Rb = vals[1];
       biasReverse.hasBias = true;
     }
   }
@@ -472,11 +454,13 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
       MemRefType::get({batchSize, 4 * hiddenSize}, elementType);
 
   // Do matrix multiplications.
-  // Xt * (Wi^T ++ Wo^T ++ Wf^T ++ Wc^T)
-  // Ht * (Ri^T ++ Ro^T ++ Rf^T ++ Rc^T)
+  // Xt * (Wi^T ++ Wo^T ++ Wf^T ++ Wc^T) + (Wbi ++ Wbo ++ Wbf ++ Wbc)
+  // Ht * (Ri^T ++ Ro^T ++ Rf^T ++ Rc^T) + (Rbi ++ Rbo ++ Rbf ++ Rbc)
   // where '++' is matrix concatenation.
-  Value XtWT = create.onnx.matmul(matrixAllGatesType, Xt, weightPack.WT);
-  Value HtRT = create.onnx.matmul(matrixAllGatesType, Ht, weightPack.RT);
+  Value XtWTWb =
+      create.onnx.gemm(matrixAllGatesType, Xt, weightPack.WT, biasPack.Wb);
+  Value HtRTRb =
+      create.onnx.gemm(matrixAllGatesType, Ht, weightPack.RT, biasPack.Rb);
 
   // Do element-wise computations. Fuse them into a single nested loop.
   // Lower and upper bounds derived from Ht tensor.
@@ -499,15 +483,9 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
 
         Value CtVal = createKrnl.load(Ct, indices);
         // it = f(Xt*(Wi^T) + Ht-1*(Ri^T) + Pi (.) Ct-1 + Wbi + Rbi)
-        Value XtWTiVal = createKrnl.loadIE(XtWT, {bsie, hsie});
-        Value HtRTiVal = createKrnl.loadIE(HtRT, {bsie, hsie});
-        Value it = createMath.add(XtWTiVal, HtRTiVal);
-        if (biasPack.hasBias) {
-          Value WbiVal = createKrnl.load(biasPack.Wbi, {hs});
-          Value RbiVal = createKrnl.load(biasPack.Rbi, {hs});
-          it = createMath.add(it, WbiVal);
-          it = createMath.add(it, RbiVal);
-        }
+        Value XtWTWbiVal = createKrnl.loadIE(XtWTWb, {bsie, hsie});
+        Value HtRTRbiVal = createKrnl.loadIE(HtRTRb, {bsie, hsie});
+        Value it = createMath.add(XtWTWbiVal, HtRTRbiVal);
         if (biasPack.hasPeephole) {
           Value PiVal = createKrnl.load(biasPack.Pi, {hs});
           Value PiCt = createMath.mul(PiVal, CtVal);
@@ -517,15 +495,11 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
             applyActivation(createKrnl.getBuilder(), loc, activationPack.f, it);
 
         // ft = f(Xt*(Wf^T) + Ht-1*(Rf^T) + Pf (.) Ct-1 + Wbf + Rbf)
-        Value XtWTfVal = createKrnl.loadIE(XtWT, {bsie, hsie + 2 * hsieLit});
-        Value HtRTfVal = createKrnl.loadIE(HtRT, {bsie, hsie + 2 * hsieLit});
-        Value ft = createMath.add(XtWTfVal, HtRTfVal);
-        if (biasPack.hasBias) {
-          Value WbfVal = createKrnl.load(biasPack.Wbf, {hs});
-          Value RbfVal = createKrnl.load(biasPack.Rbf, {hs});
-          ft = createMath.add(ft, WbfVal);
-          ft = createMath.add(ft, RbfVal);
-        }
+        Value XtWTWbfVal =
+            createKrnl.loadIE(XtWTWb, {bsie, hsie + 2 * hsieLit});
+        Value HtRTRbfVal =
+            createKrnl.loadIE(HtRTRb, {bsie, hsie + 2 * hsieLit});
+        Value ft = createMath.add(XtWTWbfVal, HtRTRbfVal);
         if (biasPack.hasPeephole) {
           Value PfVal = createKrnl.load(biasPack.Pf, {hs});
           Value PfCt = createMath.mul(PfVal, CtVal);
@@ -535,15 +509,11 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
             applyActivation(createKrnl.getBuilder(), loc, activationPack.f, ft);
 
         // ct = g(Xt*(Wc^T) + Ht-1*(Rc^T) + Wbc + Rbc)
-        Value XtWTcVal = createKrnl.loadIE(XtWT, {bsie, hsie + 3 * hsieLit});
-        Value HtRTcVal = createKrnl.loadIE(HtRT, {bsie, hsie + 3 * hsieLit});
-        Value ct = createMath.add(XtWTcVal, HtRTcVal);
-        if (biasPack.hasBias) {
-          Value WbcVal = createKrnl.load(biasPack.Wbc, {hs});
-          Value RbcVal = createKrnl.load(biasPack.Rbc, {hs});
-          ct = createMath.add(ct, WbcVal);
-          ct = createMath.add(ct, RbcVal);
-        }
+        Value XtWTWbcVal =
+            createKrnl.loadIE(XtWTWb, {bsie, hsie + 3 * hsieLit});
+        Value HtRTRbcVal =
+            createKrnl.loadIE(HtRTRb, {bsie, hsie + 3 * hsieLit});
+        Value ct = createMath.add(XtWTWbcVal, HtRTRbcVal);
         ct =
             applyActivation(createKrnl.getBuilder(), loc, activationPack.g, ct);
 
@@ -553,15 +523,9 @@ void calculateState<LstmState, LstmActivationPack, LstmWeightPack,
         Value nextCt = createMath.add(ftCt, itct);
 
         // ot = f(Xt*(Wo^T) + Ht-1*(Ro^T) + Po (.) Ct + Wbo + Rbo)
-        Value XtWToVal = createKrnl.loadIE(XtWT, {bsie, hsie + hsieLit});
-        Value HtRToVal = createKrnl.loadIE(HtRT, {bsie, hsie + hsieLit});
-        Value ot = createMath.add(XtWToVal, HtRToVal);
-        if (biasPack.hasBias) {
-          Value WboVal = createKrnl.load(biasPack.Wbo, {hs});
-          Value RboVal = createKrnl.load(biasPack.Rbo, {hs});
-          ot = createMath.add(ot, WboVal);
-          ot = createMath.add(ot, RboVal);
-        }
+        Value XtWTWboVal = createKrnl.loadIE(XtWTWb, {bsie, hsie + hsieLit});
+        Value HtRTRboVal = createKrnl.loadIE(HtRTRb, {bsie, hsie + hsieLit});
+        Value ot = createMath.add(XtWTWboVal, HtRTRboVal);
         if (biasPack.hasPeephole) {
           Value PoVal = createKrnl.load(biasPack.Po, {hs});
           Value PoCt = createMath.mul(PoVal, nextCt);
