@@ -108,6 +108,7 @@ RuntimeAPIRegistry::RuntimeAPIRegistry(ModuleOp &module, OpBuilder &builder)
     RuntimeAPI(API::GET_DATA_STRIDES, "omTensorGetStrides", int64PtrTy, {opaquePtrTy}),
     RuntimeAPI(API::GET_DATA_TYPE, "omTensorGetDataType", int64Ty, {opaquePtrTy}),
     RuntimeAPI(API::SET_DATA_TYPE, "omTensorSetDataType", voidTy, {opaquePtrTy, int64Ty}),
+    RuntimeAPI(API::VERIFY_DATA_SHAPE_AND_TYPE, "omTensorVerifyType", int64Ty, {opaquePtrTy}),
     RuntimeAPI(API::GET_OMT_ARRAY, "omTensorListGetOmtArray", opaquePtrPtrTy, {opaquePtrTy}),
     RuntimeAPI(API::PRINT_OMTENSOR, "omTensorPrint", voidTy, {opaquePtrTy, opaquePtrTy}),
   };

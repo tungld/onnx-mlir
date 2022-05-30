@@ -16,6 +16,7 @@
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "llvm/ADT/Triple.h"
 
 #include "src/Conversion/KrnlToLLVM/ConvertKrnlToLLVM.hpp"
 #include "src/Conversion/KrnlToLLVM/KrnlToLLVMHelper.hpp"
@@ -35,12 +36,19 @@ public:
   using OpRewritePattern<KrnlEntryPointOp>::OpRewritePattern;
   ArrayRef<bool> outputOMTensorOwnerships;
   bool singleEntryPoint;
+  SmallVectorImpl<std::string> &entryPointNames;
+  SmallVectorImpl<std::string> &inSignatures;
+  SmallVectorImpl<std::string> &outSignatures;
 
   KrnlEntryPointOpLowering(TypeConverter typeConverter, MLIRContext *ctx,
-      ArrayRef<bool> outputOMTensorOwnerships, bool singleEntryPoint)
+      ArrayRef<bool> outputOMTensorOwnerships, bool singleEntryPoint,
+      SmallVectorImpl<std::string> &entryPointNames,
+      SmallVectorImpl<std::string> &inSignatures,
+      SmallVectorImpl<std::string> &outSignatures)
       : OpRewritePattern<KrnlEntryPointOp>(ctx),
         outputOMTensorOwnerships(outputOMTensorOwnerships),
-        singleEntryPoint(singleEntryPoint) {}
+        singleEntryPoint(singleEntryPoint), entryPointNames(entryPointNames),
+        inSignatures(inSignatures), outSignatures(outSignatures) {}
 
   LogicalResult matchAndRewrite(
       KrnlEntryPointOp op, PatternRewriter &rewriter) const override {
@@ -75,6 +83,13 @@ public:
     std::string dynEntryPointName = "run_" + staticEntryPointFuncName.str();
     if (singleEntryPoint)
       dynEntryPointName = DEFAULT_DYN_ENTRY_POINT;
+
+    // Record entry point name, input and output signatures in order to emit
+    // signature-related functions later.
+    recordEntryPointSignatures(module, dynEntryPointName, op, entryPointNames,
+        inSignatures, outSignatures);
+
+    // Start lowering the op.
     rewriter.eraseOp(op);
     auto dynEntryPointFuncTy =
         LLVM::LLVMFunctionType::get(opaquePtrTy, {opaquePtrTy}, false);
@@ -182,6 +197,10 @@ public:
       auto omTensorPtr =
           rewriter.create<LLVM::LoadOp>(loc, opaquePtrTy, omTensorPtrAddr)
               .getResult();
+
+      // Emit code to verify each input tensor, e.g. shape, data type.
+      RuntimeAPI::callApi(rewriter, loc, apiRegistry,
+          RuntimeAPI::API::VERIFY_DATA_SHAPE_AND_TYPE, {omTensorPtr});
 
       // Create a (static) memref type corresponding to the i-th memref input to
       // the inference function on stack, and load it to memRef.
@@ -426,13 +445,52 @@ private:
     }
     return SymbolRefAttr::get(ctx, funcName);
   }
+
+  void recordEntryPointSignatures(ModuleOp &module,
+      std::string currentEntryPointName, KrnlEntryPointOp entryOp,
+      SmallVectorImpl<std::string> &entryPointNames,
+      SmallVectorImpl<std::string> &inSignatures,
+      SmallVectorImpl<std::string> &outSignatures) const {
+    Operation *op = entryOp.getOperation();
+
+    bool zOS = false;
+    if (Attribute mtripleAttr =
+            module->getAttrOfType<::mlir::Attribute>("llvm.target_triple"))
+      zOS = llvm::Triple(mtripleAttr.cast<StringAttr>().getValue()).isOSzOS();
+
+    // Entry point name.
+    currentEntryPointName.push_back('\0'); // null terminate the string.
+    if (zOS)
+      entryPointNames.emplace_back(krnl::a2e_s(currentEntryPointName));
+    else
+      entryPointNames.emplace_back(currentEntryPointName);
+
+    // Input/output signatures.
+    StringAttr sigAttr =
+        op->getAttrOfType<StringAttr>(KrnlEntryPointOp::getSignatureAttrName());
+    llvm::StringRef signature = sigAttr.getValue();
+    auto splitSig = signature.split('@');
+    llvm::StringRef inSig = splitSig.first;
+    llvm::StringRef outSig = splitSig.second;
+    if (zOS) {
+      inSignatures.emplace_back(krnl::a2e_s(inSig.str()));
+      outSignatures.emplace_back(krnl::a2e_s(outSig.str()));
+    } else {
+      inSignatures.emplace_back(inSig.str());
+      outSignatures.emplace_back(outSig.str());
+    }
+  }
 };
 
 void populateLoweringKrnlEntryPointOpPattern(TypeConverter &typeConverter,
     RewritePatternSet &patterns, MLIRContext *ctx,
-    ArrayRef<bool> outputOMTensorOwnerships, bool singleEntryPoint) {
-  patterns.insert<KrnlEntryPointOpLowering>(
-      typeConverter, ctx, outputOMTensorOwnerships, singleEntryPoint);
+    ArrayRef<bool> outputOMTensorOwnerships, bool singleEntryPoint,
+    SmallVectorImpl<std::string> &entryPointNames,
+    SmallVectorImpl<std::string> &inSignatures,
+    SmallVectorImpl<std::string> &outSignatures) {
+  patterns.insert<KrnlEntryPointOpLowering>(typeConverter, ctx,
+      outputOMTensorOwnerships, singleEntryPoint, entryPointNames, inSignatures,
+      outSignatures);
 }
 
 } // namespace krnl

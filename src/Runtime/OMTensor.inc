@@ -349,6 +349,7 @@ void omTensorSetStridesWithPyArrayStrides(
 
 /* OMTensor data type getter */
 OM_DATA_TYPE omTensorGetDataType(const OMTensor *tensor) {
+  printf("tungld\n");
   return tensor->_dataType;
 }
 
@@ -407,6 +408,10 @@ void omTensorSetOwning(OMTensor *tensor, int64_t owning) {
  */
 void *omTensorGetAllocatedPtr(const OMTensor *tensor) {
   return tensor->_allocatedPtr;
+}
+
+int64_t omTensorVerifyType(const OMTensor *tensor){
+  return 1;
 }
 
 void omTensorPrint(const char *msg, const OMTensor *tensor) {

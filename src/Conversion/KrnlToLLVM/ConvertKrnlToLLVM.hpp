@@ -26,15 +26,24 @@ namespace krnl {
 
 void populateAffineAndKrnlToLLVMConversion(mlir::RewritePatternSet &patterns,
     mlir::LLVMTypeConverter &typeConverter, mlir::MLIRContext *ctx,
-    llvm::ArrayRef<bool> constantOutputs, bool singleEntryPoint);
+    llvm::ArrayRef<bool> constantOutputs, bool singleEntryPoint,
+    llvm::SmallVectorImpl<std::string> &entryPointNames,
+    llvm::SmallVectorImpl<std::string> &inSignatures,
+    llvm::SmallVectorImpl<std::string> &outSignatures);
 
 void populateKrnlToLLVMConversion(mlir::LLVMTypeConverter &typeConverter,
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx,
-    llvm::ArrayRef<bool> constantOutputs, bool singleEntryPoint);
+    llvm::ArrayRef<bool> constantOutputs, bool singleEntryPoint,
+    llvm::SmallVectorImpl<std::string> &entryPointNames,
+    llvm::SmallVectorImpl<std::string> &inSignatures,
+    llvm::SmallVectorImpl<std::string> &outSignatures);
 
 void populateLoweringKrnlEntryPointOpPattern(mlir::TypeConverter &typeConverter,
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx,
-    llvm::ArrayRef<bool> constantOutputs, bool singleEntryPoint);
+    llvm::ArrayRef<bool> constantOutputs, bool singleEntryPoint,
+    llvm::SmallVectorImpl<std::string> &entryPointNames,
+    llvm::SmallVectorImpl<std::string> &inSignatures,
+    llvm::SmallVectorImpl<std::string> &outSignatures);
 
 void populateLoweringKrnlFindIndexOpPattern(mlir::TypeConverter &typeConverter,
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);

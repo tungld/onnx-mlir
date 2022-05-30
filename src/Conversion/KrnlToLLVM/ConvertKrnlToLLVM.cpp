@@ -40,7 +40,6 @@
 #include "mlir/Target/LLVMIR/ModuleTranslation.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/Sequence.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Endian.h"
 
@@ -142,7 +141,10 @@ void determineOwnershipForOutputOMTensors(
 
 void populateAffineAndKrnlToLLVMConversion(RewritePatternSet &patterns,
     LLVMTypeConverter &typeConverter, MLIRContext *ctx,
-    ArrayRef<bool> constantOutputs, bool singleEntryPoint) {
+    ArrayRef<bool> constantOutputs, bool singleEntryPoint,
+    SmallVectorImpl<std::string> &entryPointNames,
+    SmallVectorImpl<std::string> &inSignatures,
+    SmallVectorImpl<std::string> &outSignatures) {
   // TODO: look at what is done in
   // mlir/lib/Conversion/VectorToLLVM/ConvertVectorToLLVMPass.cpp in function
   // LowerVectorToLLVMPass::runOnOperation() and see what we should do about it.
@@ -172,62 +174,19 @@ void populateAffineAndKrnlToLLVMConversion(RewritePatternSet &patterns,
   cf::populateControlFlowToLLVMConversionPatterns(typeConverter, patterns);
 
   populateReconcileUnrealizedCastsPatterns(patterns);
-  krnl::populateKrnlToLLVMConversion(
-      typeConverter, patterns, ctx, constantOutputs, singleEntryPoint);
+  krnl::populateKrnlToLLVMConversion(typeConverter, patterns, ctx,
+      constantOutputs, singleEntryPoint, entryPointNames, inSignatures,
+      outSignatures);
 }
 
-void recordEntryPointSignatures(ModuleOp &module,
-    SmallVectorImpl<std::string> &entryPointNames,
-    SmallVectorImpl<std::string> &inSignatures,
-    SmallVectorImpl<std::string> &outSignatures) {
-
-  bool zOS = false;
-  if (Attribute mtripleAttr =
-          module->getAttrOfType<::mlir::Attribute>("llvm.target_triple"))
-    zOS = llvm::Triple(mtripleAttr.cast<StringAttr>().getValue()).isOSzOS();
-
+bool hasSingleEntryPoint(ModuleOp &module) {
+  uint64_t i = 0;
   module->walk([&](KrnlEntryPointOp entryOp) -> WalkResult {
-    Operation *op = entryOp.getOperation();
-    // Entry point name.
-    llvm::StringRef entryPointName =
-        op->getAttrOfType<SymbolRefAttr>(
-              KrnlEntryPointOp::getEntryPointFuncAttrName())
-            .getLeafReference()
-            .getValue();
-    std::string terminatedEntryPointName = "run_" + entryPointName.str();
-    terminatedEntryPointName.push_back('\0'); // null terminate the string.
-    if (zOS)
-      entryPointNames.emplace_back(krnl::a2e_s(terminatedEntryPointName));
-    else
-      entryPointNames.emplace_back(terminatedEntryPointName);
-
-    // Input/output signatures.
-    StringAttr sigAttr =
-        op->getAttrOfType<StringAttr>(KrnlEntryPointOp::getSignatureAttrName());
-    llvm::StringRef signature = sigAttr.getValue();
-    auto splitSig = signature.split('@');
-    llvm::StringRef inSig = splitSig.first;
-    llvm::StringRef outSig = splitSig.second;
-    if (zOS) {
-      inSignatures.emplace_back(krnl::a2e_s(inSig.str()));
-      outSignatures.emplace_back(krnl::a2e_s(outSig.str()));
-    } else {
-      inSignatures.emplace_back(inSig.str());
-      outSignatures.emplace_back(outSig.str());
-    }
-
+    if (++i >= 2)
+      return WalkResult::interrupt();
     return WalkResult::advance();
   });
-
-  // When there is only a single entry point function in a model, use
-  // DEFAULT_DYN_ENTRY_POINT.
-  if (entryPointNames.size() == 1) {
-    std::string defaultEntryPoint = DEFAULT_DYN_ENTRY_POINT;
-    defaultEntryPoint.push_back('\0'); // null terminate the string.
-    if (zOS)
-      defaultEntryPoint = krnl::a2e_s(defaultEntryPoint);
-    entryPointNames[0] = defaultEntryPoint;
-  }
+  return (i == 1);
 }
 
 /// This function emits three functions: omQueryEntryPoints, omInputSignature
@@ -504,16 +463,17 @@ void ConvertKrnlToLLVMPass::runOnOperation() {
   LowerToLLVMOptions options(ctx, dataLayoutAnalysis.getAtOrAbove(module));
   options.emitCWrappers = true;
 
+  // Record entry point names and their input/output signatures.
+  // This info is used to generate global signature functions.
+  SmallVector<std::string, 1> entryPointNames, inSignatures, outSignatures;
+
+  // Determine the module has a single entry point or not.
+  bool singleEntryPoint = hasSingleEntryPoint(module);
+
   // Determine whether an output OMTensor should own the underlying buffer or
   // not.
   SmallVector<bool, 4> outputOMTensorOwnerships;
   determineOwnershipForOutputOMTensors(module, outputOMTensorOwnerships);
-
-  // Record entry point names and their input/output signatures.
-  // This info is used to generate global signature functions.
-  SmallVector<std::string, 1> entryPointNames, inSignatures, outSignatures;
-  recordEntryPointSignatures(
-      module, entryPointNames, inSignatures, outSignatures);
 
   // Define the target for this lowering i.e. the LLVM dialect.
   ConversionTarget target(*ctx);
@@ -551,7 +511,8 @@ void ConvertKrnlToLLVMPass::runOnOperation() {
 
   populateAffineAndKrnlToLLVMConversion(patterns, typeConverter, ctx,
       outputOMTensorOwnerships,
-      /*singleEntryPoint=*/entryPointNames.size() == 1);
+      /*singleEntryPoint=*/singleEntryPoint, entryPointNames, inSignatures,
+      outSignatures);
 
   // Rewrite patterns for accelerators.
   for (auto *accel : onnx_mlir::accel::Accelerator::getAccelerators())
@@ -576,9 +537,13 @@ std::unique_ptr<Pass> createConvertKrnlToLLVMPass() {
 
 void populateKrnlToLLVMConversion(LLVMTypeConverter &typeConverter,
     RewritePatternSet &patterns, MLIRContext *ctx,
-    ArrayRef<bool> outputOMTensorOwnerships, bool singleEntryPoint) {
-  krnl::populateLoweringKrnlEntryPointOpPattern(
-      typeConverter, patterns, ctx, outputOMTensorOwnerships, singleEntryPoint);
+    ArrayRef<bool> outputOMTensorOwnerships, bool singleEntryPoint,
+    SmallVectorImpl<std::string> &entryPointNames,
+    SmallVectorImpl<std::string> &inSignatures,
+    SmallVectorImpl<std::string> &outSignatures) {
+  krnl::populateLoweringKrnlEntryPointOpPattern(typeConverter, patterns, ctx,
+      outputOMTensorOwnerships, singleEntryPoint, entryPointNames, inSignatures,
+      outSignatures);
   krnl::populateLoweringKrnlFindIndexOpPattern(typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlGlobalOpPattern(typeConverter, patterns, ctx);
   krnl::populateLoweringKrnlGetRefOpPattern(typeConverter, patterns, ctx);
