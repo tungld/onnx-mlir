@@ -140,19 +140,18 @@ void addPassesNNPA(mlir::OwningOpRef<mlir::ModuleOp> &module,
         optLevel = OptLevel::O3;
       addONNXToKrnlPasses(pm, optLevel);
 
+      // Partially lower Krnl ops to Affine dialect.
+      addKrnlToAffinePasses(pm);
+      // Normalize MemRefs.
+      normalizeMemRefsPasses(pm);
+      // Optimizations at ZLow.
+      pm.addPass(zlow::createZLowRewritePass());
+      pm.addPass(mlir::createCanonicalizerPass());
+      // Constant folding for std.alloc.
+      pm.addNestedPass<func::FuncOp>(onnx_mlir::createFoldStdAllocPass());
+
       if (nnpaEmissionTarget >= EmitZLowIR)
         emissionTarget = EmitMLIR;
-      else {
-        // Partially lower Krnl ops to Affine dialect.
-        addKrnlToAffinePasses(pm);
-        // Normalize MemRefs.
-        normalizeMemRefsPasses(pm);
-        // Optimizations at ZLow.
-        pm.addPass(zlow::createZLowRewritePass());
-        pm.addPass(mlir::createCanonicalizerPass());
-        // Constant folding for std.alloc.
-        pm.addNestedPass<func::FuncOp>(onnx_mlir::createFoldStdAllocPass());
-      }
     }
   }
 
