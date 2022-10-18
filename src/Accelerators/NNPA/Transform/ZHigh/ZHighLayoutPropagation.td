@@ -53,6 +53,16 @@ def GetLayout : NativeCodeCall<
   "convertDataLayoutToStringAttr($_builder, ::onnx_mlir::zhigh::getZTensorLayout($0.getType()))"
 >;
 
+def Is3DS: Constraint<
+  CPred<"getZTensorLayout($0.getType()) == ::onnx_mlir::zhigh::ZTensorEncodingAttr::DataLayout::_3DS">,
+  "Check if a value is 3DS"
+>;
+
+def IsNot3DS: Constraint<
+  CPred<"getZTensorLayout($0.getType()) != ::onnx_mlir::zhigh::ZTensorEncodingAttr::DataLayout::_3DS">,
+  "Check if a value is not 3DS"
+>;
+
 def IsNHWC: Constraint<
   CPred<"getZTensorLayout($0.getType()) == ::onnx_mlir::zhigh::ZTensorEncodingAttr::DataLayout::NHWC">,
   "Check if a value is NHWC"
@@ -100,6 +110,34 @@ def AddLayoutPropagatePattern4 : Pat<
          (returnType $y))),
      $stickLayout),
   [(IsNHWC $y), (IsNotNHWC $x)]
+>;
+
+def AddLayoutPropagatePattern31 : Pat<
+  (ZHighAddOp
+     (ZHighStickOp (ZHighUnstickOp $x), $stickLayout),
+     $y),
+  (ZHighStickOp
+     (ZHighUnstickOp
+       (ZHighAddOp
+         $x,
+         (ZHighStickOp (ZHighUnstickOp $y), (GetLayout $x)),
+         (returnType $x))),
+     $stickLayout),
+  [(Is3DS $x), (IsNot3DS $y)]
+>;
+
+def AddLayoutPropagatePattern41 : Pat<
+  (ZHighAddOp
+     $x,
+     (ZHighStickOp (ZHighUnstickOp $y), $stickLayout)),
+  (ZHighStickOp
+     (ZHighUnstickOp
+       (ZHighAddOp
+         $y,
+         (ZHighStickOp (ZHighUnstickOp $x), (GetLayout $y)),
+         (returnType $y))),
+     $stickLayout),
+  [(Is3DS $y), (IsNot3DS $x)]
 >;
 
 // If the inputs of zhigh.sub transitively/originally come from zAIU tensors
