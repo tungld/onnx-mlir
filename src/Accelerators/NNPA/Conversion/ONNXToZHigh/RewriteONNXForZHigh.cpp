@@ -217,6 +217,45 @@ bool CanExpandPowOpToMul(ONNXPowOp op) {
   return false;
 }
 
+bool CanUnsqueezeReduceMean(ONNXReduceMeanOp op) {
+  llvm::Optional<mlir::ArrayAttr> axes = op.axes();
+  int64_t keepDims = op.keepdims();
+  // Not keep dims or no axes, make it legal now.
+  if ((keepDims == 0) || !axes)
+    return false;
+
+  Value input = op.data();
+  if (auto shapedType = input.getType().dyn_cast<RankedTensorType>()) {
+    int64_t rank = shapedType.getRank();
+    mlir::ArrayAttr axesVal = axes.value();
+    SmallVector<Attribute> axesAttrs(axesVal.begin(), axesVal.end());
+    // - 2D, axes = [1]: reshape CH to 1xCxHx1
+    // - 2D, axes = [0, 1]: reshape HW to 1x1xHxW
+    if (rank == 2) {
+      if ((axesAttrs.size() == 1) &&
+          (axesAttrs[0].dyn_cast<IntegerAttr>().getInt() == 1))
+        return true;
+      if ((axesAttrs.size() == 2) &&
+          (axesAttrs[0].dyn_cast<IntegerAttr>().getInt() == 0) &&
+          (axesAttrs[1].dyn_cast<IntegerAttr>().getInt() == 1))
+        return true;
+    }
+    // - 3D, axes = [2]: reshape NCH to NxCxHx1
+    // - 3D, axes = [1, 2]: reshape CHW to 1xCxHxW
+    if (rank == 3) {
+      if ((axesAttrs.size() == 1) &&
+          (axesAttrs[0].dyn_cast<IntegerAttr>().getInt() == 2))
+        return true;
+      if ((axesAttrs.size() == 2) &&
+          (axesAttrs[0].dyn_cast<IntegerAttr>().getInt() == 1) &&
+          (axesAttrs[1].dyn_cast<IntegerAttr>().getInt() == 2))
+        return true;
+    }
+  }
+
+  return false;
+}
+
 //
 // Check if pads can be inferenced for ONNXConv op
 //
@@ -387,6 +426,85 @@ struct ExpandPowToMulPattern : public ConversionPattern {
   };
 };
 
+struct UnsqueezeReduceMeanPattern : public ConversionPattern {
+  UnsqueezeReduceMeanPattern(MLIRContext *context)
+      : ConversionPattern(ONNXReduceMeanOp::getOperationName(), 1, context) {}
+  LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+      ConversionPatternRewriter &rewriter) const final {
+    auto reduceOp = llvm::dyn_cast<ONNXReduceMeanOp>(op);
+    Location loc = reduceOp.getLoc();
+    // Illegal conditions must be satisfied at this point.
+    assert(CanUnsqueezeReduceMean(reduceOp) && "Illegal conditions failed");
+
+    // Rewrite
+    MultiDialectBuilder<OnnxBuilder> create(rewriter, loc);
+    Value input = reduceOp.data();
+    llvm::Optional<mlir::ArrayAttr> axes = reduceOp.axes();
+    Value output = reduceOp.reduced();
+
+    auto shapedType = input.getType().dyn_cast<RankedTensorType>();
+    Type elementType = shapedType.getElementType();
+    ArrayRef<int64_t> shape = shapedType.getShape();
+    int64_t rank = shapedType.getRank();
+    mlir::ArrayAttr axesVal = axes.value();
+    SmallVector<Attribute> axesAttrs(axesVal.begin(), axesVal.end());
+
+    // Rewritten ReduceMean always uses axes = [2, 3].
+    ArrayAttr reduceAxes = rewriter.getI64ArrayAttr(ArrayRef<int64_t>({2, 3}));
+
+    // Unsqueeze the input depending on rank and axes.
+    Value squeezeUnsqueezeAxes;
+    Type unsqueezeType, reduceType;
+    Type squeezeType = output.getType();
+
+    if (rank == 2) {
+      // - 2D, axes = [1]: reshape CH to 1xCxHx1
+      if (axesVal.size() == 1) {
+        squeezeUnsqueezeAxes = create.onnx.constantInt64({0, 3});
+        unsqueezeType =
+            RankedTensorType::get({1, shape[0], shape[1], 1}, elementType);
+        reduceType = RankedTensorType::get({1, shape[0], 1, 1}, elementType);
+      }
+      // - 2D, axes = [0, 1]: reshape HW to 1x1xHxW
+      if (axesVal.size() == 2) {
+        squeezeUnsqueezeAxes = create.onnx.constantInt64({0, 1});
+        unsqueezeType =
+            RankedTensorType::get({1, 1, shape[0], shape[1]}, elementType);
+        reduceType = RankedTensorType::get({1, 1, 1, 1}, elementType);
+      }
+    }
+
+    if (rank == 3) {
+      // - 3D, axes = [2]: reshape NCH to NxCxHx1
+      if (axesVal.size() == 1) {
+        squeezeUnsqueezeAxes = create.onnx.constantInt64({3});
+        unsqueezeType = RankedTensorType::get(
+            {shape[0], shape[1], shape[2], 1}, elementType);
+        reduceType =
+            RankedTensorType::get({shape[0], shape[1], 1, 1}, elementType);
+      }
+      // - 3D, axes = [1, 2]: reshape CHW to 1xCxHxW
+      if (axesVal.size() == 2) {
+        squeezeUnsqueezeAxes = create.onnx.constantInt64({0});
+        unsqueezeType = RankedTensorType::get(
+            {1, shape[0], shape[1], shape[2]}, elementType);
+        reduceType = RankedTensorType::get({1, shape[0], 1, 1}, elementType);
+      }
+    }
+
+    assert((unsqueezeType && reduceType && squeezeType) &&
+           "Expect rewritable for ReduceMean");
+
+    Value unsqueeze =
+        create.onnx.unsqueeze(unsqueezeType, input, squeezeUnsqueezeAxes);
+    Value reduce = create.onnx.reduceMean(reduceType, unsqueeze, reduceAxes);
+    Value squeeze =
+        create.onnx.squeeze(squeezeType, reduce, squeezeUnsqueezeAxes);
+
+    rewriter.replaceOp(op, {squeeze});
+    return success();
+  };
+};
 struct RewriteONNXForZHighPass
     : public PassWrapper<RewriteONNXForZHighPass, OperationPass<ModuleOp>> {
 
@@ -412,8 +530,8 @@ void RewriteONNXForZHighPass::runOnOperation() {
   // final target for this lowering.
   ConversionTarget target(getContext());
 
-  // We define the specific operations, or dialects, that are legal targets for
-  // this lowering.
+  // We define the specific operations, or dialects, that are legal targets
+  // for this lowering.
   target.addLegalDialect<ONNXDialect, zhigh::ZHighDialect, func::FuncDialect>();
 
   // `ONNXBatchNormalizationInferenceModeOp` to `ZHigh.BatchNorm`,
@@ -456,8 +574,8 @@ void RewriteONNXForZHighPass::runOnOperation() {
   // Illegalize MatMulOp if
   // - both inputs are *the same* N-D, N > 3, or
   // - one input is N-D, N > 3 and the other is 2-D.
-  // Rewrite patterns will be added to turn this MatMulOp into the one where N-D
-  // will become 3-D.
+  // Rewrite patterns will be added to turn this MatMulOp into the one where
+  // N-D will become 3-D.
   target.addDynamicallyLegalOp<ONNXMatMulOp>([](ONNXMatMulOp op) {
     Type aType = op.A().getType();
     Type bType = op.B().getType();
@@ -483,6 +601,18 @@ void RewriteONNXForZHighPass::runOnOperation() {
   target.addDynamicallyLegalOp<ONNXPowOp>(
       [](ONNXPowOp op) { return !CanExpandPowOpToMul(op); });
 
+  // zDNN supports 4D ReduceMean where NxCxHxW and axes = [2, 3]. Thus, if
+  // ReduceMean is 2D, 3D, we will unsqueeze it to 4D with axes = [2, 3].
+  // Though we can rewrite 1D ReduceMean but it's no interesting since zDNN only
+  // supports W <= 1024.
+  // Illegalize ReduceMean if
+  // - 2D, axes = [1]: reshape CH to 1xCxHx1
+  // - 2D, axes = [0, 1]: reshape HW to 1x1xHxW
+  // - 3D, axes = [2]: reshape NCH to NxCxHx1
+  // - 3D, axes = [1, 2]: reshape CHW to 1xCxHxW
+  target.addDynamicallyLegalOp<ONNXReduceMeanOp>(
+      [](ONNXReduceMeanOp op) { return !CanUnsqueezeReduceMean(op); });
+
   // Illegalize SoftmaxOp if
   // - axis is the last dimension.
   // This SoftmaxOp will be rewritten in which its input is reshaped to 2D.
@@ -506,6 +636,7 @@ void RewriteONNXForZHighPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   populateWithGenerated(patterns);
   patterns.insert<ExpandPowToMulPattern>(&getContext());
+  patterns.insert<UnsqueezeReduceMeanPattern>(&getContext());
 
   // With the target and rewrite patterns defined, we can now attempt the
   // conversion. The conversion will signal failure if any of our `illegal`

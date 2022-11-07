@@ -63,6 +63,10 @@ struct OnnxBuilder : onnx_mlir::DialectBuilder {
   mlir::Value mul(mlir::Value A, mlir::Value B) const;
   mlir::Value mul(mlir::Type resultType, mlir::Value A, mlir::Value B) const;
 
+  // ONNXReduceMeanOp
+  mlir::Value reduceMean(mlir::Type outputType, mlir::Value data,
+      mlir::ArrayAttr axes, bool keepDims = true) const;
+
   // ONNXReduceSumOp
   mlir::Value reduceSum(mlir::Type outputType, mlir::Value data,
       mlir::Value axes, bool keepDims = true,

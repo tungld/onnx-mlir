@@ -142,6 +142,16 @@ Value OnnxBuilder::mul(Type resultType, Value A, Value B) const {
   return b.create<ONNXMulOp>(loc, resultType, toTensor(A), toTensor(B));
 }
 
+Value OnnxBuilder::reduceMean(
+    Type outputType, Value data, ArrayAttr axes, bool keepDims) const {
+  int64_t iKeepDims = keepDims; // 0 if false, 1 if true
+  IntegerAttr keepDimsAttr =
+      IntegerAttr::get(b.getIntegerType(64, /*isSigned=*/true),
+          APInt(64, iKeepDims, /*isSigned=*/true));
+  return b.create<ONNXReduceMeanOp>(
+      loc, toTensor(outputType), toTensor(data), axes, keepDimsAttr);
+}
+
 Value OnnxBuilder::reduceSum(Type outputType, Value data, Value axes,
     bool keepDims, bool noop_with_empty_axes) const {
   int64_t i_keepDims = keepDims; // 0 if false, 1 if true
