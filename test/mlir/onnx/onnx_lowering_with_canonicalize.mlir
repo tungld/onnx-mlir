@@ -3807,15 +3807,49 @@ func.func @test_transpose_lowered_to_a_view_op(%arg0: tensor<?x1x1x384xf32>) -> 
 
 // -----
 
-// Check lowering transpose to a view op when the order of the dimensions whose
-// value is not 1 is unchanged.
-// The order of the dimension whose value is not 1 is changed by transpose.
-func.func @test_transpose_lowered_to_a_view_op_inv(%arg0: tensor<?x1x1x384xf32>) -> tensor<*xf32> {
+// Check lowering transpose to a memref transpose when its input has only one use.
+func.func @test_transpose_lowered_to_memref_tranpose(%arg0: tensor<?x1x1x384xf32>) -> tensor<*xf32> {
   %0 = "onnx.Transpose"(%arg0) {perm = [3, 0, 1, 2]} : (tensor<?x1x1x384xf32>) -> tensor<*xf32>
   return %0 : tensor<*xf32>
-  // CHECK-LABEL:  func @test_transpose_lowered_to_a_view_op_inv
-  // CHECK-SAME:   ([[PARAM_0_:%.+]]: memref<?x1x1x384xf32>) -> memref<384x?x1x1xf32> {
-  // CHECK-NOT:       memref.reinterpret_cast
+
+// CHECK-LABEL:  func.func @test_transpose_lowered_to_memref_tranpose
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: memref<?x1x1x384xf32>) -> memref<384x?x1x1xf32> {
+// CHECK:           [[VAR_transpose_:%.+]] = memref.transpose [[PARAM_0_]] (d0, d1, d2, d3) -> (d3, d0, d1, d2) : memref<?x1x1x384xf32> to memref<384x?x1x1xf32, strided<[1, 384, 384, 384]>>
+// CHECK:           [[VAR_0_:%.+]] = builtin.unrealized_conversion_cast [[VAR_transpose_]] : memref<384x?x1x1xf32, strided<[1, 384, 384, 384]>> to memref<384x?x1x1xf32>
+// CHECK:           return [[VAR_0_]] : memref<384x?x1x1xf32>
+// CHECK:         }
+}
+
+// -----
+
+// Normal lowering of transpose to krnl.
+func.func @test_transpose_to_krnl(%arg0 : tensor<10x?x30x40xf32>) -> tensor<*xf32> {
+  %0 = "onnx.Transpose"(%arg0) {perm = [0, 3, 1, 2]} : (tensor<10x?x30x40xf32>) -> tensor<*xf32>
+  %1 = "onnx.Relu"(%arg0) : (tensor<10x?x30x40xf32>) -> tensor<*xf32>
+  "func.return"(%0) : (tensor<*xf32>) -> ()
+
+// CHECK-DAG: #map = affine_map<(d0) -> (d0)>
+// CHECK-LABEL:  func.func @test_transpose_to_krnl
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: memref<10x?x30x40xf32>) -> memref<10x40x?x30xf32> {
+// CHECK-DAG:       [[VAR_cst_:%.+]] = arith.constant 0.000000e+00 : f32
+// CHECK-DAG:       [[VAR_c1_:%.+]] = arith.constant 1 : index
+// CHECK-DAG:       [[VAR_transpose_:%.+]] = memref.transpose [[PARAM_0_]] (d0, d1, d2, d3) -> (d0, d3, d1, d2) : memref<10x?x30x40xf32> to memref<10x40x?x30xf32, strided<[?, 1, 1200, 40]>>
+// CHECK-NOT: separator of consecutive DAGs
+// CHECK-DAG:       [[VAR_0_:%.+]] = builtin.unrealized_conversion_cast [[VAR_transpose_]] : memref<10x40x?x30xf32, strided<[?, 1, 1200, 40]>> to memref<10x40x?x30xf32>
+// CHECK-DAG:       [[VAR_dim_:%.+]] = memref.dim [[PARAM_0_]], [[VAR_c1_]] : memref<10x?x30x40xf32>
+// CHECK-NOT: separator of consecutive DAGs
+// CHECK-DAG:       [[RES_:%.+]] = memref.alloc([[VAR_dim_]]) {{.*}}: memref<10x?x30x40xf32>
+// CHECK-DAG:       [[LOOP_0_:%.+]]:4 = krnl.define_loops 4
+// CHECK-DAG:       [[VAR_dim_0_:%.+]] = memref.dim [[PARAM_0_]], [[VAR_c1_]] : memref<10x?x30x40xf32>
+// CHECK:           krnl.iterate([[LOOP_0_]]#0, [[LOOP_0_]]#1, [[LOOP_0_]]#2, [[LOOP_0_]]#3) with ([[LOOP_0_]]#0 -> [[I_0_:%.+]] = 0 to 10, [[LOOP_0_]]#1 -> [[I_1_:%.+]] = 0 to #map([[VAR_dim_0_]]), [[LOOP_0_]]#2 -> [[I_2_:%.+]] = 0 to 30, [[LOOP_0_]]#3 -> [[I_3_:%.+]] = 0 to 40){
+// CHECK:             [[VAR_2_:%.+]]:4 = krnl.get_induction_var_value([[LOOP_0_]]#0, [[LOOP_0_]]#1, [[LOOP_0_]]#2, [[LOOP_0_]]#3) : (!krnl.loop, !krnl.loop, !krnl.loop, !krnl.loop) -> (index, index, index, index)
+// CHECK:             [[LOAD_PARAM_0_MEM_:%.+]] = krnl.load [[PARAM_0_]]{{.}}[[VAR_2_]]#0, [[VAR_2_]]#1, [[VAR_2_]]#2, [[VAR_2_]]#3] : memref<10x?x30x40xf32>
+// CHECK:             [[VAR_4_:%.+]] = arith.cmpf oge, [[LOAD_PARAM_0_MEM_]], [[VAR_cst_]] : f32
+// CHECK:             [[VAR_5_:%.+]] = arith.select [[VAR_4_]], [[LOAD_PARAM_0_MEM_]], [[VAR_cst_]] : f32
+// CHECK:             krnl.store [[VAR_5_]], [[RES_]]{{.}}[[VAR_2_]]#0, [[VAR_2_]]#1, [[VAR_2_]]#2, [[VAR_2_]]#3] : memref<10x?x30x40xf32>
+// CHECK:           }
+// CHECK:           return [[VAR_0_]] : memref<10x40x?x30xf32>
+// CHECK:         }
 }
 
 // -----

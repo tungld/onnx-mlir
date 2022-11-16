@@ -627,6 +627,12 @@ Value MemRefBuilder::dim(Value val, Value index) const {
   return b().createOrFold<memref::DimOp>(loc(), val, index);
 }
 
+Value MemRefBuilder::tranpose(Value val, ArrayRef<unsigned> permutation) const {
+  return b().create<memref::TransposeOp>(loc(), val,
+      AffineMapAttr::get(
+          AffineMap::getPermutationMap(permutation, b().getContext())));
+}
+
 //===----------------------------------------------------------------------===//
 // Structured Control Flow (SCF).
 //===----------------------------------------------------------------------===//

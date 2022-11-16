@@ -177,6 +177,10 @@ struct MemRefBuilder final : DialectBuilder {
       mlir::Value input, llvm::SmallVectorImpl<IndexExpr> &outputDims) const;
   mlir::Value dim(mlir::Value val, int64_t index) const;
   mlir::Value dim(mlir::Value val, mlir::Value index) const;
+
+  // Tranpose
+  mlir::Value tranpose(
+      mlir::Value val, llvm::ArrayRef<unsigned> permutation) const;
 };
 
 // Default alignment attribute for all allocation of memory. On most system, it
