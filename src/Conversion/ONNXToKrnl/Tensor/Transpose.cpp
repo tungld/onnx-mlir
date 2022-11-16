@@ -82,7 +82,7 @@ struct ONNXTransposeOpLowering : public ConversionPattern {
 
     // If transpose is the only consumer of its input, lower transpose to
     // memref.transpose that creates a transposed view with different strides.
-    if (data.hasOneUse()) {
+    if (transposeOp.data().hasOneUse()) {
       SmallVector<unsigned, 4> permutedAxes;
       for (uint64_t i = 0; i < inRank; ++i) {
         unsigned axis = (unsigned)ArrayAttrIntVal(permAttr, i);
