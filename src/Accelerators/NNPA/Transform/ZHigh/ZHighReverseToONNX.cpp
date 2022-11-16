@@ -43,8 +43,7 @@ namespace {
 #include "src/Accelerators/NNPA/Transform/ZHigh/ONNXZHighReverseToONNX.inc"
 
 struct ZHighReverseToONNXPass
-    : public PassWrapper<ZHighReverseToONNXPass,
-          OperationPass<func::FuncOp>> {
+    : public PassWrapper<ZHighReverseToONNXPass, OperationPass<func::FuncOp>> {
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(ZHighReverseToONNXPass)
 
