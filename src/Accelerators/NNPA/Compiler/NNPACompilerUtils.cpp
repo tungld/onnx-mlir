@@ -81,6 +81,11 @@ void addONNXToZHighPasses(
         onnx_mlir::zhigh::createZHighConstPropagationPass());
   // Remove common sub-expressions.
   pm.addPass(mlir::createCSEPass());
+
+  // If there are stick/unstick ops, try to reduce them by reversing back to
+  // ONNX ops.
+  pm.addNestedPass<func::FuncOp>(
+      onnx_mlir::zhigh::createZHighReverseToONNXPass());
 }
 
 void normalizeMemRefsPasses(mlir::PassManager &pm) {

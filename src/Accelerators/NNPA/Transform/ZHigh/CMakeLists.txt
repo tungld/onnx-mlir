@@ -35,3 +35,17 @@ add_onnx_mlir_library(OMZHighLayoutPropagation
   OMZHighOps
   OMONNXOps
   )
+
+add_onnx_mlir_rewriter(ZHighReverseToONNX)
+add_onnx_mlir_library(OMZHighReverseToONNX
+  ZHighReverseToONNX.cpp
+
+  DEPENDS
+  OMONNXZHighReverseToONNXIncGen
+
+  LINK_LIBS PUBLIC
+  MLIRRewrite
+  MLIRTransformUtils
+  OMZHighOps
+  OMONNXOps
+  )
