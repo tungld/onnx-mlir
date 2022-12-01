@@ -183,20 +183,40 @@ void DimAnalysis::build(Value val) {
   }
 }
 
-bool DimAnalysis::sameUnknownDim(mlir::Value tensor1, uint64_t dimAxis1,
+bool DimAnalysis::sameDim(mlir::Value tensor1, uint64_t dimAxis1,
     mlir::Value tensor2, uint64_t dimAxis2) const {
   if ((tensor1 == tensor2) && (dimAxis1 == dimAxis2))
     return true;
 
-  DimT dim1(tensor1, dimAxis1);
-  DimT dim2(tensor2, dimAxis2);
-  // Two dims are the same if they are in the same set.
-  for (auto &entry : dimSetMap) {
-    DimSetT dims = entry.second;
-    if (dims.contains(dim1) && dims.contains(dim2))
-      return true;
+  ShapedType tensor1Type = tensor1.getType().cast<ShapedType>();
+  ShapedType tensor2Type = tensor2.getType().cast<ShapedType>();
+  if (!tensor1Type.hasRank() || !tensor2Type.hasRank())
+    return false;
+
+  int64_t dim1Int = tensor1Type.getShape()[dimAxis1];
+  int64_t dim2Int = tensor2Type.getShape()[dimAxis2];
+  // Different dimension sizes or one of them is unknown.
+  if (dim1Int != dim2Int)
+    return false;
+
+  // Same dimensions but can be unknown (-1).
+  if (ShapedType::isDynamic(dim1Int)) {
+    DimT dim1(tensor1, dimAxis1);
+    DimT dim2(tensor2, dimAxis2);
+    // Two unknown dims are the same if there exists a set containing them.
+    bool sameDim = false;
+    for (auto &entry : dimSetMap) {
+      DimSetT dims = entry.second;
+      if (dims.contains(dim1) && dims.contains(dim2)) {
+        sameDim = true;
+        break;
+      }
+    }
+    return sameDim;
   }
-  return false;
+
+  // Same static dimensions.
+  return true;
 }
 
 bool DimAnalysis::sameShape(Value tensor1, Value tensor2) const {
@@ -212,16 +232,8 @@ bool DimAnalysis::sameShape(Value tensor1, Value tensor2) const {
     return (tensor1Type.getShape() == tensor2Type.getShape());
   // There are unknown dimensions, use DimAnalysis to check equality.
   for (unsigned i = 0; i < tensor1Type.getRank(); ++i) {
-    int64_t dim1 = tensor1Type.getShape()[i];
-    int64_t dim2 = tensor2Type.getShape()[i];
-    if (dim1 != dim2)
+    if (!sameDim(tensor1, i, tensor2, i))
       return false;
-    // Same dimensions but can be unknown (-1).
-    if (ShapedType::isDynamic(dim1)) {
-      // Two unknown dimensions are NOT the same at compile time.
-      if (!sameUnknownDim(tensor1, i, tensor2, i))
-        return false;
-    }
   }
   return true;
 }
@@ -362,7 +374,7 @@ void DimAnalysis::visitDim(
       if ((aDimIndex >= 0) && (bDimIndex >= 0) &&
           ShapedType::isDynamic(aShape[aDimIndex]) &&
           ShapedType::isDynamic(bShape[bDimIndex]) &&
-          onnx_mlir::DimAnalysis::sameUnknownDim(A, aDimIndex, B, bDimIndex))
+          onnx_mlir::DimAnalysis::sameDim(A, aDimIndex, B, bDimIndex))
         sameDims.insert(onnx_mlir::DimAnalysis::DimT(A, aDimIndex));
     }
     return;
@@ -437,7 +449,7 @@ void DimAnalysis::visitDim(
       if ((aDimIndex >= 0) && (bDimIndex >= 0) &&
           ShapedType::isDynamic(aShape[aDimIndex]) &&
           ShapedType::isDynamic(bShape[bDimIndex]) &&
-          sameUnknownDim(A, aDimIndex, B, bDimIndex))
+          sameDim(A, aDimIndex, B, bDimIndex))
         sameDims.insert(DimT(A, aDimIndex));
     }
     return;

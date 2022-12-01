@@ -58,6 +58,11 @@ struct OnnxBuilder : onnx_mlir::DialectBuilder {
   // ONNXDimGroupOp
   void dimGroup(mlir::Value input, int axis, int groupID) const;
 
+  // ONNXGemmOp
+  mlir::Value gemm(mlir::Type Y, mlir::Value A, mlir::Value B, mlir::Value C,
+      float alpha = 1.0, float beta = 1.0, bool transA = false,
+      bool transB = false) const;
+
   // ONNXMatMulOp or ONNXGemmOp
   mlir::Value matmul(
       mlir::Type Y, mlir::Value A, mlir::Value B, bool useGemm = false) const;
@@ -93,6 +98,11 @@ struct OnnxBuilder : onnx_mlir::DialectBuilder {
       mlir::Value steps) const;
   mlir::Value slice(mlir::Type outputType, mlir::Value input, int64_t start,
       int64_t end, int64_t step = 1) const; // 1D slice
+
+  // ONNXSplitOp
+  // Equally split along an axis.
+  mlir::ValueRange split(
+      mlir::TypeRange outputTypes, mlir::Value input, int64_t axis = 0) const;
 
   // ONNXSqueezeOp
   mlir::Value squeeze(

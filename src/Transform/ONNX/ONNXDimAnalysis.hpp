@@ -51,10 +51,10 @@ public:
   /// Returns the grouping result of unknown dimensions.
   DimSetMapT getGroupingResult() const { return dimSetMap; }
 
-  /// Test if two unknown dimensions are the same or not.
+  /// Test if two dimensions are the same or not.
   /// Each dimension is identified by its tensor and axis.
-  bool sameUnknownDim(mlir::Value tensor1, uint64_t dimAxis1,
-      mlir::Value tensor2, uint64_t dimAxis2) const;
+  bool sameDim(mlir::Value tensor1, uint64_t dimAxis1, mlir::Value tensor2,
+      uint64_t dimAxis2) const;
 
   /// Test if two tensors have the same shape or not.
   bool sameShape(mlir::Value tensor1, mlir::Value tensor2) const;

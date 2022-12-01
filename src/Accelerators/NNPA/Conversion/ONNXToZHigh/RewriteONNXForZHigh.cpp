@@ -212,6 +212,55 @@ bool CanExpandPowOpToMul(ONNXPowOp op) {
   return false;
 }
 
+// Check the following pattern about GemmOp in the IR in which multiple GemmOp
+// share the same input.
+//   X1 = A * B1 + C1
+//   X2 = A * B2 + C2
+//   X3 = A * B3 + C3
+// Additionally, `+` is non-broadcasting.
+bool CanCombineGemmOp(
+    ONNXGemmOp op, const onnx_mlir::DimAnalysis *dimAnalysis) {
+  // Collect all GemmOps that uses the input A including this op.
+  Value A = op.A();
+  SmallVector<ONNXGemmOp, 4> gemmOps;
+  gemmOps.emplace_back(op);
+  for (auto user : A.getUsers()) {
+    if (auto gemmOp = llvm::dyn_cast<ONNXGemmOp>(user)) {
+      if ((gemmOp != op) && (gemmOp.A() == A))
+        gemmOps.emplace_back(gemmOp);
+    }
+  }
+
+  // No rewriting if there is no other GemmOp.
+  if (gemmOps.size() == 1)
+    return false;
+
+  // Check attributes: alpha = beta = 1.0,  transA = transB = 0.
+  bool attributeOK = llvm::all_of(gemmOps, [](ONNXGemmOp gemmOp) {
+    return (gemmOp.alpha().convertToFloat() == 1.0) &&
+           (gemmOp.beta().convertToFloat() == 1.0) && !gemmOp.transA() &&
+           !gemmOp.transB();
+  });
+  if (!attributeOK)
+    return false;
+
+  // Check `+ C` is not broadcasting and all Cs are the same.
+  Value firstC = op.C();
+  if (isFromNone(firstC))
+    return false;
+
+  bool COK = llvm::all_of(gemmOps, [&](ONNXGemmOp gemmOp) {
+    Value B = gemmOp.B();
+    Value C = gemmOp.C();
+    return (!isFromNone(C) && dimAnalysis->sameDim(B, 1, C, 0) &&
+            dimAnalysis->sameDim(firstC, 0, C, 0));
+  });
+  if (!COK)
+    return false;
+
+  return true;
+}
+
 //
 // Check if pads can be inferenced for ONNXConv op
 //
@@ -318,6 +367,7 @@ Type CreatePaddedXType(Value x, ArrayAttr pads) {
 /// Include the patterns defined in the Declarative Rewrite framework.
 #include "src/Accelerators/NNPA/Conversion/ONNXToZHigh/ONNXRewriteONNXForZHigh.inc"
 
+/// Patterns defined in C++.
 struct ExpandPowToMulPattern : public ConversionPattern {
   ExpandPowToMulPattern(MLIRContext *context)
       : ConversionPattern(ONNXPowOp::getOperationName(), 1, context) {}
@@ -382,6 +432,86 @@ struct ExpandPowToMulPattern : public ConversionPattern {
   };
 };
 
+/// This pattern combines multiple GemmOps into a big GemmOp. For example,
+///   X1 = A[N, P] * B1[P, M] + C1[M]
+///   X2 = A[N, P] * B2[P, M] + C2[M]
+///   X3 = A[N, P] * B3[P, M] + C3[M]
+/// These GemmOp will be rewritten into a single GemmOp that is:
+///   X = A * (B1 ++ B2 ++ B3) + (C1 ++ C2 ++ C3)
+/// where `++` is concatenation with axis being the last dimension.
+class CombineGemmOpsPattern : public OpRewritePattern<ONNXGemmOp> {
+public:
+  using OpRewritePattern<ONNXGemmOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(
+      ONNXGemmOp gemmOp, PatternRewriter &rewriter) const override {
+    Location loc = gemmOp.getLoc();
+    Value A = gemmOp.A();
+    Value B = gemmOp.B();
+    Value C = gemmOp.C();
+    ArrayRef<int64_t> aShape = getShape(A.getType());
+    ArrayRef<int64_t> bShape = getShape(B.getType());
+    ArrayRef<int64_t> cShape = getShape(C.getType());
+    Type outputType = gemmOp.Y().getType();
+    Type elementType = getElementType(outputType);
+
+    // Rewrite
+    MultiDialectBuilder<OnnxBuilder> create(rewriter, loc);
+
+    // Collect all GemmOps that uses the input A including this op.
+    // These ops satisfy the illegal conditions.
+    SmallVector<ONNXGemmOp, 4> gemmOps;
+    gemmOps.emplace_back(gemmOp);
+    for (auto user : A.getUsers()) {
+      if (auto op = llvm::dyn_cast<ONNXGemmOp>(user)) {
+        if ((op != gemmOp) && (op.A() == A))
+          gemmOps.emplace_back(op);
+      }
+    }
+    int64_t numOfGemmOps = gemmOps.size();
+
+    // New B = (B1 ++ B2 ++ B3)
+    int64_t bConcatAxis = 1; // The last dimension
+    SmallVector<int64_t, 2> newBShape(bShape.begin(), bShape.end());
+    if (!ShapedType::isDynamic(bShape[bConcatAxis]))
+      newBShape[bConcatAxis] *= numOfGemmOps;
+    auto newBType = RankedTensorType::get(newBShape, elementType);
+    SmallVector<Value> allBs;
+    for (auto op : gemmOps)
+      allBs.emplace_back(op.B());
+    Value concatB = create.onnx.concat(newBType, allBs, /*axis=*/bConcatAxis);
+
+    // New C = (C1 ++ C2 ++ C3)
+    int64_t cConcatAxis = 0; // The last dimension
+    SmallVector<int64_t, 2> newCShape(cShape.begin(), cShape.end());
+    if (!ShapedType::isDynamic(cShape[cConcatAxis]))
+      newCShape[cConcatAxis] *= numOfGemmOps;
+    auto newCType = RankedTensorType::get(newCShape, elementType);
+    SmallVector<Value> allCs;
+    for (auto op : gemmOps)
+      allCs.emplace_back(op.C());
+    Value concatC = create.onnx.concat(newCType, allCs, /*axis=*/cConcatAxis);
+
+    // Emit the big combined GemmOp.
+    SmallVector<int64_t, 2> combinedOutputShape;
+    combinedOutputShape.emplace_back(aShape[0]);
+    combinedOutputShape.emplace_back(newBShape[1]);
+    auto combinedType = RankedTensorType::get(combinedOutputShape, elementType);
+    Value combinedOutput = create.onnx.gemm(combinedType, A, concatB, concatC);
+
+    // Split the result of the combined GemmOp to obtain the result of each
+    // original GemmOp.
+    SmallVector<Type> splitTypes(numOfGemmOps, outputType);
+    ValueRange results = create.onnx.split(splitTypes, combinedOutput, 1);
+
+    // Replace the original GemmOp with the new result.
+    for (int64_t i = 0; i < numOfGemmOps; ++i)
+      rewriter.replaceOp(gemmOps[i], {results[i]});
+    return success();
+  };
+};
+
+/// Define rewrite-onnx-for-zhigh pass.
 struct RewriteONNXForZHighPass
     : public PassWrapper<RewriteONNXForZHighPass, OperationPass<ModuleOp>> {
 
@@ -453,6 +583,18 @@ void RewriteONNXForZHighPass::runOnOperation() {
                  isUniBroadcatableFirstToSecond(op.B(), op.A())));
   });
 
+  // Illegalize GemmOp if there are multiple GemmOp sharing the same first
+  // input. For example,
+  //   X1 = A * B1 + C1
+  //   X2 = A * B2 + C2
+  //   X3 = A * B3 + C3
+  // These GemmOp will be rewritten into a single GemmOp that is:
+  //   X = A * (B1 ++ B2 ++ B3) + (C1 ++ C2 ++ C3)
+  // where `++` is concatenation
+  target.addDynamicallyLegalOp<ONNXGemmOp>([&dimAnalysis](ONNXGemmOp op) {
+    return !CanCombineGemmOp(op, &dimAnalysis);
+  });
+
   // Illegalize MatMulOp if
   // - both inputs are *the same* N-D, N > 3 and there is no broadcasting, or
   // - one input is N-D, N > 3 and the other is 2-D.
@@ -476,13 +618,8 @@ void RewriteONNXForZHighPass::runOnOperation() {
     // - both inputs are *the same* N-D, N > 3 and there is no broadcasting
     if (aRank > 3 && (aRank == bRank)) {
       bool sameBatchDims = true;
-      ArrayRef<int64_t> aShape = getShape(aType);
-      ArrayRef<int64_t> bShape = getShape(bType);
-      for (int64_t i = 0; i < aRank - 2; ++i) {
-        sameBatchDims &= (aShape[i] == bShape[i]);
-        if (sameBatchDims && ShapedType::isDynamic(aShape[i]))
-          sameBatchDims = dimAnalysis.sameUnknownDim(op.A(), i, op.B(), i);
-      }
+      for (int64_t i = 0; i < aRank - 2; ++i)
+        sameBatchDims &= dimAnalysis.sameDim(op.A(), i, op.B(), i);
       return !sameBatchDims;
     }
 
@@ -520,6 +657,7 @@ void RewriteONNXForZHighPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   populateWithGenerated(patterns);
   patterns.insert<ExpandPowToMulPattern>(&getContext());
+  patterns.insert<CombineGemmOpsPattern>(&getContext());
 
   // With the target and rewrite patterns defined, we can now attempt the
   // conversion. The conversion will signal failure if any of our `illegal`

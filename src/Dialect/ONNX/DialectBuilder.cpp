@@ -102,6 +102,21 @@ Value OnnxBuilder::div(Value A, Value B) const {
   return b().create<ONNXDivOp>(loc(), toTensor(A), toTensor(B));
 }
 
+Value OnnxBuilder::gemm(Type Y, Value A, Value B, Value C, float alpha,
+    float beta, bool transA, bool transB) const {
+  auto aValue = toTensor(A);
+  auto bValue = toTensor(B);
+  auto cValue = toTensor(C);
+  return b().create<ONNXGemmOp>(loc(), Y, aValue, bValue, cValue,
+      /*alpha=*/b().getF32FloatAttr(alpha), /*beta=*/b().getF32FloatAttr(beta),
+      /*transA=*/
+      IntegerAttr::get(b().getIntegerType(64, /*isSigned=*/true),
+          APInt(64, transA ? 1 : 0, /*isSigned=*/true)),
+      /*transB=*/
+      IntegerAttr::get(b().getIntegerType(64, /*isSigned=*/true),
+          APInt(64, transB ? 1 : 0, /*isSigned=*/true)));
+}
+
 Value OnnxBuilder::matmul(Type Y, Value A, Value B, bool useGemm) const {
   // Gemm only supports rank 2.
   bool canUseGemm = useGemm && A.getType().isa<ShapedType>() &&
@@ -184,6 +199,15 @@ Value OnnxBuilder::slice(Type outputType, Value input, int64_t start,
   Value endVal = constant(b().getI64TensorAttr(ArrayRef<int64_t>({end})));
   Value stepVal = constant(b().getI64TensorAttr(ArrayRef<int64_t>({step})));
   return slice(outputType, input, startVal, endVal, /*axis*/ zeroVal, stepVal);
+}
+
+ValueRange OnnxBuilder::split(
+    TypeRange outputTypes, Value input, int64_t axis) const {
+  ONNXSplitOp splitOp = b().create<ONNXSplitOp>(loc(), outputTypes,
+      toTensor(input), b().createOrFold<ONNXNoneOp>(loc()),
+      IntegerAttr::get(b().getIntegerType(64, /*isSigned=*/true),
+          APInt(64, axis, /*isSigned=*/true)));
+  return splitOp.outputs();
 }
 
 Value OnnxBuilder::squeeze(Type outputType, Value data, Value axes) const {
