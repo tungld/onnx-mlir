@@ -697,6 +697,9 @@ KrnlTypeConverter::KrnlTypeConverter() {
     if (inputs.size() != 1)
       return llvm::None;
 
+    if (resultType.isa<MemRefType>() && inputs[0].getType().isa<MemRefType>())
+      return inputs[0];
+
     return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs)
         .getResult(0);
   });
@@ -706,6 +709,9 @@ KrnlTypeConverter::KrnlTypeConverter() {
                                Location loc) -> Optional<Value> {
     if (inputs.size() != 1)
       return llvm::None;
+
+    if (resultType.isa<MemRefType>() && inputs[0].getType().isa<MemRefType>())
+      return inputs[0];
 
     return builder.create<UnrealizedConversionCastOp>(loc, resultType, inputs)
         .getResult(0);

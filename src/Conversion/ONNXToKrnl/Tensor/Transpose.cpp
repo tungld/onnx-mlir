@@ -31,6 +31,7 @@ struct ONNXTransposeOpLowering : public ConversionPattern {
       ConversionPatternRewriter &rewriter) const final {
     Location loc = op->getLoc();
     MDBuider create(rewriter, loc);
+    ONNXTransposeOp transposeOp = llvm::cast<ONNXTransposeOp>(op);
 
     // Operands and attributes.
     ONNXTransposeOpAdaptor operandAdaptor(operands, op->getAttrDictionary());
@@ -57,6 +58,23 @@ struct ONNXTransposeOpLowering : public ConversionPattern {
       rewriter.replaceOp(op, view);
       return success();
     }
+
+    // If transpose is the only consumer of its input, lower transpose to
+    // memref.transpose that creates a transposed view with different strides.
+    // Only do this if the transpose's result is not the function return value.
+    if (canBeMemRefTransposeOp(transposeOp.data(), transposeOp.transposed())) {
+      uint64_t rank = inMemRefType.getRank();
+      SmallVector<unsigned, 4> permutedAxes;
+      for (uint64_t i = 0; i < rank; ++i) {
+        unsigned axis = (unsigned)ArrayAttrIntVal(permAttr, i);
+        permutedAxes.emplace_back(axis);
+      }
+      Value view = create.mem.tranpose(data, llvm::makeArrayRef(permutedAxes));
+      rewriter.replaceOp(op, view);
+      return success();
+    }
+
+    // Otherwise, do transpose by copying data.
 
     // Insert an allocation and deallocation for the result of this operation.
     Value alloc =
@@ -93,6 +111,17 @@ private:
         permutedAxes.emplace_back(axis);
     }
     return (originalAxes == permutedAxes);
+  }
+
+  // If transpose is the only consumer of its input, lower transpose to
+  // memref.transpose that creates a transposed view with different strides.
+  // Only do this if the transpose's result is not the function return value.
+  bool canBeMemRefTransposeOp(Value inputTensor, Value outputTensor) const {
+    for (Operation *user : outputTensor.getUsers()) {
+      if (isa<func::ReturnOp>(user))
+        return false;
+    }
+    return inputTensor.hasOneUse();
   }
 
   // Determine how many consecutive inner-most dimensions are not permuted.
