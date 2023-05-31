@@ -84,6 +84,7 @@ struct ONNXGatherOpLowering : public OpConversionPattern<ONNXGatherOp> {
     DimsExpr lbs(outputRank, zeroIE);
     create.krnl.iterateIE(loopDef, loopDef, lbs, shapeHelper.getOutputDims(),
         [&](KrnlBuilder &createKrnl, ValueRange loopInd) {
+          MultiDialectBuilder<KrnlBuilder, MathBuilder> create(createKrnl);
           // Insert code inside the loop.
           IndexExprScope innerLoopScope(createKrnl);
           SymbolIndexExpr axisDim(dataDims[axisLit]);
@@ -97,6 +98,8 @@ struct ONNXGatherOpLowering : public OpConversionPattern<ONNXGatherOp> {
           for (int j = 0; j < indicesRank; ++j)
             indicesAccessFct.emplace_back(outputAccessFct[jIndexStart + j]);
           Value indexVal = createKrnl.loadIE(indices, indicesAccessFct);
+          if (!isa<IntegerType>(indexVal.getType()))
+            indexVal = create.math.cast(rewriter.getIndexType(), indexVal);
           // Loaded value is an index that is not affine
           IndexExpr index = NonAffineIndexExpr(indexVal);
           // When index may be negative, add axis Dim to it.

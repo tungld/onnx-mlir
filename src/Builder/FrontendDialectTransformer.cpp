@@ -170,7 +170,8 @@ private:
     auto loc =
         NameLoc::get(builder_.getStringAttr("Initializer_" + tensor.name()));
     Value initializer =
-        builder_.create<ONNXConstantOp>(loc, Attribute(), mlirAttr);
+       builder_.create<ONNXConstantOp>(loc, Attribute(), mlirAttr);
+    // Value initializer = builder_.create<ONNXDummyOp>(loc, mlirAttr.getType());
     num_of_parameters_ += mlirAttr.getShapedType().getNumElements();
     return initializer;
   }

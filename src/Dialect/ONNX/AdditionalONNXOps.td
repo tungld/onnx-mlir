@@ -558,3 +558,11 @@ def ONNXShapeTransformOp: ONNX_Op<"ShapeTransform", [Pure,
   let hasVerifier = 1;
 }
 
+def ONNXDummyOp:ONNX_Op<"dummy", [Pure]> {
+  let summary = "ZLow dummy operation that behaves like identity";
+  let description = [{
+  ZLow operation to forward the input value to the output value.
+  It will be removed if canonicalization is called.
+  }];
+  let results = (outs AnyType:$output);
+}
