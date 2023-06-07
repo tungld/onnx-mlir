@@ -273,6 +273,96 @@ static void loadMLIR(std::string inputFilename, mlir::MLIRContext &context,
   }
 }
 
+void genConstPackObj(const mlir::OwningOpRef<ModuleOp> &module,
+    llvm::Optional<std::string> &constPackObjPath, std::string outputBaseName) {
+  // Extract constant pack file name, which is embedded as a symbol in the
+  // module being compiled.
+  auto constPackFilePathSym = (*module).lookupSymbol<mlir::LLVM::GlobalOp>(
+      mlir::KrnlPackedConstantOp::getConstPackFilePathSymbolName());
+  auto constPackFilePath = constPackFilePathSym.getValueAttr()
+                               .dyn_cast_or_null<mlir::StringAttr>()
+                               .getValue()
+                               .str();
+  llvm::FileRemover constPackRemover(constPackFilePath);
+
+#if __APPLE__
+  // Create a empty stub file, compile it to an empty obj file.
+  llvm::SmallVector<char, 20> stubSrcPath;
+  llvm::sys::fs::createTemporaryFile("stub", "cpp", stubSrcPath);
+  llvm::FileRemover subSrcRemover(stubSrcPath);
+  std::string stubSrcPathStr(stubSrcPath.begin(), stubSrcPath.end());
+  Command createStubObj(/*exePath=*/kCxxPath);
+  std::string stubObjPathStr = stubSrcPathStr + ".o";
+  createStubObj.appendList({"-o", stubObjPathStr})
+      .appendList({"-c", stubSrcPathStr})
+      .exec();
+  llvm::FileRemover stubObjRemover(stubObjPathStr);
+
+  // Embed data into the empty stub obj file.
+  constPackObjPath = constPackFilePath + ".o";
+  Command genParamObj(/*exePath=*/kLinkerPath);
+  genParamObj.appendStr("-r")
+      .appendList({"-o", constPackObjPath.getValue()})
+      .appendList({"-sectcreate", "binary", "param", constPackFilePath})
+      .appendStr(stubObjPathStr)
+      .exec();
+
+#elif __linux__
+  // Create param.o holding packed parameter values.
+  constPackObjPath = constPackFilePath + ".o";
+  Command genParamObj(/*exePath=*/kLinkerPath);
+  genParamObj.appendStr("-r")
+      .appendList({"-b", "binary"})
+      .appendList({"-o", constPackObjPath.value()})
+      .appendStr(constPackFilePath)
+      .exec();
+
+  // Figure out what is the default symbol name describing the start/end
+  // address of the embedded data.
+  std::regex e("[^0-9A-Za-z]");
+  auto sanitizedName =
+      "_binary_" + std::regex_replace(constPackFilePath, e, "_");
+
+  // Rename the symbols to saner ones expected by the runtime function.
+  Command redefineSym(/*exePath=*/kObjCopyPath);
+  redefineSym.appendStr("--redefine-sym")
+      .appendStr(sanitizedName + "_start=_binary_param_bin_start")
+      .appendStr(constPackObjPath.value())
+      .exec();
+  redefineSym.resetArgs()
+      .appendStr("--redefine-sym")
+      .appendStr(sanitizedName + "_end=_binary_param_bin_end")
+      .appendStr(constPackObjPath.value())
+      .exec();
+
+#else
+  /* The final constant pack object file on Windows is NOT embedded into
+   * the shared library but rather is kept in a separate .bin file. So
+   * do not set it in constPackObjPath so that when this function returns
+   * the caller (compileModuleToSharedLibrary and compileModuleToJniJar)
+   * won't put it into llvm::FileRemover.
+   */
+  llvm::SmallVector<char, 10> permConstPackFileName(
+      constPackFilePath.begin(), constPackFilePath.end());
+  llvm::sys::path::replace_extension(permConstPackFileName, "bin");
+  std::string permConstPackFileNameStr(
+      permConstPackFileName.begin(), permConstPackFileName.end());
+  auto constPackFileName = llvm::sys::path::filename(outputBaseName) + "." +
+                           llvm::sys::path::filename(permConstPackFileNameStr);
+  llvm::sys::fs::rename(constPackFilePath, constPackFileName);
+
+  mlir::Builder builder(*module);
+  (*module)
+      .lookupSymbol<mlir::LLVM::GlobalOp>(
+          mlir::KrnlPackedConstantOp::getConstPackFileNameSymbolName())
+      .valueAttr(builder.getStringAttr(constPackFileName.str()));
+  (*module)
+      .lookupSymbol<mlir::LLVM::GlobalOp>(
+          mlir::KrnlPackedConstantOp::getConstPackFileNameStrLenSymbolName())
+      .valueAttr(builder.getI64IntegerAttr(constPackFileName.str().size()));
+#endif
+}
+
 // Tailor LLVMIR to add features that cannot be done with MLIR LLVMIR.
 static void tailorLLVMIR(llvm::Module &llvmModule) {
   llvm::LLVMContext &ctx = llvmModule.getContext();
@@ -498,6 +588,8 @@ static int genSharedLib(std::string sharedLibNameWithExt,
 #else
   std::vector<std::string> outputOpt = {"-o", sharedLibNameWithExt};
   std::vector<std::string> sharedLibOpts = {"-shared", "-fPIC"};
+  if (modelSize == ModelSize::huge)
+    sharedLibOpts.push_back("-lEmbeddedDataLoader");
   llvm::for_each(libs, [](std::string &lib) { lib = "-l" + lib; });
   llvm::for_each(libDirs, [](std::string &libDir) { libDir = "-L" + libDir; });
 #ifdef __s390x__
@@ -514,7 +606,10 @@ static int genSharedLib(std::string sharedLibNameWithExt,
     ofs << kLrodataScript;
     ofs.close();
     sharedLibOpts.push_back("-Wl,-T," + ldScript);
+  } else if (modelSize == ModelSize::huge) {
+    sharedLibOpts.push_back("-lEmbeddedDataLoader");
   }
+
   llvm::FileRemover ldsRemover(lds);
 #endif
 #endif
@@ -571,6 +666,12 @@ static int compileModuleToObject(const mlir::OwningOpRef<ModuleOp> &module,
 static int compileModuleToSharedLibrary(
     const mlir::OwningOpRef<ModuleOp> &module, std::string outputNameNoExt,
     std::string &libNameWithExt) {
+  llvm::Optional<std::string> constPackObjPath;
+  if (modelSize == ModelSize::huge) {
+    genConstPackObj(module, constPackObjPath, outputNameNoExt);
+    llvm::FileRemover constPackObjRemover(constPackObjPath.value());
+  }
+
   std::string modelObjNameWithExt;
   int rc = compileModuleToObject(module, outputNameNoExt, modelObjNameWithExt);
   if (rc != CompilerSuccess)
@@ -578,6 +679,12 @@ static int compileModuleToSharedLibrary(
   llvm::FileRemover modelObjRemover(
       modelObjNameWithExt, !keepFiles(KeepFilesOfType::Object));
   libNameWithExt = getTargetFilename(outputNameNoExt, EmitLib);
+
+  if (constPackObjPath.has_value())
+    return genSharedLib(libNameWithExt, {},
+        {constPackObjPath.value(), modelObjNameWithExt},
+        getCompilerConfig(CCM_SHARED_LIB_DEPS), {getLibraryPath()});
+
   return genSharedLib(libNameWithExt, {}, {modelObjNameWithExt},
       getCompilerConfig(CCM_SHARED_LIB_DEPS), {getLibraryPath()});
 }
@@ -585,6 +692,12 @@ static int compileModuleToSharedLibrary(
 // Return 0 on success, error code on failure
 static int compileModuleToJniJar(
     const mlir::OwningOpRef<ModuleOp> &module, std::string outputNameNoExt) {
+  llvm::Optional<std::string> constPackObjPath;
+  if (modelSize == ModelSize::huge) {
+    genConstPackObj(module, constPackObjPath, outputNameNoExt);
+    llvm::FileRemover constPackObjRemover(constPackObjPath.value());
+  }
+
   std::string modelObjNameWithExt;
   int rc = compileModuleToObject(module, outputNameNoExt, modelObjNameWithExt);
   if (rc != CompilerSuccess)
@@ -620,9 +733,14 @@ static int compileModuleToJniJar(
   { "-z", "noexecstack" }
 #endif
   std::string modelSharedLibPath = getTargetFilename(jniLibBase, EmitLib);
-  rc = genSharedLib(modelSharedLibPath, NOEXECSTACK,
-      {modelObjNameWithExt, jniObjPath}, getCompilerConfig(CCM_SHARED_LIB_DEPS),
-      {getLibraryPath()});
+  if (constPackObjPath.has_value())
+    rc = genSharedLib(modelSharedLibPath, NOEXECSTACK,
+        {constPackObjPath.value(), modelObjNameWithExt, jniObjPath},
+        getCompilerConfig(CCM_SHARED_LIB_DEPS), {getLibraryPath()});
+  else
+    rc = genSharedLib(modelSharedLibPath, NOEXECSTACK,
+        {modelObjNameWithExt, jniObjPath},
+        getCompilerConfig(CCM_SHARED_LIB_DEPS), {getLibraryPath()});
   if (rc != CompilerSuccess)
     return rc;
   llvm::FileRemover modelSharedLibRemover(

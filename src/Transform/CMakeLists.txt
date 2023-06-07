@@ -10,6 +10,14 @@ add_onnx_mlir_library(OMElideKrnlGlobalConstants
   MLIRTransformUtils
   )
 
+add_onnx_mlir_library(OMPackKrnlGlobalConstants
+  PackKrnlGlobalConstants.cpp
+
+  LINK_LIBS PUBLIC
+  OMElideKrnlGlobalConstants
+  OMKrnlOps
+  )
+
 add_onnx_mlir_library(OMEnableMemoryPool
   EnableMemoryPool.cpp
 

@@ -38,6 +38,8 @@ public:
 
   LogicalResult matchAndRewrite(Operation *op, ArrayRef<Value> operands,
       ConversionPatternRewriter &rewriter) const override {
+    MLIRContext *context = op->getContext();
+    ModuleOp module = op->getParentOfType<ModuleOp>();
     auto krnlGlobalOp = llvm::dyn_cast<KrnlGlobalOp>(op);
     Location loc = krnlGlobalOp.getLoc();
     MultiDialectBuilder<LLVMBuilder> create(rewriter, loc);
@@ -60,30 +62,50 @@ public:
     }
 
     // Create the global at the entry of the module.
-    assert(krnlGlobalOp.getValue().has_value() &&
-           "Krnl Global must always have a value");
-    auto value = krnlGlobalOp.getValue().value();
-    LLVM::GlobalOp global;
-    TypeSwitch<Attribute>(value)
-        .Case<DenseResourceElementsAttr>([&](DenseResourceElementsAttr attr) {
-          global =
-              lowerDenseResourceConstant(krnlGlobalOp, globalType, rewriter);
-        })
-        .Case<DenseElementsAttr>([&](DenseElementsAttr attr) {
-          global = lowerDenseConstant(krnlGlobalOp, globalType, rewriter);
-        })
-        .Default([&](Attribute attr) {
-          llvm_unreachable("Unsupported attribute type");
-        });
+    Value globalOpAddr;
+    if (krnlGlobalOp.getValue().has_value()) {
+      auto value = krnlGlobalOp.getValue().value();
+      LLVM::GlobalOp global;
+      TypeSwitch<Attribute>(value)
+          .Case<DenseResourceElementsAttr>([&](DenseResourceElementsAttr attr) {
+            global =
+                lowerDenseResourceConstant(krnlGlobalOp, globalType, rewriter);
+          })
+          .Case<DenseElementsAttr>([&](DenseElementsAttr attr) {
+            global = lowerDenseConstant(krnlGlobalOp, globalType, rewriter);
+          })
+          .Default([&](Attribute attr) {
+            llvm_unreachable("Unsupported attribute type");
+          });
 
-    // Set the global alignment based on the alignment attribute if it exists,
-    // otherwise use the module datalayout info.
-    krnl::setAlignment(global, krnlGlobalOp.getAlignmentAttr(),
-        krnlGlobalOp->getParentOfType<ModuleOp>(), rewriter,
-        *getTypeConverter());
+      // Set the global alignment based on the alignment attribute if it exists,
+      // otherwise use the module datalayout info.
+      krnl::setAlignment(global, krnlGlobalOp.getAlignmentAttr(),
+          krnlGlobalOp->getParentOfType<ModuleOp>(), rewriter,
+          *getTypeConverter());
+      globalOpAddr = create.llvm.addressOf(global);
+    } else {
+      // Some frequently used types.
+      auto llvmI8PtrTy = getI8PointerType(context);
+      auto llvmI8Ty = IntegerType::get(context, 8);
+
+      // Allocate the memory where the constants will be used from.
+      // This is a region of local memory and needs to be emitted as an alloca.
+      auto base = module.lookupSymbol<LLVM::GlobalOp>("packedConst");
+      assert(base && "Cannot find symbol packedConst.");
+
+      Value constPackBasePtrAddr = create.llvm.addressOf(base);
+      Value constPackBasePtr = create.llvm.load(llvmI8Ty, constPackBasePtrAddr);
+      int64_t iOffset = 0;
+      if (krnlGlobalOp.getOffsetAttr())
+        iOffset = krnlGlobalOp.getOffsetAttr().getValue().getSExtValue();
+      Value gep = create.llvm.getElemPtr(llvmI8PtrTy, llvmI8PtrTy,
+          constPackBasePtr, ArrayRef<LLVM::GEPArg>{(int32_t)iOffset});
+      globalOpAddr = create.llvm.bitcast(
+          getPointerType(context, constantElementType), gep);
+    }
 
     // Prepare data to be inserted into a MemRefDescriptor (a struct).
-    Value globalOpAddr = create.llvm.addressOf(global);
     MemRefDescriptor memRefDescr =
         createMemRefDescriptor(globalOpAddr, memRefTy, loc, rewriter);
 

@@ -80,6 +80,9 @@ void populateLoweringKrnlInstrumentOpPattern(
 void populateLoweringKrnlMemcpyOpPattern(mlir::LLVMTypeConverter &typeConverter,
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);
 
+void populateLoweringKrnlPackedConstOpPattern(mlir::LLVMTypeConverter &typeConverter,
+    mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);
+
 void populateLoweringKrnlPrintOpPattern(mlir::LLVMTypeConverter &typeConverter,
     mlir::RewritePatternSet &patterns, mlir::MLIRContext *ctx);
 

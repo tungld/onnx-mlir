@@ -34,6 +34,16 @@ set_target_properties(cruntime
   POSITION_INDEPENDENT_CODE TRUE
   )
 
+# See comments above about libcruntime.a
+add_onnx_mlir_library(EmbeddedDataLoader STATIC
+  GetEmbeddedConstPool.h
+  GetEmbeddedConstPool.cpp
+  )
+set_target_properties(EmbeddedDataLoader
+  PROPERTIES
+  POSITION_INDEPENDENT_CODE TRUE
+  )
+
 add_onnx_mlir_library(OMTensorUtils
   OMIndexLookup.cpp
   OMInstrument.cpp

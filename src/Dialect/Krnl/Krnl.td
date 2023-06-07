@@ -366,6 +366,49 @@ def KrnlGlobalOp : Op<Krnl_Dialect, "global", [Pure, MemRefsNormalizable]> {
   let results = (outs AnyTypeOf<[AnyMemRef]>:$output);
 }
 
+def KrnlPackedConstantOp : Op<Krnl_Dialect, "packed_const", [Pure, MemRefsNormalizable]> {
+  let summary = "Krnl packed constant operation";
+  let description = [{
+    Operation for holding packed constants.
+  }];
+
+  let arguments = (ins I64Attr:$size_in_bytes,
+                       BoolAttr:$is_le,
+                       OptionalAttr<AnyAttr>:$value,
+                       OptionalAttr<StrAttr>:$file_name);
+  let results = (outs I64:$output);
+
+  let extraClassDeclaration = [{
+    // The *path* to the file storing the constant pack on disk is encoded
+    // as a global variable in the LLVM module of the lowered model.
+    // getConstPackFilePathSymbolName returns the name of this symbol;
+    // getConstPackFilePathStrLenSymbolName returns the name of the symbol holding
+    // a constant value equal to the length of the file path.
+    static StringRef getConstPackFilePathSymbolName() { return "constPackFilePath"; }
+    static StringRef getConstPackFilePathStrLenSymbolName() { return "constPackFilePathStrLen"; }
+
+    // The *name* of the file storing the constant pack is also recorded for
+    // convenience. Similarly, getConstPackFileNameSymbolName and
+    // getConstPackFileNameStrLenSymbolName returns records the symbol holding
+    // the string constant representing the filename and the length of this
+    // string constant.
+    static StringRef getConstPackFileNameSymbolName() { return "constPackFileName"; }
+    static StringRef getConstPackFileNameStrLenSymbolName() { return "constPackFileNameStrLen"; }
+
+    // We record whether the constant pack is stored in LE byte order as a
+    // int8 symbol; it is to be interpreted as a boolean switch - with 0
+    // meaning that the constant pack is not stored in LE byte order and
+    // non-0 values meaning that it is stored in LE byte order.
+    static StringRef getConstPackIsLESymbolName() { return "constPackIsLE"; }
+    // The name of a function we call to read packed constants embedded within
+    // the current binary executable/library, or in the case of unsupported platform,
+    // from a binary constant pack file.
+    static StringRef getEmbeddedDataLoaderMethodName() {
+      return "getEmbeddedConstPool";
+    }
+  }];
+}
+
 def KrnlGetRefOp : Op<Krnl_Dialect, "getref", [MemRefsNormalizable]> {
   let summary = "Krnl a MemRef from within another MemRef starting at a specific offset.";
   let description = [{

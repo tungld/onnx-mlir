@@ -170,6 +170,7 @@ add_onnx_mlir_library(OMCompilerUtils
 # however, they are required for execution when using the EmitLib or EmitJNI
 # options
 add_dependencies(OMCompilerUtils cruntime)
+add_dependencies(OMCompilerUtils EmbeddedDataLoader)
 if (ONNX_MLIR_ENABLE_JNI)
   add_dependencies(OMCompilerUtils jniruntime)
 endif()

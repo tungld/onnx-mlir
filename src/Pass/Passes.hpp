@@ -93,6 +93,9 @@ std::unique_ptr<mlir::Pass> createLowerKrnlShapePass();
 std::unique_ptr<mlir::Pass> createElideConstGlobalValuePass();
 
 namespace krnl {
+///  Pass to move packed contants to a file.
+std::unique_ptr<mlir::Pass> createPackKrnlGlobalConstantsPass();
+
 /// Pass for lowering frontend dialects to Krnl IR dialect.
 std::unique_ptr<mlir::Pass> createConvertKrnlToAffinePass();
 

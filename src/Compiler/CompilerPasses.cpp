@@ -190,6 +190,9 @@ void addKrnlToLLVMPasses(mlir::OpPassManager &pm, bool enableCSE) {
   pm.addNestedPass<func::FuncOp>(mlir::createConvertSCFToCFPass());
 
   pm.addPass(mlir::memref::createFoldMemRefAliasOpsPass());
+  // Pack global constants to save them to .o files when the model is huge.
+  if (modelSize == ModelSize::huge)
+    pm.addPass(krnl::createPackKrnlGlobalConstantsPass());
   pm.addPass(krnl::createConvertKrnlToLLVMPass(verifyInputTensors,
       /*useOpaquePointers=*/true,
       /*useLRODATA=*/(modelSize == ModelSize::large)));
