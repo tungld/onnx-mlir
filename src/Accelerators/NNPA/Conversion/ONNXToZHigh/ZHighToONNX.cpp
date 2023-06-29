@@ -15,6 +15,8 @@
 // use CPU instead of NNPA to avoid stick/unstick. CPU is efficient to handle
 // these ops, e.g. by vectorizing the computation.
 //
+// TODO: propose a cost model to help make decision.
+//
 //===----------------------------------------------------------------------===//
 
 #include "mlir/IR/Matchers.h"
