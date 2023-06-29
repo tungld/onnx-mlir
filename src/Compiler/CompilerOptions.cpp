@@ -95,6 +95,50 @@ llvm::cl::opt<std::string> march("march",
     llvm::cl::value_desc("Target a specific architecture type"),
     llvm::cl::cat(OnnxMlirOptions), llvm::cl::ValueRequired);
 
+llvm::cl::opt<ModelSize> modelSize("modelSize",
+    llvm::cl::desc("Model to generate code"),
+    llvm::cl::value_desc("Only support small or large"),
+    llvm::cl::values(
+        clEnumVal(small, "Generate code for the small model. "
+                         "No special treament at this moment. This is the "
+                         "default code model"),
+        clEnumVal(large,
+            "Generate code for the large model. "
+            "Global constants are put into large read-only data section.")),
+    llvm::cl::init(small), llvm::cl::cat(OnnxMlirOptions),
+    llvm::cl::ValueRequired);
+
+llvm::cl::opt<bool> storeConstantsToFile("store-constants-to-file",
+    llvm::cl::desc(
+        "Constants will be stored on a binary file instead of be embedded "
+        "into the model.so. The binary file is in the same folder as the "
+        "model.so and has the same name as the model with the extension of "
+        ".constants.bin. For inference, model.constants.bin must be at the "
+        "same folder as the inference programm. If model.constants.bin is at "
+        "another folder, use the environment variable OM_CONSTANT_PATH to set "
+        "the constant folder. Windows will be supported soon."),
+    llvm::cl::init(false), llvm::cl::cat(OnnxMlirOptions));
+
+llvm::cl::opt<float> constantsToFileTotalThreshold(
+    "constants-to-file-total-threshold",
+    llvm::cl::desc(
+        "Put global constants to a file if the total size in "
+        "bytes of constants is greater than this threshold. "
+        "store-constants-to-file must be enabled for this to be effective. "
+        "Only count contants whose size is greater than "
+        "constants-to-file-single-threshold. Value is in GB."),
+    llvm::cl::init(2.0), llvm::cl::cat(OnnxMlirOptions));
+
+llvm::cl::opt<float> constantsToFileSingleThreshold(
+    "constants-to-file-single-threshold",
+    llvm::cl::desc(
+        "Put global constants to a file if a single constant's size in "
+        "bytes is greater than this threshold. "
+        "store-constants-to-file must be enabled for this to be effective. "
+        "Total sizes in bytes of satisfied constants must be greater than "
+        "constants-to-file-total-threshold. Value is in KB."),
+    llvm::cl::init(1.0), llvm::cl::cat(OnnxMlirOptions));
+
 llvm::cl::list<accel::Accelerator::Kind> maccel("maccel",
     llvm::cl::desc("Specify an accelerator to generate code for"),
     // clang-format off
@@ -214,9 +258,9 @@ llvm::cl::opt<bool> enablePatternShapeInference("pattern-shape-inference",
     llvm::cl::init(true), llvm::cl::cat(OnnxMlirCommonOptions));
 
 llvm::cl::opt<bool> enableONNXHybridPass("onnx-hybrid-pass",
-    llvm::cl::desc("Enable ONNX hybrid pass (default=false)\n"
-                   "Set to 'true' if you want to enable ONNX hybrid pass."),
-    llvm::cl::init(false), llvm::cl::cat(OnnxMlirCommonOptions));
+    llvm::cl::desc("Enable ONNX hybrid pass (default=true)\n"
+                   "Set to 'false' if you want to disable ONNX hybrid pass."),
+    llvm::cl::init(true), llvm::cl::cat(OnnxMlirCommonOptions));
 
 llvm::cl::opt<bool> verifyInputTensors("verifyInputTensors",
     llvm::cl::desc(
@@ -248,6 +292,9 @@ llvm::cl::opt<std::string> reportHeapAfter("report-heap-after",
 // If it gets more complicated in the future, it can be
 // replaced by a class of its own.
 std::map<std::string, std::vector<std::string>> CompilerConfigMap;
+
+// Must match ModelSize enum
+const std::string modelSizeStr[] = {"small", "medium", "large", "huge"};
 
 // =============================================================================
 // Methods for setting and getting compiler variables.
@@ -417,7 +464,7 @@ std::string getOptimizationLevelOption() {
 // Support for Xopt.
 void setXoptOption(const std::vector<std::string> &flags) {
   for (const std::string &flag : flags)
-    Xllc.addValue(flag);
+    Xopt.addValue(flag);
 }
 
 void clearXoptOption() { Xopt.clear(); }

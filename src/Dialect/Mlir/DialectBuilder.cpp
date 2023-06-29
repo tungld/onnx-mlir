@@ -553,16 +553,32 @@ TypedAttr MathBuilder::positiveInfAttr(mlir::Type type) const {
 }
 
 Value MathBuilder::negativeInf(Type type) const {
-  TypedAttr attr = negativeInfAttr(type);
+  // Strip vector type if any.
+  Type elementType = elementTypeWithVector(type);
+  TypedAttr attr = negativeInfAttr(elementType);
   Value constant = b().create<arith::ConstantOp>(loc(), attr);
   assert(constant != nullptr && "Expecting valid constant value");
+  if (type.isa<VectorType>()) {
+    // For vectors, need to splat the constant.
+    MultiDialectBuilder<VectorBuilder> create(*this);
+    VectorType vecType = type.dyn_cast<VectorType>();
+    constant = create.vec.splat(vecType, constant);
+  }
   return constant;
 }
 
 Value MathBuilder::positiveInf(Type type) const {
-  TypedAttr attr = positiveInfAttr(type);
+  // Strip vector type if any.
+  Type elementType = elementTypeWithVector(type);
+  TypedAttr attr = positiveInfAttr(elementType);
   Value constant = b().create<arith::ConstantOp>(loc(), attr);
   assert(constant != nullptr && "Expecting valid constant value");
+  if (type.isa<VectorType>()) {
+    // For vectors, need to splat the constant.
+    MultiDialectBuilder<VectorBuilder> create(*this);
+    VectorType vecType = type.dyn_cast<VectorType>();
+    constant = create.vec.splat(vecType, constant);
+  }
   return constant;
 }
 
@@ -1669,6 +1685,10 @@ Value LLVMBuilder::ptrtoint(Type type, Value val) const {
   return b().create<LLVM::PtrToIntOp>(loc(), type, val);
 }
 
+void LLVMBuilder::_return() const {
+  b().create<LLVM::ReturnOp>(loc(), ArrayRef<Value>{});
+}
+
 void LLVMBuilder::_return(Value val) const {
   b().create<LLVM::ReturnOp>(loc(), ArrayRef<Value>({val}));
 }
@@ -1701,14 +1721,14 @@ void LLVMBuilder::ifThenElse(
   // Split the current block into IF, THEN, ELSE and END blocks.
   Block *ifBlock, *thenBlock, *elseBlock, *endBlock;
   ifBlock = b().getInsertionBlock();
-  thenBlock = ifBlock->splitBlock(b().getInsertionPoint());
-  elseBlock = b().createBlock(
-      thenBlock->getParent(), std::next(Region::iterator(thenBlock)));
+  endBlock = ifBlock->splitBlock(b().getInsertionPoint());
+  thenBlock = b().createBlock(
+      ifBlock->getParent(), std::next(Region::iterator(ifBlock)));
   if (elseFn)
-    endBlock = b().createBlock(
-        elseBlock->getParent(), std::next(Region::iterator(elseBlock)));
+    elseBlock = b().createBlock(
+        thenBlock->getParent(), std::next(Region::iterator(thenBlock)));
   else
-    endBlock = elseBlock;
+    elseBlock = endBlock;
 
   // Emit code for the IF block.
   b().setInsertionPointToEnd(ifBlock);

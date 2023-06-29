@@ -299,6 +299,11 @@ int64_t ArrayAttrIntVal(Optional<ArrayAttr> a, int i) {
   return (a.value().getValue()[i]).cast<IntegerAttr>().getInt();
 }
 
+void ArrayAttrIntVals(ArrayAttr a, mlir::SmallVectorImpl<int64_t> &i) {
+  for (size_t k = 0; k < a.size(); ++k)
+    i.emplace_back((a.getValue()[k]).cast<IntegerAttr>().getInt());
+}
+
 ElementsAttr getElementAttributeFromONNXValue(Value value) {
   ONNXConstantOp constantOp = getONNXConstantOp(value);
   if (constantOp)
@@ -337,6 +342,8 @@ ArrayAttr CombinedTransposePattern(PatternRewriter &rewriter,
 /// Test if the permute pattern correspond to an identity pattern.
 /// Identity patterns are {0, 1, 2, ... , rank -1}.
 bool IsIdentityPermuteVector(ArrayAttr permAttr) {
+  if (!permAttr)
+    return false;
   int64_t currentIndex = 0;
   for (auto permVal : permAttr.getValue())
     if (permVal.cast<IntegerAttr>().getInt() != currentIndex++)
@@ -428,11 +435,6 @@ bool areDims(Value val) {
   // Value must be a 1D tensor.
   Type vType = val.getType();
   if (!(isRankedShapedType(vType) && (getRank(vType) == 1)))
-    return false;
-
-  // Dim must be i64.
-  Type elmTy = getElementType(vType);
-  if (!elmTy.isSignlessInteger(64))
     return false;
 
   // Base case.
@@ -582,36 +584,44 @@ template int64_t getScalarValue<int64_t>(ONNXConstantOp constantOp);
 // <onnx-mlir-build-folder>/third_party/onnx/onnx/onnx.pb.h
 // TODO: Update Int*/Uint* to emit signed/unsigned MLIR types
 Type convertONNXTypeToMLIRType(
-    OpBuilder &builder_, onnx::TensorProto_DataType onnxType) {
+    Builder &builder, onnx::TensorProto_DataType onnxType) {
   switch (onnxType) {
+  case onnx::TensorProto_DataType::TensorProto_DataType_FLOAT8E4M3FN:
+    return builder.getFloat8E4M3FNType();
+  case onnx::TensorProto_DataType::TensorProto_DataType_FLOAT8E4M3FNUZ:
+    return builder.getFloat8E4M3FNUZType();
+  case onnx::TensorProto_DataType::TensorProto_DataType_FLOAT8E5M2:
+    return builder.getFloat8E5M2Type();
+  case onnx::TensorProto_DataType::TensorProto_DataType_FLOAT8E5M2FNUZ:
+    return builder.getFloat8E5M2FNUZType();
   case onnx::TensorProto_DataType::TensorProto_DataType_BFLOAT16:
-    return builder_.getBF16Type();
+    return builder.getBF16Type();
   case onnx::TensorProto_DataType::TensorProto_DataType_FLOAT16:
-    return builder_.getF16Type();
+    return builder.getF16Type();
   case onnx::TensorProto_DataType::TensorProto_DataType_FLOAT:
-    return builder_.getF32Type();
+    return builder.getF32Type();
   case onnx::TensorProto_DataType::TensorProto_DataType_DOUBLE:
-    return builder_.getF64Type();
+    return builder.getF64Type();
   case onnx::TensorProto_DataType::TensorProto_DataType_INT8:
-    return builder_.getIntegerType(/*width=*/8);
+    return builder.getIntegerType(/*width=*/8);
   case onnx::TensorProto_DataType::TensorProto_DataType_UINT8:
-    return builder_.getIntegerType(/*width=*/8, false);
+    return builder.getIntegerType(/*width=*/8, false);
   case onnx::TensorProto_DataType::TensorProto_DataType_INT16:
-    return builder_.getIntegerType(/*width=*/16);
+    return builder.getIntegerType(/*width=*/16);
   case onnx::TensorProto_DataType::TensorProto_DataType_UINT16:
-    return builder_.getIntegerType(/*width=*/16, false);
+    return builder.getIntegerType(/*width=*/16, false);
   case onnx::TensorProto_DataType::TensorProto_DataType_INT32:
-    return builder_.getIntegerType(/*width=*/32);
+    return builder.getIntegerType(/*width=*/32);
   case onnx::TensorProto_DataType::TensorProto_DataType_UINT32:
-    return builder_.getIntegerType(/*width=*/32, false);
+    return builder.getIntegerType(/*width=*/32, false);
   case onnx::TensorProto_DataType::TensorProto_DataType_INT64:
-    return builder_.getIntegerType(/*width=*/64);
+    return builder.getIntegerType(/*width=*/64);
   case onnx::TensorProto_DataType::TensorProto_DataType_UINT64:
-    return builder_.getIntegerType(/*width=*/64, false);
+    return builder.getIntegerType(/*width=*/64, false);
   case onnx::TensorProto_DataType::TensorProto_DataType_BOOL:
-    return builder_.getI1Type();
+    return builder.getI1Type();
   case onnx::TensorProto_DataType::TensorProto_DataType_STRING:
-    return ONNXStringType::get(builder_.getContext());
+    return ONNXStringType::get(builder.getContext());
 
   case onnx::TensorProto_DataType::TensorProto_DataType_COMPLEX64:
   case onnx::TensorProto_DataType::TensorProto_DataType_COMPLEX128:
@@ -630,6 +640,18 @@ int64_t mlirTypeToOnnxType(Type elemType) {
     return onnxType;
 
   TypeSwitch<Type>(elemType)
+      .Case<ONNXStringType>(
+          [&](ONNXStringType) { onnxType = onnx::TensorProto::STRING; })
+      .Case<Float8E4M3FNType>(
+          [&](Float8E4M3FNType) { onnxType = onnx::TensorProto::FLOAT8E4M3FN; })
+      .Case<Float8E4M3FNUZType>([&](Float8E4M3FNUZType) {
+        onnxType = onnx::TensorProto::FLOAT8E4M3FNUZ;
+      })
+      .Case<Float8E5M2Type>(
+          [&](Float8E5M2Type) { onnxType = onnx::TensorProto::FLOAT8E5M2; })
+      .Case<Float8E5M2FNUZType>([&](Float8E5M2FNUZType) {
+        onnxType = onnx::TensorProto::FLOAT8E5M2FNUZ;
+      })
       .Case<BFloat16Type>(
           [&](BFloat16Type) { onnxType = onnx::TensorProto::BFLOAT16; })
       .Case<ComplexType>([&](ComplexType type) {

@@ -462,8 +462,8 @@ def get_test_models():
 
         # ==OP== IsInf
         "test_isinf_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
-        # "test_isinf_negative_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
-        # "test_isinf_positive_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_isinf_negative_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_isinf_positive_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
 
         # ==OP== IsNaN
         "test_isnan_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
@@ -1044,7 +1044,26 @@ def get_test_models():
         "test_transpose_all_permutations_4_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
         "test_transpose_all_permutations_5_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
 
-        # Trilu
+        # ==OP== Trilu
+        # Disable zero tests that accepts an input of dimension size 0 and return an empty output.
+        # Zero tests failed when running `make check-onnx-backend-jni`.
+        "test_tril_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_tril_neg_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_tril_out_neg_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_tril_out_pos_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_tril_pos_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_tril_square_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_tril_square_neg_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        #"test_tril_zero_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_triu_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_triu_neg_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_triu_one_row_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_triu_out_neg_out_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_triu_out_pos_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_triu_pos_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_triu_square_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        "test_triu_square_neg_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
+        #"test_triu_zero_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{-1:{-1}}, CONSTANT_INPUT:{-1}},
 
         # Unique
 
@@ -1093,7 +1112,7 @@ def get_test_models():
     variables.model_test_to_enable_dict = {
         "test_densenet121_cpu": {STATIC_SHAPE:{}},
         "test_inception_v1_cpu": {STATIC_SHAPE:{}},
-        "test_resnet50_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{0:{-1}}},
+        "test_resnet50_cpu": {STATIC_SHAPE:{}, DYNAMIC_SHAPE:{0:{-1}}, CONSTANTS_TO_FILE:{}},
         "test_shufflenet_cpu": {STATIC_SHAPE:{}},
         "test_squeezenet_cpu": {STATIC_SHAPE:{}},
         # Failure in version v13
@@ -1131,6 +1150,14 @@ def get_test_models():
     variables.test_for_constant = [
         key for (key, value) in variables.test_to_enable_dict.items() if CONSTANT_INPUT in value ]
 
+    # Test for constants to file.
+    variables.node_test_for_constants_to_file = [
+        key for (key, value) in variables.node_test_to_enable_dict.items() if CONSTANTS_TO_FILE in value ]
+    variables.model_test_for_constants_to_file = [
+        key for (key, value) in variables.model_test_to_enable_dict.items() if CONSTANTS_TO_FILE in value ]
+    variables.test_for_constants_to_file = [
+        key for (key, value) in variables.test_to_enable_dict.items() if CONSTANTS_TO_FILE in value ]
+
     # Specify the test cases which need version converter
     variables.test_need_converter = []
 
@@ -1147,6 +1174,13 @@ def get_test_models():
         node_test_to_enable = variables.node_test_for_constant
         model_test_to_enable = variables.model_test_for_constant
         test_to_enable = variables.test_for_constant
+
+    if args.constants_to_file:
+        if args.verbose:
+            print("constants-to-file is enabled", file=sys.stderr)
+        node_test_to_enable = variables.node_test_for_constants_to_file
+        model_test_to_enable = variables.model_test_for_constants_to_file
+        test_to_enable = variables.test_for_constants_to_file
 
     # User can specify a list of test cases with TEST_CASE_BY_USER
     TEST_CASE_BY_USER = os.getenv("TEST_CASE_BY_USER")
@@ -1194,7 +1228,7 @@ def JniExecutionSession(jar_name, inputs):
     )
 
     dtype = {
-        "b1": np.bool,
+        "b1": np.bool_,
         "i1": np.int8,
         "u1": np.uint8,
         "i2": np.int16,

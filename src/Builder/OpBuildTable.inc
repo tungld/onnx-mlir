@@ -39,7 +39,7 @@ op_dialect_version_map_["Clip"] = {13, 12, 11, 6};
 op_dialect_version_map_["Compress"] = {11};
 op_dialect_version_map_["Concat"] = {13};
 op_dialect_version_map_["ConcatFromSequence"] = {11};
-op_dialect_version_map_["Constant"] = {13};
+op_dialect_version_map_["Constant"] = {19};
 op_dialect_version_map_["ConstantOfShape"] = {9};
 op_dialect_version_map_["Conv"] = {11};
 op_dialect_version_map_["ConvInteger"] = {10};
@@ -533,7 +533,7 @@ import_handler_map_["Round"] =
 import_handler_map_["STFT"] = 
    &onnx_mlir::detail::FrontendGenImpl::buildOperation<mlir::ONNXSTFTOp>;
 import_handler_map_["Scan"] = 
-   &onnx_mlir::detail::FrontendGenImpl::ImportScan;
+   &onnx_mlir::detail::FrontendGenImpl::buildOperation<mlir::ONNXScanOp>;
 import_handler_map_["Scatter"] = 
    &onnx_mlir::detail::FrontendGenImpl::buildOperation<mlir::ONNXScatterOp>;
 import_handler_map_["ScatterElements"] = 

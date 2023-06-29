@@ -60,6 +60,9 @@ std::unique_ptr<mlir::Pass> createInstrumentONNXSignaturePass();
 std::unique_ptr<mlir::Pass> createSimplifyShapeRelatedOpsPass(
     bool report = false);
 
+/// Pass for replacing ONNXReturnOp with func::ReturnOp.
+std::unique_ptr<mlir::Pass> createStandardFuncReturnPass();
+
 /// Pass that combines multiple ONNX dialect transformations,
 /// including shape inference.
 std::unique_ptr<mlir::Pass> createONNXHybridTransformPass();
@@ -110,8 +113,10 @@ std::unique_ptr<mlir::Pass> createLowerKrnlRegionPass();
 
 /// Pass for lowering Krnl dialect to LLVM dialect.
 std::unique_ptr<mlir::Pass> createConvertKrnlToLLVMPass();
-std::unique_ptr<mlir::Pass> createConvertKrnlToLLVMPass(
-    bool verifyInputTensors, bool useOpaquePointer);
+std::unique_ptr<mlir::Pass> createConvertKrnlToLLVMPass(bool verifyInputTensors,
+    bool useOpaquePointer, bool useLRODATA, bool storeConstantsToFile,
+    float constantsToFileSingleThreshold, float constantsToFileTotalThreshold,
+    std::string outputNameNoExt);
 
 } // namespace krnl
 
