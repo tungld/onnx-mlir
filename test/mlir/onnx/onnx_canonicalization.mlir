@@ -866,14 +866,14 @@ func.func @test_loop_derive_max_trip_count_non_constant_ub(%arg0: tensor<?x30xf3
 // CHECK-DAG:       [[VAR_1_:%.+]] = onnx.Constant dense<9223372036854775807> : tensor<i64>
 // CHECK-DAG:       [[VAR_2_:%.+]] = onnx.Constant dense<true> : tensor<i1>
 // CHECK-DAG:       [[VAR_3_:%.+]] = onnx.Constant dense<0> : tensor<i32>
-// CHECK-DAG:       [[VAR_4_:%.+]] = "onnx.Cast"([[PARAM_1_]]) {to = i64} : (tensor<i32>) -> tensor<i64>
-// CHECK:           [[VAR_5_:%.+]] = "onnx.Cast"([[VAR_3_]]) {to = i64} : (tensor<i32>) -> tensor<i64>
+// CHECK-DAG:       [[VAR_4_:%.+]] = "onnx.Cast"([[PARAM_1_]]) {saturate = 1 : si64, to = i64} : (tensor<i32>) -> tensor<i64>
+// CHECK:           [[VAR_5_:%.+]] = "onnx.Cast"([[VAR_3_]]) {saturate = 1 : si64, to = i64} : (tensor<i32>) -> tensor<i64>
 // CHECK:           [[VAR_6_:%.+]] = "onnx.Sub"([[VAR_4_]], [[VAR_5_]]) : (tensor<i64>, tensor<i64>) -> tensor<i64>
-// CHECK-DAG:       [[VAR_7_:%.+]] = "onnx.Cast"([[VAR_6_]]) {to = f32} : (tensor<i64>) -> tensor<f32>
-// CHECK-DAG:       [[VAR_8_:%.+]] = "onnx.Cast"([[VAR_0_]]) {to = f32} : (tensor<i32>) -> tensor<f32>
+// CHECK-DAG:       [[VAR_7_:%.+]] = "onnx.Cast"([[VAR_6_]]) {saturate = 1 : si64, to = f32} : (tensor<i64>) -> tensor<f32>
+// CHECK-DAG:       [[VAR_8_:%.+]] = "onnx.Cast"([[VAR_0_]]) {saturate = 1 : si64, to = f32} : (tensor<i32>) -> tensor<f32>
 // CHECK:           [[VAR_9_:%.+]] = "onnx.Div"([[VAR_7_]], [[VAR_8_]]) : (tensor<f32>, tensor<f32>) -> tensor<f32>
 // CHECK:           [[VAR_10_:%.+]] = "onnx.Ceil"([[VAR_9_]]) : (tensor<f32>) -> tensor<f32>
-// CHECK:           [[VAR_11_:%.+]] = "onnx.Cast"([[VAR_10_]]) {to = i64} : (tensor<f32>) -> tensor<i64>
+// CHECK:           [[VAR_11_:%.+]] = "onnx.Cast"([[VAR_10_]]) {saturate = 1 : si64, to = i64} : (tensor<f32>) -> tensor<i64>
 // CHECK:           [[VAR_12_:%.+]] = "onnx.Min"([[VAR_1_]], [[VAR_1_]]1) : (tensor<i64>, tensor<i64>) -> tensor<i64>
 // CHECK:           [[VAR_13_:%.+]]:4 = "onnx.Loop"([[VAR_12_]], [[VAR_2_]], [[VAR_3_]], [[PARAM_1_]], [[PARAM_0_]]) ({
 // CHECK:           ^bb0([[arg2_:%.+]]: tensor<i64>, [[arg3_:%.+]]: tensor<i1>, [[arg4_:%.+]]: tensor<i32>, [[arg5_:%.+]]: tensor<i32>, [[arg6_:%.+]]: tensor<?x30xf32>):
@@ -1029,17 +1029,34 @@ func.func @shape_transform_identity_map(%arg0: tensor<128x128xf32>) -> tensor<12
 // -----
 
 // COM: Expand Pow into multiple Mul if exponent is an integer and <= 64.
-func.func @expand_pow_into_mul(%arg0: tensor<3x4x5xf32>) -> tensor<3x4x5xf32> {
+func.func @expand_pow_into_mul_f32(%arg0: tensor<3x4x5xf32>) -> tensor<3x4x5xf32> {
     %cst = onnx.Constant dense<5.0> : tensor<f32>
     %0 = "onnx.Pow"(%arg0, %cst) : (tensor<3x4x5xf32>, tensor<f32>) -> tensor<3x4x5xf32>
     onnx.Return %0 : tensor<3x4x5xf32>
 
-// CHECK-LABEL:  func.func @expand_pow_into_mul
+// CHECK-LABEL:  func.func @expand_pow_into_mul_f32
 // CHECK-SAME:   ([[PARAM_0_:%.+]]: tensor<3x4x5xf32>) -> tensor<3x4x5xf32> {
 // CHECK:           [[VAR_1_:%.+]] = "onnx.Mul"([[PARAM_0_]], [[PARAM_0_]]) : (tensor<3x4x5xf32>, tensor<3x4x5xf32>) -> tensor<3x4x5xf32>
 // CHECK:           [[VAR_2_:%.+]] = "onnx.Mul"([[VAR_1_]], [[VAR_1_]]) : (tensor<3x4x5xf32>, tensor<3x4x5xf32>) -> tensor<3x4x5xf32>
 // CHECK:           [[VAR_3_:%.+]] = "onnx.Mul"([[PARAM_0_]], [[VAR_2_]]) : (tensor<3x4x5xf32>, tensor<3x4x5xf32>) -> tensor<3x4x5xf32>
 // CHECK:           onnx.Return [[VAR_3_]] : tensor<3x4x5xf32>
+// CHECK:        }
+}
+
+// -----
+
+// COM: Expand Pow into multiple Mul if exponent is an integer and <= 64.
+func.func @expand_pow_into_mul_f16(%arg0: tensor<3x4x5xf16>) -> tensor<3x4x5xf16> {
+    %cst = onnx.Constant dense<5.0> : tensor<f16>
+    %0 = "onnx.Pow"(%arg0, %cst) : (tensor<3x4x5xf16>, tensor<f16>) -> tensor<3x4x5xf16>
+    onnx.Return %0 : tensor<3x4x5xf16>
+
+// CHECK-LABEL:  func.func @expand_pow_into_mul_f16
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: tensor<3x4x5xf16>) -> tensor<3x4x5xf16> {
+// CHECK:           [[VAR_1_:%.+]] = "onnx.Mul"([[PARAM_0_]], [[PARAM_0_]]) : (tensor<3x4x5xf16>, tensor<3x4x5xf16>) -> tensor<3x4x5xf16>
+// CHECK:           [[VAR_2_:%.+]] = "onnx.Mul"([[VAR_1_]], [[VAR_1_]]) : (tensor<3x4x5xf16>, tensor<3x4x5xf16>) -> tensor<3x4x5xf16>
+// CHECK:           [[VAR_3_:%.+]] = "onnx.Mul"([[PARAM_0_]], [[VAR_2_]]) : (tensor<3x4x5xf16>, tensor<3x4x5xf16>) -> tensor<3x4x5xf16>
+// CHECK:           onnx.Return [[VAR_3_]] : tensor<3x4x5xf16>
 // CHECK:        }
 }
 

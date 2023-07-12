@@ -58,7 +58,7 @@ std::string getVendorName() {
 #endif
 }
 
-llvm::Optional<std::string> getEnvVar(std::string name) {
+std::optional<std::string> getEnvVar(std::string name) {
   if (const char *envVerbose = std::getenv(name.c_str()))
     return std::string(envVerbose);
   return std::nullopt;
@@ -177,7 +177,7 @@ Command &Command::appendStr(const std::string &arg) {
 }
 
 // Append a single optional string argument.
-Command &Command::appendStrOpt(const llvm::Optional<std::string> &arg) {
+Command &Command::appendStrOpt(const std::optional<std::string> &arg) {
   if (arg.has_value())
     _args.emplace_back(arg.value());
   return *this;
@@ -679,6 +679,8 @@ int processInputFile(StringRef inputFilename, mlir::MLIRContext &context,
     options.shapeInformation = shapeInformation;
     options.allowSorting = allowSorting;
     options.externalDataDir = dirName(inputFilename);
+    options.functionsToDecompose.insert(options.functionsToDecompose.end(),
+        functionsToDecompose.begin(), functionsToDecompose.end());
     return ImportFrontendModelFile(
         inputFilename, context, module, errorMessage, options);
   } else if (inputIsMLIR)

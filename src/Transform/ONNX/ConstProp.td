@@ -71,11 +71,11 @@ def HasIntegerElementType: Constraint<CPred<
 >;
 
 def IsConstOfZeros : Constraint<
-  CPred<"isConstOf($_self, 0.0)">,
+  CPred<"isDenseONNXConstant($_self) && isConstOf($_self, 0.0)">,
   "Value is an all-zeros constant tensor">;
 
 def IsConstOfOnes : Constraint<
-  CPred<"isConstOf($_self, 1.0)">,
+  CPred<"isDenseONNXConstant($_self) && isConstOf($_self, 1.0)">,
   "Value is an all-ones constant tensor">;
 
 def ValuesHaveSameType : Constraint<
@@ -103,7 +103,7 @@ def CreateSubOfTwoConst :
    NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXSubOp>($_builder, $0, $1, $2)">;
 
 def CreateCastOfConst :
-   NativeCodeCall<"ConstPropCast($_builder, $0, $1)">;
+   NativeCodeCall<"ConstPropCast($_builder, $0, $1, $2, $3)">;
 
 def CreateNegOfConst :
    NativeCodeCall<"ConstPropElementwiseUnary<mlir::ONNXNegOp>($_builder, $0, $1)">;
@@ -113,6 +113,15 @@ def CreateSqrtOfConst :
 
 def CreateReluOfConst :
    NativeCodeCall<"ConstPropElementwiseUnary<mlir::ONNXReluOp>($_builder, $0, $1)">;
+
+def CreateMaxOfConst :
+   NativeCodeCall<"ConstPropVariadicElementwiseBinary<mlir::ONNXMaxOp>($_builder, $0, $1)">;
+
+def CreateMinOfConst :
+   NativeCodeCall<"ConstPropVariadicElementwiseBinary<mlir::ONNXMinOp>($_builder, $0, $1)">;
+
+def CreateSumOfConst :
+   NativeCodeCall<"ConstPropVariadicElementwiseBinary<mlir::ONNXSumOp>($_builder, $0, $1)">;
 
 def CreateMulOfTwoConst :
    NativeCodeCall<"ConstPropElementwiseBinary<mlir::ONNXMulOp>($_builder, $0, $1, $2)">;
@@ -272,10 +281,7 @@ def AddZerosOnRhs : Pat<
     ),
     // To x.
     (replaceWithValue $x),
-    [
-      (IsNotAConstant:$x), (IsConstOfZeros:$c),
-      (ValuesHaveSameType $result, $x)
-    ]>;
+    [(IsNotAConstant:$x), (ValuesHaveSameType $result, $x), (IsConstOfZeros:$c)]>;
 
 //===----------------------------------------------------------------------===//
 // Patterns to enable opportunities with elementwise SUB / NEG operations.
@@ -299,17 +305,14 @@ def SubZerosOnRhs : Pat<
     ),
     // To x.
     (replaceWithValue $x),
-    [
-      (IsNotAConstant:$x), (IsConstOfZeros:$c),
-      (ValuesHaveSameType $result, $x)
-    ]>;
+    [(IsNotAConstant:$x), (ValuesHaveSameType $result, $x), (IsConstOfZeros:$c)]>;
 
 // Cast of constant is simply a constant with the new type.
 def CastofConst :  Pat<
     // From (c)
-    (ONNXCastOp:$castOp (ONNXConstantOp:$input $_, $_, $_, $_, $_, $_, $_, $_), $to),
+    (ONNXCastOp:$castOp (ONNXConstantOp:$input $_, $_, $_, $_, $_, $_, $_, $_), $saturate, $to),
     // To (c)
-    (CreateCastOfConst $castOp, $input),
+    (CreateCastOfConst $castOp, $input, $saturate, $to),
     [(IsFromDenseONNXConstantOp:$input)]>;
 
 // Neg of constant is simply -const
@@ -345,6 +348,37 @@ def ReluofConst :  Pat<
     (CreateReluOfConst $reluOp, $input),
     [(IsFromDenseONNXConstantOp:$input)]>;
  
+//===----------------------------------------------------------------------===//
+// Const propagation patterns for variadic elementwise operations.
+//===----------------------------------------------------------------------===//
+
+// Constant Propagation for Max
+def MaxConstProp : Pat<
+    // From max(c1, c2).
+    (ONNXMaxOp:$maxOp $operandList),
+    // To c = max(c1, c2)
+    (CreateMaxOfConst $maxOp, $operandList),
+    // Constraints
+    [(IsVariadicOperandDenseONNXConstantOp:$operandList)]>;
+
+// Constant Propagation for Min
+def MinConstProp : Pat<
+    // From min(c1, c2).
+    (ONNXMinOp:$minOp $operandList),
+    // To c = min(c1, c2)
+    (CreateMinOfConst $minOp, $operandList),
+    // Constraints
+    [(IsVariadicOperandDenseONNXConstantOp:$operandList)]>;
+
+// Constant Propagation for Sum
+def SumConstProp : Pat<
+    // From sum(c1, c2).
+    (ONNXSumOp:$sumOp $operandList),
+    // To c = sum(c1, c2)
+    (CreateSumOfConst $sumOp, $operandList),
+    // Constraints
+    [(IsVariadicOperandDenseONNXConstantOp:$operandList)]>;
+
 //===----------------------------------------------------------------------===//
 // Patterns to enable opportunities with elementwise MUL operations.
 // Exactly the same pattern as for the elementwise ADD operations.
@@ -591,8 +625,8 @@ def MatMulZerosOnLhs : Pat<
       $B
     ),
     (CreateZeroTensorOfType $resOp),
-    [(IsConstOfZeros:$A), (IsNotAConstant:$B),
-     (HasStaticShape:$resOp), (HasIntegerElementType:$resOp)]
+    [(IsNotAConstant:$B), (HasIntegerElementType:$resOp),
+     (HasStaticShape:$resOp), (IsConstOfZeros:$A)]
     >;
 
 // Limited to integers because NaN * 0 is NaN, not 0.
@@ -602,8 +636,8 @@ def MatMulZerosOnRhs : Pat<
       (ONNXConstantOp:$B $_, $_, $_, $_, $_, $_, $_, $_)
     ),
     (CreateZeroTensorOfType $resOp),
-    [(IsNotAConstant:$A), (IsConstOfZeros:$B),
-     (HasStaticShape:$resOp), (HasIntegerElementType:$resOp)]
+    [(IsNotAConstant:$A), (HasIntegerElementType:$resOp),
+     (HasStaticShape:$resOp), (IsConstOfZeros:$B)]
     >;
 
 def MatMulOfConsts : Pat<

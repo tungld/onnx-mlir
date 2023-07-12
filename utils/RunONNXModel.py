@@ -600,6 +600,12 @@ def main():
                     'x'.join([str(i) for i in inp.shape]), inp.dtype, inp))
 
         # Running inference.
+        print("Running inference: warmup ...")
+        start = time.perf_counter()
+        outs = sess.run(inputs)
+        end = time.perf_counter()
+        print("  took ", end - start, " seconds.\n")
+
         print("Running inference ...")
         start = time.perf_counter()
         outs = sess.run(inputs)

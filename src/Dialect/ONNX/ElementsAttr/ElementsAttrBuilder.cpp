@@ -157,14 +157,17 @@ bool ElementsAttrBuilder::allEqual(
             auto values = castArrayRef<cpptype>(disposable.getBufferBytes());
             return llvm::all_of(values, nEquals);
           }
+        } else if (auto dense = lhs.dyn_cast<DenseElementsAttr>()) {
+          if (dense.isSplat()) {
+            cpptype x = dense.getSplatValue<cpptype>();
+            return nEquals(x);
+          } else {
+            auto values = dense.getValues<cpptype>();
+            return llvm::all_of(values, nEquals);
+          }
         }
-        if (lhs.isSplat()) {
-          cpptype x = lhs.getSplatValue<cpptype>();
-          return nEquals(x);
-        } else {
-          auto values = lhs.getValues<cpptype>();
-          return llvm::all_of(values, nEquals);
-        }
+        // TODO: consider supporting more ElementsAttr types
+        llvm_unreachable("unexpected ElementsAttr instance");
       });
 }
 
@@ -329,6 +332,23 @@ ElementsAttr ElementsAttrBuilder::castElementType(
                 functionTransformer(wideCaster(oldWideType, newWideType)));
   return create(newType, props.bufferBType, props.strides, props.buffer,
       std::move(transformer));
+}
+
+ElementsAttr ElementsAttrBuilder::clip(
+    ElementsAttr elms, WideNum min, WideNum max) {
+  return wideZeroDispatchNonBool(elms.getElementType(), [&](auto wideZero) {
+    using cpptype = decltype(wideZero);
+    return doTransform(
+        elms, elms.getElementType(), functionTransformer([min, max](WideNum n) {
+          constexpr BType TAG = toBType<cpptype>;
+          cpptype x = n.narrow<TAG>();
+          if (x < min.narrow<TAG>())
+            return min;
+          if (x > max.narrow<TAG>())
+            return max;
+          return n;
+        }));
+  });
 }
 
 namespace {
