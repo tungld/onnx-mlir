@@ -27,6 +27,10 @@
 #include "ExecutionSession.hpp"
 #include "OMTensorListHelper.hpp"
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
 namespace onnx_mlir {
 const std::string ExecutionSession::_queryEntryPointsName =
     "omQueryEntryPoints";
@@ -36,6 +40,22 @@ const std::string ExecutionSession::_outputSignatureName = "omOutputSignature";
 ExecutionSession::ExecutionSession(
     std::string sharedLibPath, bool defaultEntryPoint) {
 
+#ifdef RTLD_DEEPBIND
+  // On Linux, use RTLD_DEEPBIND to search symbols locally, so that we can
+  // safely load multiple models without symbol conflicts.
+  //
+  // llvm::sys::DynamicLibrary has no mechanism for users to set dlopen's
+  // options, so we open the library with our options, then call
+  // DynamicLibrary::getLibrary() so that DynamicLirary can manage the opened
+  // library.
+  //
+  // DynamicLibrary::getLibrary() is safe to be called multiple times
+  // for the same library.
+  void *Handle =
+      dlopen(sharedLibPath.c_str(), RTLD_LAZY | RTLD_GLOBAL | RTLD_DEEPBIND);
+  if (!Handle)
+    throw std::runtime_error(reportLibraryOpeningError(sharedLibPath));
+#endif
   _sharedLibraryHandle =
       llvm::sys::DynamicLibrary::getLibrary(sharedLibPath.c_str());
   if (!_sharedLibraryHandle.isValid())

@@ -69,6 +69,7 @@ add_onnx_mlir_library(OMExecutionSession
   LINK_LIBS PUBLIC
   OMTensorUtils
   LLVMSupport
+  ${CMAKE_DL_LIBS}
   )
 set_target_properties(OMExecutionSession
   PROPERTIES
