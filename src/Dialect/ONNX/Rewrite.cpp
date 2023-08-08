@@ -925,6 +925,7 @@ void ONNXDepthToSpaceOp::getCanonicalizationPatterns(
 void ONNXDivOp::getCanonicalizationPatterns(
     RewritePatternSet &result, MLIRContext *context) {
   result.insert<BinaryOpBroadcastAxisPattern<ONNXDivOp>>(context);
+  result.insert<DivByScalarToMul>(context);
 }
 
 /// on the ONNXDropoutOp.

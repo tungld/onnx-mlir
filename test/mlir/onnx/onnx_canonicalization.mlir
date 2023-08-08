@@ -1256,3 +1256,18 @@ func.func @mul_broadcast_axis_unsqueeze(%279: tensor<1x64x112x112xf32>, %138: te
 // CHECK:         }
 }
 
+// -----
+
+// Div by scalar to mul. 
+func.func @div_by_scalar_to_mul(%arg0: tensor<?x?xf32>) -> tensor<?x?xf32> {
+  %cst = onnx.Constant dense<64.0> : tensor<f32>
+  %0 = "onnx.Div"(%arg0, %cst) : (tensor<?x?xf32>, tensor<f32>) -> tensor<?x?xf32>
+  onnx.Return %0 : tensor<?x?xf32>
+
+// CHECK-LABEL:  func.func @div_by_scalar_to_mul
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: tensor<?x?xf32>) -> tensor<?x?xf32> {
+// CHECK:           [[VAR_0_:%.+]] = onnx.Constant dense<1.562500e-02> : tensor<f32>
+// CHECK:           [[VAR_1_:%.+]] = "onnx.Mul"([[PARAM_0_]], [[VAR_0_]]) : (tensor<?x?xf32>, tensor<f32>) -> tensor<?x?xf32>
+// CHECK:           onnx.Return [[VAR_1_]] : tensor<?x?xf32>
+// CHECK:         }
+}

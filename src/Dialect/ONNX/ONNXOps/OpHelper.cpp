@@ -16,6 +16,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 
 #include "src/Dialect/Mlir/IndexExpr.hpp"
+#include "src/Dialect/ONNX/DialectBuilder.hpp"
 #include "src/Dialect/ONNX/ONNXLayoutHelper.hpp"
 #include "src/Dialect/ONNX/ONNXOps.hpp"
 #include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"
@@ -496,6 +497,21 @@ DenseElementsAttr createDenseElementsAttrFromSize(
   SmallVector<int64_t, 1> values = {inType.getNumElements()};
   auto tensorType = RankedTensorType::get(dims, rewriter.getIntegerType(64));
   return DenseElementsAttr::get(tensorType, ArrayRef(values));
+}
+
+// Create an ONNXConstantOp containing the reciprocal of the given scalar
+// tensor.
+Value createScalarConstantReciprocal(
+    PatternRewriter &rewriter, Location loc, Value value) {
+  auto tensorType = value.getType().cast<ShapedType>();
+  Type elementType = tensorType.getElementType();
+  assert(isa<FloatType>(elementType) && "Only support float for reciprocal");
+  ONNXConstantOp op = dyn_cast<ONNXConstantOp>(value.getDefiningOp());
+  assert(op && "Expect a ONNXConstantOp");
+  double rs = 1.0 / getScalarValue<double>(op);
+  Attribute elmAttr = FloatAttr::get(elementType, rs);
+  auto valueAttr = DenseElementsAttr::get(tensorType, {elmAttr});
+  return OnnxBuilder(rewriter, loc).constant(valueAttr);
 }
 
 /// Check whether a value is produced by a dense ONNXConstantOp.

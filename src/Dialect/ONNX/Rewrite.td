@@ -52,6 +52,10 @@ def createDenseElementsAttrFromShapeResult : NativeCodeCall<
 def createDenseElementsAttrFromSize : NativeCodeCall<
   "onnx_mlir::createDenseElementsAttrFromSize($_builder, $0)">;
 
+// Create an ONNXConstantOp containing the reciprocal of the given scalar tensor. 
+def createScalarConstantReciprocal: NativeCodeCall<
+  "onnx_mlir::createScalarConstantReciprocal($_builder, $_loc, $0)">;
+
 // If '$1' is not NoneType, do subtraction '$1 - $2'.
 // Otherwise, take the negative of '$2'.
 def subtractOrNeg: NativeCodeCall<
@@ -162,7 +166,7 @@ def HaveSameElementTypeBitWidth: Constraint<
           "$1.getType().dyn_cast<ShapedType>().getElementTypeBitWidth())">,
     "has same element type bitwidth">;
 
-def  ElementTypeIsNotUnsigned: Constraint<
+def ElementTypeIsNotUnsigned: Constraint<
     CPred<"!$_self.getType().dyn_cast<ShapedType>().getElementType().isUnsignedInteger()">,
     "element type is not unsigned int">;
 
@@ -192,6 +196,14 @@ def IsFromONNXConstantOpWithDenseElementsAttr: Constraint<
     And<[CPred<" isa<ONNXConstantOp>($_self.getDefiningOp()) ">,
          CPred<" onnx_mlir::getONNXConstantOp($_self).getValueAttr().isa<DenseElementsAttr>() ">
         ]>, "Value is not a ONNXConstantOp with a DenseElementsAttr">;
+
+def IsScalarFloatConstant: Constraint<
+    CPred<"(llvm::dyn_cast_or_null<ONNXConstantOp>($_self.getDefiningOp()) && "
+          " onnx_mlir::hasShapeAndRank($_self) && "
+          " isa<FloatType>($_self.getType().cast<ShapedType>().getElementType()) && "
+          " (($_self.getType().cast<ShapedType>().getRank() == 0) || "
+          "  ($_self.getType().cast<ShapedType>().getShape()[0] == 1)))">,
+    "Is a scalar constant tensor">;
 
 def AreTheSameAxesConstant: Constraint<
     CPred<"onnx_mlir::AreTheSameAxesConstant("
@@ -996,6 +1008,17 @@ def ShapeTransformComposePattern : Pat<
   (ONNXShapeTransformOp (ONNXShapeTransformOp $arg, $map1), $map2),
   (ONNXShapeTransformOp $arg, (GetComposedMap $map2, $map1)),
   []
+>;
+
+//===----------------------------------------------------------------------===//
+// Canonicalization for ONNXDiv
+//===----------------------------------------------------------------------===//
+
+// This is to rewrite `x / s` into `x * (1/s)`  where s is scalar constant.
+def DivByScalarToMul : Pat<
+  (ONNXDivOp $x, $s),
+  (ONNXMulOp $x, (createScalarConstantReciprocal $s)),
+  [(IsScalarFloatConstant:$s)]
 >;
 
 #endif // ONNX_REWRITE

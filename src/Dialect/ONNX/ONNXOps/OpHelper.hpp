@@ -227,6 +227,11 @@ mlir::DenseElementsAttr createDenseElementsAttrFromSize(
 // Create an ArrayAttr from a dense ConstantOp
 mlir::ArrayAttr createArrayAttrFromConstantOp(mlir::ONNXConstantOp constOp);
 
+// Create an ONNXConstantOp containing the reciprocal of the given scalar
+// tensor.
+mlir::Value createScalarConstantReciprocal(
+    mlir::PatternRewriter &rewriter, mlir::Location loc, mlir::Value value);
+
 // Check whether a value is produced by a dense ONNXConstantOp.
 bool isDenseONNXConstant(mlir::Value result);
 
