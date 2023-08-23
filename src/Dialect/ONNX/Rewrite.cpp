@@ -1022,6 +1022,7 @@ void ONNXReshapeOp::getCanonicalizationPatterns(
   result.insert<FuseReshapePattern>(context);
   result.insert<RemoveIdentityReshapePattern>(context);
   result.insert<SwapReshapeMatMulPattern>(context);
+  result.insert<SwapReshapeScalarDivPattern>(context);
 }
 
 /// on the ONNXResizeOp.

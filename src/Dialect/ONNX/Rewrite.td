@@ -121,6 +121,13 @@ class HasRankOf<int rank> :
                    "$0.getType().cast<ShapedType>().hasRank() && "
                    "$0.getType().cast<ShapedType>().getRank() == " # rank>>;
 
+// Check a tensor is scalar or not.
+def IsScalarTensor:
+  Constraint<CPred<"onnx_mlir::hasShapeAndRank($0) && "
+                   "(($0.getType().cast<ShapedType>().getRank() == 0) || "
+                   " ($0.getType().cast<ShapedType>().getRank() == 1 && "
+                   "  $0.getType().cast<ShapedType>().getShape()[0] == 1))">>;
+
 def HaveSameLastDim: Constraint<
   CPred<"onnx_mlir::hasShapeAndRank($0) && onnx_mlir::hasShapeAndRank($1) && "
         "($0.getType().cast<RankedTensorType>().getShape()"
@@ -600,6 +607,14 @@ def SwapReshapeMatMulPattern: Pattern<
   (HaveSameLastDim $A, $res1), // The last dim of A is unchanged by reshape.
   (IsStaticShapeTensor:$res2)  // $res2 has static dims in order to create ReshapeOp.
  ]
+>;
+
+def SwapReshapeScalarDivPattern: Pat<
+ // Push reshape down so that all reshape ops are put together,
+ // then the reshape fusion rule can be applied.
+ (ONNXDivOp (ONNXReshapeOp:$res1 $input, $shape, $az), $scalar),
+ (ONNXReshapeOp (ONNXDivOp $input, $scalar, (returnType $input)), $shape, $az),
+ [(HasOneUse $res1), (IsScalarTensor $scalar)]
 >;
 
 //===----------------------------------------------------------------------===//
