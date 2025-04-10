@@ -639,6 +639,7 @@ void getRewriteONNXForZHighDynamicallyLegal(
 
         // - both inputs are *the same* N-D, N > 3 and there is no broadcasting
         if (aRank > 3 && (aRank == bRank)) {
+          return false; // for testing granite-3.1-2b-instruct.
           bool sameBatchDims = true;
           std::string message = "";
           for (int64_t i = 0; i < aRank - 2; ++i) {

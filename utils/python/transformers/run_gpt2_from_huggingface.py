@@ -51,6 +51,7 @@ config_json_url = f"https://huggingface.co/openai-community/{model_name_or_path}
 
 # Local directories for caching the model.
 cache_dir = "./"
+cache_dir = "/data/granite-3.1-2b-instruct-onnx/quantized"
 decoder_model_path = f"{cache_dir}/{decoder_model_name}"
 decoder_data_path = f"{cache_dir}/{decoder_model_name}_data"
 decoder_with_past_model_path = f"{cache_dir}/{decoder_with_past_model_name}"
@@ -81,13 +82,13 @@ if not os.path.exists(config_json_path):
     urlretrieve(config_json_url, config_json_path)
     print("Done")
 
-with open(config_json_path) as f:
-    cfg = json.load(f)
-    print("Model configuration: {}\n".format(cfg))
-    num_attention_heads = cfg["n_head"]
-    hidden_size = cfg["n_embd"]
-    num_layers = cfg["n_layer"]
-    eos_token_id = cfg["eos_token_id"]
+# with open(config_json_path) as f:
+#     cfg = json.load(f)
+#     print("Model configuration: {}\n".format(cfg))
+#     num_attention_heads = cfg["n_head"]
+#     hidden_size = cfg["n_embd"]
+#     num_layers = cfg["n_layer"]
+#     eos_token_id = cfg["eos_token_id"]
 
 # Create CompileExecutionSession to compile and run the model,
 compile_flags = "-O3 -v --onnx-op-stats TXT"
@@ -105,9 +106,14 @@ decoder_with_past_sess = OMCompileExecutionSession(
 tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, cache_dir=cache_dir)
 
 # Tokenize the input text.
-prompt_text = "Which is the highest mountain in Japan?"
+# prompt_text = "Which is the highest mountain in Japan?"
+# for i in range(70):
+#     prompt_text += " Which is the highest mountain in Japan?"
+# prompt_text = prompt_text[0:2556]
+prompt_text = "What is 84 * 3 / 2?"
 pt_inputs = tokenizer(prompt_text, return_tensors="pt")
-output_length = 13
+output_length = 50
+print("input token: ", pt_inputs["input_ids"].numpy().size)
 
 # Generate tokens.
 ts = []
@@ -135,7 +141,8 @@ for r in range(num_runs):
         attention_mask = np.append(
             attention_mask, np.array([[1]], dtype=np.int64), axis=1
         )
-        inputs = [next_id] + kv_cache + [attention_mask]
+        # inputs = [next_id] + kv_cache + [attention_mask]
+        inputs = [next_id] + [attention_mask] + kv_cache
         output_ids += [next_id[0][0]]
 
     ts += [t]
