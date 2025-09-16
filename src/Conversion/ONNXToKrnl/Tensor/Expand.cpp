@@ -15,6 +15,7 @@
 #include "src/Conversion/ONNXToKrnl/ONNXToKrnlCommon.hpp"
 #include "src/Dialect/Krnl/KrnlHelper.hpp"
 #include "src/Dialect/ONNX/ONNXOps/ShapeHelper.hpp"
+#include "src/Support/SmallVectorHelper.hpp"
 
 using namespace mlir;
 
@@ -63,10 +64,29 @@ struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
     DimsExpr ubs = shapeHelper.getOutputDims();
 
     // Enable parallelism if required.
+    int64_t parId = -1;
     if (enableParallel)
-      tryCreateKrnlParallel(create.krnl, op, "expand", outputLoopDef, lbs, ubs);
+      parId = tryCreateKrnlParallel(
+          create.krnl, op, "expand", outputLoopDef, lbs, ubs);
 
-    create.krnl.iterateIE(outputLoopDef, outputLoopDef, lbs, ubs,
+    SmallVector<Value, 4> optimizedLoopDef = outputLoopDef;
+    // Test for easy unrolling for the innermost store dimension.
+    // const int64_t unroll = 8;
+    // int64_t uDim = outputRank - 1;
+    // if (parId < uDim) {
+    //   int64_t tripCount;
+    //   int64_t u =
+    //       getNoLeftoverUnrollFactor(lbs[uDim], ubs[uDim], unroll, tripCount);
+    //   if (u > 1) {
+    //     ValueRange blockedLoopDef = create.krnl.block(outputLoopDef[uDim], u);
+    //     create.krnl.unroll(blockedLoopDef[1]);
+    //     optimizedLoopDef = firstFew<Value, 4>(outputLoopDef, -2);
+    //     optimizedLoopDef.emplace_back(blockedLoopDef[0]);
+    //     optimizedLoopDef.emplace_back(blockedLoopDef[1]);
+    //   }
+    // }
+
+    create.krnl.iterateIEWithOrigLoop(outputLoopDef, optimizedLoopDef, lbs, ubs,
         [&](const KrnlBuilder &createKrnl, ValueRange outputLoopInd) {
           IndexExprScope outputScope(createKrnl, shapeHelper.getScope());
           SmallVector<IndexExpr, 4> outputLoopIndices, lhsAccessExprs;
