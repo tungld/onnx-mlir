@@ -194,6 +194,13 @@ private:
               srcOffsetIE = srcOffsetIE + srcIndex * SymIE(inStrides[i]);
             }
 
+            // Compute base destination offset for outer dimensions (computed once).
+            IndexExpr destBaseOffsetIE = LitIE(0);
+            for (int64_t i = 0; i < outerRank; ++i) {
+              DimIndexExpr outerIndex(outerIndices[i]);
+              destBaseOffsetIE = destBaseOffsetIE + outerIndex * SymIE(outStrides[i]);
+            }
+
             // Loop over the expanded dimension.
             create.krnl.iterateIE(expandLoopDef, expandLoopDef, expandLbs,
                 expandUbs,
@@ -202,14 +209,11 @@ private:
                       createKrnl);
                   IndexExprScope expandScope(createKrnl);
 
-                  // Compute destination offset from all dimensions.
-                  IndexExpr destOffsetIE = LitIE(0);
-                  for (int64_t i = 0; i < outerRank; ++i) {
-                    DimIndexExpr outerIndex(outerIndices[i]);
-                    destOffsetIE = destOffsetIE + outerIndex * SymIE(outStrides[i]);
-                  }
+                  // Compute destination offset by adding expand dimension contribution.
                   DimIndexExpr expandIndex(expandIndices[0]);
-                  destOffsetIE = destOffsetIE + expandIndex * SymIE(outStrides[expandedDim]);
+                  IndexExpr destOffsetIE =
+                      SymIE(destBaseOffsetIE) +
+                      expandIndex * SymIE(outStrides[expandedDim]);
 
                   // Call memcpy.
                   create.krnl.memcpy(outputMemRef, inputMemRef, elemsToCopyI64,
