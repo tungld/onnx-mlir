@@ -66,7 +66,7 @@ struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
     // This is determined by the annotateONNXOps function using DimAnalysis.
     bool useSingleDimExpand = false;
     int expandedDim = -1;
-    
+
     if (auto attr = expandOp->getAttrOfType<BoolAttr>("single_dim_expand")) {
       useSingleDimExpand = attr.getValue();
       if (useSingleDimExpand) {
@@ -74,9 +74,9 @@ struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
         expandedDim = findExpandedDimension(inputMemRefType, outputMemRefType);
       }
     }
-    
+
     LLVM_DEBUG({
-      llvm::dbgs() << "Expand: useSingleDimExpand = " << useSingleDimExpand 
+      llvm::dbgs() << "Expand: useSingleDimExpand = " << useSingleDimExpand
                    << ", expandedDim = " << expandedDim << "\n";
       llvm::dbgs() << "Input shape: ";
       for (int64_t i = 0; i < inputMemRefType.getRank(); ++i)
@@ -86,7 +86,7 @@ struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
         llvm::dbgs() << outputMemRefType.getShape()[i] << " ";
       llvm::dbgs() << "\n";
     });
-    
+
     if (useSingleDimExpand && expandedDim >= 0) {
       // Use optimized block expansion with memcpy.
       blockExpand(op, input, alloc, expandedDim, &create, enableParallel);
@@ -101,7 +101,7 @@ struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
       // Enable parallelism if required.
       if (enableParallel)
         tryCreateKrnlParallel(
-            create.krnl, op, "expand", outputLoopDef, lbs, ubs);
+            create.krnl, op, "expand", outputLoopDef, lbs, ubs, 0, 2, {}, 4);
 
       create.krnl.iterateIE(outputLoopDef, outputLoopDef, lbs, ubs,
           [&](const KrnlBuilder &createKrnl, ValueRange outputLoopInd) {
@@ -128,7 +128,6 @@ private:
       int expandedDim, MDBuilder *create, bool enableParallel) const {
     Type i64Ty = create->math.getBuilder().getI64Type();
     MemRefType inMemRefType = mlir::cast<MemRefType>(inputMemRef.getType());
-    MemRefType outMemRefType = mlir::cast<MemRefType>(outputMemRef.getType());
     int64_t rank = inMemRefType.getRank();
 
     // Input and output upper bounds.
@@ -142,8 +141,9 @@ private:
     IndexExpr elemsToCopy = LitIE(1);
     for (int64_t i = expandedDim + 1; i < rank; ++i)
       elemsToCopy = elemsToCopy * inUBs[i];
-    
-    // Convert to i64 for memcpy - this handles both static and dynamic dimensions.
+
+    // Convert to i64 for memcpy - this handles both static and dynamic
+    // dimensions.
     Value elemsToCopyI64 = create->math.cast(i64Ty, elemsToCopy.getValue());
 
     // Compute strides for input and output.
@@ -173,7 +173,7 @@ private:
 
     if (enableParallel && outerRank > 0) {
       tryCreateKrnlParallel(create->krnl, op, "block expand", outerLoopDef,
-          outerLbs, outerUbs, 0, 2, {}, 8);
+          outerLbs, outerUbs, 0, 2, {}, 4);
     }
 
     // Create a loop for the expanded dimension.
@@ -202,10 +202,14 @@ private:
                       createKrnl);
                   IndexExprScope expandScope(createKrnl);
 
-                  // Compute destination offset.
+                  // Compute destination offset from all dimensions.
+                  IndexExpr destOffsetIE = LitIE(0);
+                  for (int64_t i = 0; i < outerRank; ++i) {
+                    DimIndexExpr outerIndex(outerIndices[i]);
+                    destOffsetIE = destOffsetIE + outerIndex * SymIE(outStrides[i]);
+                  }
                   DimIndexExpr expandIndex(expandIndices[0]);
-                  IndexExpr destOffsetIE =
-                      SymIE(srcOffsetIE) + expandIndex * SymIE(outStrides[expandedDim]);
+                  destOffsetIE = destOffsetIE + expandIndex * SymIE(outStrides[expandedDim]);
 
                   // Call memcpy.
                   create.krnl.memcpy(outputMemRef, inputMemRef, elemsToCopyI64,
@@ -234,24 +238,24 @@ private:
     }
   }
 
-  // Find which dimension is being expanded (when single_dim_expand attribute is set).
-  // Returns the dimension index, or -1 if not found.
-  int findExpandedDimension(MemRefType inputMemRefType,
-      MemRefType outputMemRefType) const {
+  // Find which dimension is being expanded (when single_dim_expand attribute is
+  // set). Returns the dimension index, or -1 if not found.
+  int findExpandedDimension(
+      MemRefType inputMemRefType, MemRefType outputMemRefType) const {
     int64_t rank = inputMemRefType.getRank();
     ArrayRef<int64_t> inputShape = inputMemRefType.getShape();
     ArrayRef<int64_t> outputShape = outputMemRefType.getShape();
-    
+
     for (int64_t i = 0; i < rank; ++i) {
       int64_t inputSize = inputShape[i];
       int64_t outputSize = outputShape[i];
-      
+
       // Check if this dimension is being expanded (static case).
       if (inputSize >= 0 && outputSize >= 0 && inputSize != outputSize) {
         return i;
       }
     }
-    
+
     return -1;
   }
 
@@ -262,18 +266,18 @@ private:
     int64_t rank = inputMemRefType.getRank();
     ArrayRef<int64_t> inputShape = inputMemRefType.getShape();
     ArrayRef<int64_t> outputShape = outputMemRefType.getShape();
-    
+
     // Count how many dimensions are being expanded.
     int expandedDim = -1;
     int numExpandedDims = 0;
     bool hasUnknownExpansion = false;
-    
+
     // Use the static shape information from the MemRefType.
     // This is more reliable than the shape helper for detecting expansions.
     for (int64_t i = 0; i < rank; ++i) {
       int64_t inputSize = inputShape[i];
       int64_t outputSize = outputShape[i];
-      
+
       // Check if this dimension is being expanded.
       if (inputSize >= 0 && outputSize >= 0) {
         // Both dimensions are static.
@@ -282,21 +286,24 @@ private:
           numExpandedDims++;
         }
       } else if (inputSize == -1 && outputSize == -1) {
-        // Both are dynamic - assume they represent the same dimension (no expansion).
-        // This is the common case where a dynamic dimension is preserved.
+        // Both are dynamic - assume they represent the same dimension (no
+        // expansion). This is the common case where a dynamic dimension is
+        // preserved.
         continue;
       } else {
-        // One is static, one is dynamic - this is unusual and we can't optimize.
+        // One is static, one is dynamic - this is unusual and we can't
+        // optimize.
         hasUnknownExpansion = true;
       }
     }
-    
-    // Only optimize if we have exactly one expanded dimension and no unknown expansions.
-    // Dynamic dimensions that are the same in input and output are allowed.
+
+    // Only optimize if we have exactly one expanded dimension and no unknown
+    // expansions. Dynamic dimensions that are the same in input and output are
+    // allowed.
     if (numExpandedDims == 1 && !hasUnknownExpansion) {
       return expandedDim;
     }
-    
+
     return -1;
   }
 };
