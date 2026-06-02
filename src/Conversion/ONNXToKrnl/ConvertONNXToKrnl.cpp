@@ -273,7 +273,7 @@ void populateONNXToKrnlConversionPattern(RewritePatternSet &patterns,
   populateLoweringONNXResizeOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXNonZeroOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXReverseSequenceOpPattern(patterns, typeConverter, ctx);
-  populateLoweringONNXExpandOpPattern(patterns, typeConverter, ctx, enableParallel);
+  populateLoweringONNXExpandOpPattern(patterns, typeConverter, ctx, dimAnalysis, enableParallel);
   populateLoweringONNXOneHotOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXCompressOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXPrintSignaturePattern(patterns, typeConverter, ctx);
@@ -301,72 +301,6 @@ void populateONNXToKrnlConversionPattern(RewritePatternSet &patterns,
   populateLoweringONNXShapeTransformOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXUpsampleAndPadOpPattern(patterns, typeConverter, ctx, enableParallel);
   // clang-format on
-}
-
-//===----------------------------------------------------------------------===//
-// Helper functions to annotate ONNX operations with optimization hints.
-//===----------------------------------------------------------------------===//
-
-// Annotate ONNXExpandOp with single_dim_expand attribute if applicable.
-static void annotateExpandOp(ONNXExpandOp expandOp, DimAnalysis *dimAnalysis) {
-  // Get input and output types.
-  Value input = expandOp.getInput();
-  Value output = expandOp.getOutput();
-  auto inputType = mlir::dyn_cast<ShapedType>(input.getType());
-  auto outputType = mlir::dyn_cast<ShapedType>(output.getType());
-  
-  if (!inputType || !outputType || !inputType.hasRank() || !outputType.hasRank())
-    return;
-  
-  int64_t rank = inputType.getRank();
-  if (rank != outputType.getRank())
-    return;
-  
-  // Count dimensions that are being expanded.
-  int numExpandedDims = 0;
-  bool hasUnknownExpansion = false;
-  
-  for (int64_t i = 0; i < rank; ++i) {
-    int64_t inputSize = inputType.getDimSize(i);
-    int64_t outputSize = outputType.getDimSize(i);
-    
-    if (inputSize >= 0 && outputSize >= 0) {
-      // Both dimensions are static.
-      if (inputSize != outputSize) {
-        numExpandedDims++;
-      }
-    } else if (inputSize == ShapedType::kDynamic && outputSize == ShapedType::kDynamic) {
-      // Both are dynamic - check if they represent the same dimension using DimAnalysis.
-      if (!dimAnalysis->sameDynDim(input, i, output, i)) {
-        // Dynamic dimensions are different - this is an expansion.
-        numExpandedDims++;
-      }
-    } else {
-      // One is static, one is dynamic - this is unusual and we can't optimize.
-      hasUnknownExpansion = true;
-    }
-  }
-  
-  // Add attribute if we have exactly one expanded dimension and no unknown expansions.
-  if (numExpandedDims == 1 && !hasUnknownExpansion) {
-    OpBuilder builder(expandOp.getContext());
-    expandOp->setAttr("single_dim_expand", builder.getBoolAttr(true));
-  }
-}
-
-// Function to annotate ONNX operations with optimization hints.
-static void annotateONNXOps(ModuleOp module, DimAnalysis *dimAnalysis) {
-  module.walk([&](Operation *op) {
-    // Annotate ONNXExpandOp operations.
-    if (auto expandOp = dyn_cast<ONNXExpandOp>(op)) {
-      annotateExpandOp(expandOp, dimAnalysis);
-    }
-    // Add annotations for other ONNX operations here.
-    // Example:
-    // else if (auto someOtherOp = dyn_cast<ONNXSomeOtherOp>(op)) {
-    //   annotateSomeOtherOp(someOtherOp, dimAnalysis);
-    // }
-  });
 }
 
 //===----------------------------------------------------------------------===//
@@ -439,9 +373,6 @@ void FrontendToKrnlLoweringPass::runOnOperation() {
   // expressions in index access patterns).
   DimAnalysis *dimAnalysis = new DimAnalysis(module);
   dimAnalysis->analyze();
-
-  // Annotate ONNX operations with optimization hints based on dim analysis.
-  annotateONNXOps(module, dimAnalysis);
 
   // The first thing to define is the conversion target. This will define the
   // final target for this lowering.

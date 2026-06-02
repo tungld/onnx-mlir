@@ -25,11 +25,12 @@ namespace onnx_mlir {
 struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
   using MDBuilder = MultiDialectBuilder<KrnlBuilder, IndexExprBuilderForKrnl,
       MemRefBuilder, MathBuilder>;
+  DimAnalysis *dimAnalysis;
   bool enableParallel = false;
 
-  ONNXExpandOpLowering(
-      TypeConverter &typeConverter, MLIRContext *ctx, bool enableParallel)
-      : OpConversionPattern(typeConverter, ctx) {
+  ONNXExpandOpLowering(TypeConverter &typeConverter, MLIRContext *ctx,
+      DimAnalysis *dimAnalysis, bool enableParallel)
+      : OpConversionPattern(typeConverter, ctx), dimAnalysis(dimAnalysis) {
     this->enableParallel =
         enableParallel &&
         OnnxToKrnlLoweringConfiguration::enableSpecificParallelOps.isEnabled(
@@ -62,17 +63,14 @@ struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
     Value alloc =
         create.mem.alignedAlloc(outputMemRefType, shapeHelper.getOutputDims());
 
-    // Check if we can use block expansion optimization.
-    // This is determined by the annotateONNXOps function using DimAnalysis.
+    // Check if we can use block expansion optimization using DimAnalysis.
     bool useSingleDimExpand = false;
     int expandedDim = -1;
 
-    if (auto attr = expandOp->getAttrOfType<BoolAttr>("single_dim_expand")) {
-      useSingleDimExpand = attr.getValue();
-      if (useSingleDimExpand) {
-        // Find which dimension is being expanded.
-        expandedDim = findExpandedDimension(inputMemRefType, outputMemRefType);
-      }
+    if (dimAnalysis) {
+      expandedDim = singleDimensionExpansion(
+          inputMemRefType, outputMemRefType, input, expandOp.getOutput());
+      useSingleDimExpand = (expandedDim >= 0);
     }
 
     LLVM_DEBUG({
@@ -126,6 +124,7 @@ private:
   // This is used when expansion is along a single dimension.
   void blockExpand(Operation *op, Value inputMemRef, Value outputMemRef,
       int expandedDim, MDBuilder *create, bool enableParallel) const {
+    llvm::outs() << "tung, block expand\n";
     Type i64Ty = create->math.getBuilder().getI64Type();
     MemRefType inMemRefType = mlir::cast<MemRefType>(inputMemRef.getType());
     int64_t rank = inMemRefType.getRank();
@@ -266,10 +265,10 @@ private:
     return -1;
   }
 
-  // Determine if expansion is along a single dimension only.
+  // Determine if expansion is along a single dimension only using DimAnalysis.
   // Returns the dimension index if true, -1 otherwise.
   int singleDimensionExpansion(MemRefType inputMemRefType,
-      MemRefType outputMemRefType, ONNXExpandOpShapeHelper &shapeHelper) const {
+      MemRefType outputMemRefType, Value input, Value output) const {
     int64_t rank = inputMemRefType.getRank();
     ArrayRef<int64_t> inputShape = inputMemRefType.getShape();
     ArrayRef<int64_t> outputShape = outputMemRefType.getShape();
@@ -279,8 +278,6 @@ private:
     int numExpandedDims = 0;
     bool hasUnknownExpansion = false;
 
-    // Use the static shape information from the MemRefType.
-    // This is more reliable than the shape helper for detecting expansions.
     for (int64_t i = 0; i < rank; ++i) {
       int64_t inputSize = inputShape[i];
       int64_t outputSize = outputShape[i];
@@ -292,21 +289,20 @@ private:
           expandedDim = i;
           numExpandedDims++;
         }
-      } else if (inputSize == -1 && outputSize == -1) {
-        // Both are dynamic - assume they represent the same dimension (no
-        // expansion). This is the common case where a dynamic dimension is
-        // preserved.
-        continue;
+      } else if (inputSize == ShapedType::kDynamic && outputSize == ShapedType::kDynamic) {
+        // Both are dynamic - use DimAnalysis to check if they're the same.
+        if (dimAnalysis && !dimAnalysis->sameDynDim(input, i, output, i)) {
+          // Dynamic dimensions are different - this is an expansion.
+          expandedDim = i;
+          numExpandedDims++;
+        }
       } else {
-        // One is static, one is dynamic - this is unusual and we can't
-        // optimize.
+        // One is static, one is dynamic - this is unusual and we can't optimize.
         hasUnknownExpansion = true;
       }
     }
 
-    // Only optimize if we have exactly one expanded dimension and no unknown
-    // expansions. Dynamic dimensions that are the same in input and output are
-    // allowed.
+    // Only optimize if we have exactly one expanded dimension and no unknown expansions.
     if (numExpandedDims == 1 && !hasUnknownExpansion) {
       return expandedDim;
     }
@@ -316,8 +312,10 @@ private:
 };
 
 void populateLoweringONNXExpandOpPattern(RewritePatternSet &patterns,
-    TypeConverter &typeConverter, MLIRContext *ctx, bool enableParallel) {
-  patterns.insert<ONNXExpandOpLowering>(typeConverter, ctx, enableParallel);
+    TypeConverter &typeConverter, MLIRContext *ctx, DimAnalysis *dimAnalysis,
+    bool enableParallel) {
+  patterns.insert<ONNXExpandOpLowering>(
+      typeConverter, ctx, dimAnalysis, enableParallel);
 }
 
 } // namespace onnx_mlir
