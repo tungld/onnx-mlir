@@ -163,69 +163,72 @@ private:
       outStrides[i] = strideIE;
     }
 
-    // Create loops for dimensions before the expanded dimension.
+    // Flatten ALL dimensions up to and including the expanded dimension for maximum parallelism.
     int64_t outerRank = expandedDim;
-    ValueRange outerLoopDef = create->krnl.defineLoops(outerRank);
-    SmallVector<IndexExpr, 4> outerLbs(outerRank, LitIE(0));
-    SmallVector<IndexExpr, 4> outerUbs;
-    for (int64_t i = 0; i < outerRank; ++i)
-      outerUbs.emplace_back(inUBs[i]);
+    
+    // Compute total flattened size (outer dims * expanded dim).
+    IndexExpr totalFlatSize = LitIE(1);
+    for (int64_t i = 0; i < outerRank; ++i) {
+      totalFlatSize = totalFlatSize * inUBs[i];
+    }
+    totalFlatSize = totalFlatSize * outUBs[expandedDim];
 
-    if (enableParallel && outerRank > 0) {
-      tryCreateKrnlParallel(create->krnl, op, "block expand", outerLoopDef,
-          outerLbs, outerUbs, 0, 2, {}, 4);
+    // Create a single flattened loop for ALL dimensions.
+    ValueRange flatLoopDef = create->krnl.defineLoops(1);
+    SmallVector<IndexExpr, 4> flatLbs(1, LitIE(0));
+    SmallVector<IndexExpr, 4> flatUbs(1, totalFlatSize);
+
+    if (enableParallel) {
+      tryCreateKrnlParallel(create->krnl, op, "block expand", flatLoopDef,
+          flatLbs, flatUbs, 0, 2, {}, 4);
     }
 
-    // Create a loop for the expanded dimension.
-    ValueRange expandLoopDef = create->krnl.defineLoops(1);
-    SmallVector<IndexExpr, 4> expandLbs(1, LitIE(0));
-    SmallVector<IndexExpr, 4> expandUbs(1, outUBs[expandedDim]);
-
     if (outerRank > 0) {
-      create->krnl.iterateIE(outerLoopDef, outerLoopDef, outerLbs, outerUbs,
-          [&](const KrnlBuilder &createKrnl, ValueRange outerIndices) {
+      create->krnl.iterateIE(flatLoopDef, flatLoopDef, flatLbs, flatUbs,
+          [&](const KrnlBuilder &createKrnl, ValueRange flatIndices) {
             MultiDialectBuilder<MathBuilder, KrnlBuilder> create(createKrnl);
-            IndexExprScope outerScope(createKrnl);
+            IndexExprScope flatScope(createKrnl);
 
-            // Compute source offset for the outer dimensions.
+            // Decompose flat index into all dimension indices (outer + expanded).
+            DimIndexExpr flatIdx(flatIndices[0]);
+            SmallVector<IndexExpr, 4> allIndices;
+            allIndices.resize(outerRank + 1);
+            IndexExpr remaining = flatIdx;
+            
+            // Decompose from rightmost to leftmost: expanded dim, then outer dims.
+            IndexExpr expandDimSize = SymIE(outUBs[expandedDim]);
+            allIndices[outerRank] = remaining % expandDimSize;
+            remaining = remaining.floorDiv(expandDimSize);
+            
+            for (int64_t i = outerRank - 1; i >= 0; --i) {
+              IndexExpr dimSize = SymIE(inUBs[i]);
+              allIndices[i] = remaining % dimSize;
+              remaining = remaining.floorDiv(dimSize);
+            }
+
+            // Compute source offset (only uses outer dimensions).
             IndexExpr srcOffsetIE = LitIE(0);
             for (int64_t i = 0; i < outerRank; ++i) {
-              DimIndexExpr srcIndex(outerIndices[i]);
-              srcOffsetIE = srcOffsetIE + srcIndex * SymIE(inStrides[i]);
+              srcOffsetIE = srcOffsetIE + allIndices[i] * SymIE(inStrides[i]);
             }
 
-            // Compute base destination offset for outer dimensions (computed once).
-            IndexExpr destBaseOffsetIE = LitIE(0);
+            // Compute destination offset (uses outer + expanded dimension).
+            IndexExpr destOffsetIE = LitIE(0);
             for (int64_t i = 0; i < outerRank; ++i) {
-              DimIndexExpr outerIndex(outerIndices[i]);
-              destBaseOffsetIE = destBaseOffsetIE + outerIndex * SymIE(outStrides[i]);
+              destOffsetIE = destOffsetIE + allIndices[i] * SymIE(outStrides[i]);
             }
+            destOffsetIE = destOffsetIE + allIndices[outerRank] * SymIE(outStrides[expandedDim]);
 
-            // Loop over the expanded dimension.
-            create.krnl.iterateIE(expandLoopDef, expandLoopDef, expandLbs,
-                expandUbs,
-                [&](const KrnlBuilder &createKrnl, ValueRange expandIndices) {
-                  MultiDialectBuilder<MathBuilder, KrnlBuilder> create(
-                      createKrnl);
-                  IndexExprScope expandScope(createKrnl);
-
-                  // Compute destination offset by adding expand dimension contribution.
-                  DimIndexExpr expandIndex(expandIndices[0]);
-                  IndexExpr destOffsetIE =
-                      SymIE(destBaseOffsetIE) +
-                      expandIndex * SymIE(outStrides[expandedDim]);
-
-                  // Call memcpy.
-                  create.krnl.memcpy(outputMemRef, inputMemRef, elemsToCopyI64,
-                      destOffsetIE.getValue(), srcOffsetIE.getValue());
-                });
+            // Call memcpy.
+            create.krnl.memcpy(outputMemRef, inputMemRef, elemsToCopyI64,
+                destOffsetIE.getValue(), srcOffsetIE.getValue());
           });
     } else {
       // No outer dimensions, just loop over the expanded dimension.
       IndexExprScope scope(create->krnl);
       IndexExpr srcOffsetIE = LitIE(0);
 
-      create->krnl.iterateIE(expandLoopDef, expandLoopDef, expandLbs, expandUbs,
+      create->krnl.iterateIE(flatLoopDef, flatLoopDef, flatLbs, flatUbs,
           [&](const KrnlBuilder &createKrnl, ValueRange expandIndices) {
             MultiDialectBuilder<MathBuilder, KrnlBuilder> create(createKrnl);
             IndexExprScope expandScope(createKrnl);
