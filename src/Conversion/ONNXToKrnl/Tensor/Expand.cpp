@@ -68,8 +68,7 @@ struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
     int expandedDim = -1;
 
     if (dimAnalysis) {
-      expandedDim = singleDimensionExpansion(
-          inputMemRefType, outputMemRefType, input, expandOp.getOutput());
+      expandedDim = singleDimensionExpansion(expandOp);
       useSingleDimExpand = (expandedDim >= 0);
     }
 
@@ -124,7 +123,6 @@ private:
   // This is used when expansion is along a single dimension.
   void blockExpand(Operation *op, Value inputMemRef, Value outputMemRef,
       int expandedDim, MDBuilder *create, bool enableParallel) const {
-    llvm::outs() << "tung, block expand\n";
     Type i64Ty = create->math.getBuilder().getI64Type();
     MemRefType inMemRefType = mlir::cast<MemRefType>(inputMemRef.getType());
     int64_t rank = inMemRefType.getRank();
@@ -162,9 +160,10 @@ private:
       outStrides[i] = strideIE;
     }
 
-    // Flatten ALL dimensions up to and including the expanded dimension for maximum parallelism.
+    // Flatten ALL dimensions up to and including the expanded dimension for
+    // maximum parallelism.
     int64_t outerRank = expandedDim;
-    
+
     // Compute total flattened size (outer dims * expanded dim).
     IndexExpr totalFlatSize = LitIE(1);
     for (int64_t i = 0; i < outerRank; ++i) {
@@ -188,17 +187,19 @@ private:
             MultiDialectBuilder<MathBuilder, KrnlBuilder> create(createKrnl);
             IndexExprScope flatScope(createKrnl);
 
-            // Decompose flat index into all dimension indices (outer + expanded).
+            // Decompose flat index into all dimension indices (outer +
+            // expanded).
             DimIndexExpr flatIdx(flatIndices[0]);
             SmallVector<IndexExpr, 4> allIndices;
             allIndices.resize(outerRank + 1);
             IndexExpr remaining = flatIdx;
-            
-            // Decompose from rightmost to leftmost: expanded dim, then outer dims.
+
+            // Decompose from rightmost to leftmost: expanded dim, then outer
+            // dims.
             IndexExpr expandDimSize = SymIE(outUBs[expandedDim]);
             allIndices[outerRank] = remaining % expandDimSize;
             remaining = remaining.floorDiv(expandDimSize);
-            
+
             for (int64_t i = outerRank - 1; i >= 0; --i) {
               IndexExpr dimSize = SymIE(inUBs[i]);
               allIndices[i] = remaining % dimSize;
@@ -214,9 +215,11 @@ private:
             // Compute destination offset (uses outer + expanded dimension).
             IndexExpr destOffsetIE = LitIE(0);
             for (int64_t i = 0; i < outerRank; ++i) {
-              destOffsetIE = destOffsetIE + allIndices[i] * SymIE(outStrides[i]);
+              destOffsetIE =
+                  destOffsetIE + allIndices[i] * SymIE(outStrides[i]);
             }
-            destOffsetIE = destOffsetIE + allIndices[outerRank] * SymIE(outStrides[expandedDim]);
+            destOffsetIE = destOffsetIE + allIndices[outerRank] *
+                                              SymIE(outStrides[expandedDim]);
 
             // Call memcpy.
             create.krnl.memcpy(outputMemRef, inputMemRef, elemsToCopyI64,
@@ -267,11 +270,21 @@ private:
 
   // Determine if expansion is along a single dimension only using DimAnalysis.
   // Returns the dimension index if true, -1 otherwise.
-  int singleDimensionExpansion(MemRefType inputMemRefType,
-      MemRefType outputMemRefType, Value input, Value output) const {
-    int64_t rank = inputMemRefType.getRank();
-    ArrayRef<int64_t> inputShape = inputMemRefType.getShape();
-    ArrayRef<int64_t> outputShape = outputMemRefType.getShape();
+  int singleDimensionExpansion(ONNXExpandOp expandOp) const {
+    Value input = expandOp.getInput();
+    Value output = expandOp.getOutput();
+
+    expandOp.getOperation()->dump();
+
+    Type inputType = input.getType();
+    Type outputType = output.getType();
+    // TODO: check same rank.
+
+    ArrayRef<int64_t> inputShape = getShape(inputType);
+    ArrayRef<int64_t> outputShape = getShape(outputType);
+    if (inputShape.size() != outputShape.size())
+      return -1;
+    int64_t rank = inputShape.size();
 
     // Count how many dimensions are being expanded.
     int expandedDim = -1;
@@ -279,33 +292,37 @@ private:
     bool hasUnknownExpansion = false;
 
     for (int64_t i = 0; i < rank; ++i) {
-      int64_t inputSize = inputShape[i];
-      int64_t outputSize = outputShape[i];
-
       // Check if this dimension is being expanded.
-      if (inputSize >= 0 && outputSize >= 0) {
-        // Both dimensions are static.
-        if (inputSize != outputSize) {
-          expandedDim = i;
-          numExpandedDims++;
-        }
-      } else if (inputSize == ShapedType::kDynamic && outputSize == ShapedType::kDynamic) {
-        // Both are dynamic - use DimAnalysis to check if they're the same.
+      int64_t dimI = inputShape[i];
+      int64_t dimO = outputShape[i];
+
+      // Both are dynamic - use DimAnalysis to check if they're the same.
+      if (dimI == ShapedType::kDynamic && dimO == ShapedType::kDynamic) {
         if (dimAnalysis && !dimAnalysis->sameDynDim(input, i, output, i)) {
           // Dynamic dimensions are different - this is an expansion.
           expandedDim = i;
           numExpandedDims++;
         }
-      } else {
-        // One is static, one is dynamic - this is unusual and we can't optimize.
+        continue;
+      }
+
+      // One is static, one is dynamic - this is unusual and we can't optimize.
+      if (dimI == ShapedType::kDynamic || dimO == ShapedType::kDynamic) {
         hasUnknownExpansion = true;
+        continue;
+      }
+
+      // Both dimensions are static.
+      if (dimI != dimO) {
+        expandedDim = i;
+        numExpandedDims++;
       }
     }
 
-    // Only optimize if we have exactly one expanded dimension and no unknown expansions.
-    if (numExpandedDims == 1 && !hasUnknownExpansion) {
+    // Only optimize if we have exactly one expanded dimension and no unknown
+    // expansions.
+    if (numExpandedDims == 1 && !hasUnknownExpansion)
       return expandedDim;
-    }
 
     return -1;
   }
