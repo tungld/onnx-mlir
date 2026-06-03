@@ -25,11 +25,12 @@ namespace onnx_mlir {
 struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
   using MDBuilder = MultiDialectBuilder<KrnlBuilder, IndexExprBuilderForKrnl,
       MemRefBuilder, MathBuilder>;
+  DimAnalysis *dimAnalysis;
   bool enableParallel = false;
 
-  ONNXExpandOpLowering(
-      TypeConverter &typeConverter, MLIRContext *ctx, bool enableParallel)
-      : OpConversionPattern(typeConverter, ctx) {
+  ONNXExpandOpLowering(TypeConverter &typeConverter, MLIRContext *ctx,
+      DimAnalysis *dimAnalysis, bool enableParallel)
+      : OpConversionPattern(typeConverter, ctx), dimAnalysis(dimAnalysis) {
     this->enableParallel =
         enableParallel &&
         OnnxToKrnlLoweringConfiguration::enableSpecificParallelOps.isEnabled(
@@ -62,17 +63,13 @@ struct ONNXExpandOpLowering : public OpConversionPattern<ONNXExpandOp> {
     Value alloc =
         create.mem.alignedAlloc(outputMemRefType, shapeHelper.getOutputDims());
 
-    // Check if we can use block expansion optimization.
-    // This is determined by the annotateONNXOps function using DimAnalysis.
+    // Check if we can use block expansion optimization using DimAnalysis.
     bool useSingleDimExpand = false;
     int expandedDim = -1;
 
-    if (auto attr = expandOp->getAttrOfType<BoolAttr>("single_dim_expand")) {
-      useSingleDimExpand = attr.getValue();
-      if (useSingleDimExpand) {
-        // Find which dimension is being expanded.
-        expandedDim = findExpandedDimension(inputMemRefType, outputMemRefType);
-      }
+    if (dimAnalysis) {
+      expandedDim = singleDimensionExpansion(expandOp);
+      useSingleDimExpand = (expandedDim >= 0);
     }
 
     LLVM_DEBUG({
@@ -163,69 +160,77 @@ private:
       outStrides[i] = strideIE;
     }
 
-    // Create loops for dimensions before the expanded dimension.
+    // Flatten ALL dimensions up to and including the expanded dimension for
+    // maximum parallelism.
     int64_t outerRank = expandedDim;
-    ValueRange outerLoopDef = create->krnl.defineLoops(outerRank);
-    SmallVector<IndexExpr, 4> outerLbs(outerRank, LitIE(0));
-    SmallVector<IndexExpr, 4> outerUbs;
-    for (int64_t i = 0; i < outerRank; ++i)
-      outerUbs.emplace_back(inUBs[i]);
 
-    if (enableParallel && outerRank > 0) {
-      tryCreateKrnlParallel(create->krnl, op, "block expand", outerLoopDef,
-          outerLbs, outerUbs, 0, 2, {}, 4);
+    // Compute total flattened size (outer dims * expanded dim).
+    IndexExpr totalFlatSize = LitIE(1);
+    for (int64_t i = 0; i < outerRank; ++i) {
+      totalFlatSize = totalFlatSize * inUBs[i];
+    }
+    totalFlatSize = totalFlatSize * outUBs[expandedDim];
+
+    // Create a single flattened loop for ALL dimensions.
+    ValueRange flatLoopDef = create->krnl.defineLoops(1);
+    SmallVector<IndexExpr, 4> flatLbs(1, LitIE(0));
+    SmallVector<IndexExpr, 4> flatUbs(1, totalFlatSize);
+
+    if (enableParallel) {
+      tryCreateKrnlParallel(create->krnl, op, "block expand", flatLoopDef,
+          flatLbs, flatUbs, 0, 2, {}, 4);
     }
 
-    // Create a loop for the expanded dimension.
-    ValueRange expandLoopDef = create->krnl.defineLoops(1);
-    SmallVector<IndexExpr, 4> expandLbs(1, LitIE(0));
-    SmallVector<IndexExpr, 4> expandUbs(1, outUBs[expandedDim]);
-
     if (outerRank > 0) {
-      create->krnl.iterateIE(outerLoopDef, outerLoopDef, outerLbs, outerUbs,
-          [&](const KrnlBuilder &createKrnl, ValueRange outerIndices) {
+      create->krnl.iterateIE(flatLoopDef, flatLoopDef, flatLbs, flatUbs,
+          [&](const KrnlBuilder &createKrnl, ValueRange flatIndices) {
             MultiDialectBuilder<MathBuilder, KrnlBuilder> create(createKrnl);
-            IndexExprScope outerScope(createKrnl);
+            IndexExprScope flatScope(createKrnl);
 
-            // Compute source offset for the outer dimensions.
+            // Decompose flat index into all dimension indices (outer +
+            // expanded).
+            DimIndexExpr flatIdx(flatIndices[0]);
+            SmallVector<IndexExpr, 4> allIndices;
+            allIndices.resize(outerRank + 1);
+            IndexExpr remaining = flatIdx;
+
+            // Decompose from rightmost to leftmost: expanded dim, then outer
+            // dims.
+            IndexExpr expandDimSize = SymIE(outUBs[expandedDim]);
+            allIndices[outerRank] = remaining % expandDimSize;
+            remaining = remaining.floorDiv(expandDimSize);
+
+            for (int64_t i = outerRank - 1; i >= 0; --i) {
+              IndexExpr dimSize = SymIE(inUBs[i]);
+              allIndices[i] = remaining % dimSize;
+              remaining = remaining.floorDiv(dimSize);
+            }
+
+            // Compute source offset (only uses outer dimensions).
             IndexExpr srcOffsetIE = LitIE(0);
             for (int64_t i = 0; i < outerRank; ++i) {
-              DimIndexExpr srcIndex(outerIndices[i]);
-              srcOffsetIE = srcOffsetIE + srcIndex * SymIE(inStrides[i]);
+              srcOffsetIE = srcOffsetIE + allIndices[i] * SymIE(inStrides[i]);
             }
 
-            // Compute base destination offset for outer dimensions (computed once).
-            IndexExpr destBaseOffsetIE = LitIE(0);
+            // Compute destination offset (uses outer + expanded dimension).
+            IndexExpr destOffsetIE = LitIE(0);
             for (int64_t i = 0; i < outerRank; ++i) {
-              DimIndexExpr outerIndex(outerIndices[i]);
-              destBaseOffsetIE = destBaseOffsetIE + outerIndex * SymIE(outStrides[i]);
+              destOffsetIE =
+                  destOffsetIE + allIndices[i] * SymIE(outStrides[i]);
             }
+            destOffsetIE = destOffsetIE + allIndices[outerRank] *
+                                              SymIE(outStrides[expandedDim]);
 
-            // Loop over the expanded dimension.
-            create.krnl.iterateIE(expandLoopDef, expandLoopDef, expandLbs,
-                expandUbs,
-                [&](const KrnlBuilder &createKrnl, ValueRange expandIndices) {
-                  MultiDialectBuilder<MathBuilder, KrnlBuilder> create(
-                      createKrnl);
-                  IndexExprScope expandScope(createKrnl);
-
-                  // Compute destination offset by adding expand dimension contribution.
-                  DimIndexExpr expandIndex(expandIndices[0]);
-                  IndexExpr destOffsetIE =
-                      SymIE(destBaseOffsetIE) +
-                      expandIndex * SymIE(outStrides[expandedDim]);
-
-                  // Call memcpy.
-                  create.krnl.memcpy(outputMemRef, inputMemRef, elemsToCopyI64,
-                      destOffsetIE.getValue(), srcOffsetIE.getValue());
-                });
+            // Call memcpy.
+            create.krnl.memcpy(outputMemRef, inputMemRef, elemsToCopyI64,
+                destOffsetIE.getValue(), srcOffsetIE.getValue());
           });
     } else {
       // No outer dimensions, just loop over the expanded dimension.
       IndexExprScope scope(create->krnl);
       IndexExpr srcOffsetIE = LitIE(0);
 
-      create->krnl.iterateIE(expandLoopDef, expandLoopDef, expandLbs, expandUbs,
+      create->krnl.iterateIE(flatLoopDef, flatLoopDef, flatLbs, flatUbs,
           [&](const KrnlBuilder &createKrnl, ValueRange expandIndices) {
             MultiDialectBuilder<MathBuilder, KrnlBuilder> create(createKrnl);
             IndexExprScope expandScope(createKrnl);
@@ -263,58 +268,71 @@ private:
     return -1;
   }
 
-  // Determine if expansion is along a single dimension only.
+  // Determine if expansion is along a single dimension only using DimAnalysis.
   // Returns the dimension index if true, -1 otherwise.
-  int singleDimensionExpansion(MemRefType inputMemRefType,
-      MemRefType outputMemRefType, ONNXExpandOpShapeHelper &shapeHelper) const {
-    int64_t rank = inputMemRefType.getRank();
-    ArrayRef<int64_t> inputShape = inputMemRefType.getShape();
-    ArrayRef<int64_t> outputShape = outputMemRefType.getShape();
+  int singleDimensionExpansion(ONNXExpandOp expandOp) const {
+    Value input = expandOp.getInput();
+    Value output = expandOp.getOutput();
+
+    expandOp.getOperation()->dump();
+
+    Type inputType = input.getType();
+    Type outputType = output.getType();
+    // TODO: check same rank.
+
+    ArrayRef<int64_t> inputShape = getShape(inputType);
+    ArrayRef<int64_t> outputShape = getShape(outputType);
+    if (inputShape.size() != outputShape.size())
+      return -1;
+    int64_t rank = inputShape.size();
 
     // Count how many dimensions are being expanded.
     int expandedDim = -1;
     int numExpandedDims = 0;
     bool hasUnknownExpansion = false;
 
-    // Use the static shape information from the MemRefType.
-    // This is more reliable than the shape helper for detecting expansions.
     for (int64_t i = 0; i < rank; ++i) {
-      int64_t inputSize = inputShape[i];
-      int64_t outputSize = outputShape[i];
-
       // Check if this dimension is being expanded.
-      if (inputSize >= 0 && outputSize >= 0) {
-        // Both dimensions are static.
-        if (inputSize != outputSize) {
+      int64_t dimI = inputShape[i];
+      int64_t dimO = outputShape[i];
+
+      // Both are dynamic - use DimAnalysis to check if they're the same.
+      if (dimI == ShapedType::kDynamic && dimO == ShapedType::kDynamic) {
+        if (dimAnalysis && !dimAnalysis->sameDynDim(input, i, output, i)) {
+          // Dynamic dimensions are different - this is an expansion.
           expandedDim = i;
           numExpandedDims++;
         }
-      } else if (inputSize == -1 && outputSize == -1) {
-        // Both are dynamic - assume they represent the same dimension (no
-        // expansion). This is the common case where a dynamic dimension is
-        // preserved.
         continue;
-      } else {
-        // One is static, one is dynamic - this is unusual and we can't
-        // optimize.
+      }
+
+      // One is static, one is dynamic - this is unusual and we can't optimize.
+      if (dimI == ShapedType::kDynamic || dimO == ShapedType::kDynamic) {
         hasUnknownExpansion = true;
+        continue;
+      }
+
+      // Both dimensions are static.
+      if (dimI != dimO) {
+        expandedDim = i;
+        numExpandedDims++;
       }
     }
 
     // Only optimize if we have exactly one expanded dimension and no unknown
-    // expansions. Dynamic dimensions that are the same in input and output are
-    // allowed.
-    if (numExpandedDims == 1 && !hasUnknownExpansion) {
+    // expansions.
+    if (numExpandedDims == 1 && !hasUnknownExpansion)
       return expandedDim;
-    }
 
     return -1;
   }
 };
 
 void populateLoweringONNXExpandOpPattern(RewritePatternSet &patterns,
-    TypeConverter &typeConverter, MLIRContext *ctx, bool enableParallel) {
-  patterns.insert<ONNXExpandOpLowering>(typeConverter, ctx, enableParallel);
+    TypeConverter &typeConverter, MLIRContext *ctx, DimAnalysis *dimAnalysis,
+    bool enableParallel) {
+  patterns.insert<ONNXExpandOpLowering>(
+      typeConverter, ctx, dimAnalysis, enableParallel);
 }
 
 } // namespace onnx_mlir
