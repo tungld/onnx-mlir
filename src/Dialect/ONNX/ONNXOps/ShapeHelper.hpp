@@ -998,6 +998,21 @@ protected:
      ONNXUnsqueezeOp unsqueezeOp = mlir::dyn_cast<ONNXUnsqueezeOp>(op);
      SaveOnnxConstInOp(op, unsqueezeOp.axesMutable(), unsqueezedAxes);
 */
+
+//===----------------------------------------------------------------------===//
+// ConcatUnsqueezeExpandForKVCache Op
+//===----------------------------------------------------------------------===//
+
+struct ONNXConcatUnsqueezeExpandForKVCacheOpShapeHelper : public ONNXOpShapeHelper {
+  ONNXConcatUnsqueezeExpandForKVCacheOpShapeHelper(mlir::Operation *op,
+      mlir::ValueRange operands, IndexExprBuilder *ieBuilder = nullptr,
+      IndexExprScope *scope = nullptr)
+      : ONNXOpShapeHelper(op, operands, ieBuilder, scope) {}
+  virtual ~ONNXConcatUnsqueezeExpandForKVCacheOpShapeHelper() {}
+  mlir::LogicalResult computeShape() final;
+};
+
+
 void SaveOnnxConstInOp(mlir::Operation *op, mlir::MutableOperandRange operand,
     const llvm::SmallVectorImpl<int64_t> &vals);
 

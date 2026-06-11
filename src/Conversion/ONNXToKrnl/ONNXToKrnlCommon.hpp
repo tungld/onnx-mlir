@@ -481,6 +481,8 @@ void populateLoweringONNXConcatOpPattern(mlir::RewritePatternSet &,
     mlir::TypeConverter &, mlir::MLIRContext *, bool enableParallel);
 void populateLoweringONNXConcatShapeTransposeOpPattern(
     mlir::RewritePatternSet &, mlir::TypeConverter &, mlir::MLIRContext *);
+void populateLoweringONNXConcatUnsqueezeExpandForKVCacheOpPattern(
+    mlir::RewritePatternSet &, mlir::TypeConverter &, mlir::MLIRContext *, bool enableParallel);
 void populateLoweringONNXDepthToSpaceOpPattern(
     mlir::RewritePatternSet &, mlir::TypeConverter &, mlir::MLIRContext *);
 void populateLoweringONNXSpaceToDepthOpPattern(

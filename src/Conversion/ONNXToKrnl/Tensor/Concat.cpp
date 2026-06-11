@@ -64,13 +64,17 @@ struct ONNXConcatOpLowering : public OpConversionPattern<ONNXConcatOp> {
         outputMemRefType, shapeHelper.getOutputDims(), alignment);
 
     // Determine if using block copy is benifical.
-    bool useBlockCopy = true;
+    bool useBlockCopy = false;
+
+    // Concat of scalar tensors: use element-wise concat.
+    if (isScalarValue(operands[0]))
+      useBlockCopy = false;
 
     if (useBlockCopy) {
       genBlockConcat(
           create, concatOp, operands, shapeHelper, alloc, enableParallel);
     } else {
-      genScalarConcat(
+      genElementwiseConcat(
           create, concatOp, operands, shapeHelper, alloc, enableParallel);
     }
 
@@ -80,7 +84,7 @@ struct ONNXConcatOpLowering : public OpConversionPattern<ONNXConcatOp> {
   }
 
 private:
-  void genScalarConcat(MDBuilder &create, ONNXConcatOp concatOp,
+  void genElementwiseConcat(MDBuilder &create, ONNXConcatOp concatOp,
       ValueRange operands, ONNXConcatOpShapeHelper &shapeHelper, Value alloc,
       bool enableParallel) const {
     Operation *op = concatOp.getOperation();
@@ -175,46 +179,69 @@ private:
     }
     Value bsOut = bsOutIE.getValue();
 
-    // Creates loops for the outer dimensions before axis.
-    SmallVector<IndexExpr, 4> ubs;
-    for (unsigned int r = 0; r < axis; ++r) {
-      ubs.emplace_back(outputDims[r]);
+    if (axis == 0) {
+      // Copy the whole input tensors to the output.
+      Value outOffset = create.math.constantIndex(0);
+      for (unsigned int i = 0; i < inputNum; ++i) {
+        // Copy data.
+        Value inOffset = create.math.constantIndex(0);
+        Value blockSizeI64 = create.math.cast(
+            create.krnl.getBuilder().getI64Type(), blockSizes[i]);
+        create.krnl.memcpy(
+            alloc, operands[i], blockSizeI64, outOffset, inOffset);
+        // Update output offset.
+        outOffset = create.math.add(outOffset, blockSizes[i]);
+      }
+    } else {
+      // Creates loops for the outer dimensions before axis.
+      SmallVector<IndexExpr, 4> ubs;
+      for (unsigned int r = 0; r < axis; ++r) {
+        ubs.emplace_back(outputDims[r]);
+      }
+      SmallVector<IndexExpr, 4> lbs(axis, LitIE(0));
+      ValueRange loopDef = create.krnl.defineLoops(axis);
+
+      // Enable parallelism if required. Do not parallel on the axis dimension.
+      if (enableParallel)
+        tryCreateKrnlParallel(
+            create.krnl, op, "concat", loopDef, lbs, ubs, 0, axis, {axis});
+
+      // Loop body.
+      create.krnl.iterateIE(loopDef, loopDef, lbs, ubs,
+          [&](const KrnlBuilder &createKrnl, ValueRange loopInd) {
+            MathBuilder createMath(createKrnl);
+            // Compute the linear index from loop indices.
+            // For indices [i0, i1, i2, ...] and dimensions [d0, d1, d2, ...],
+            // linear_index = i0 * (d1 * d2 * ...) + i1 * (d2 * ...) + ...
+            Value linearIndex = createMath.constantIndex(0);
+            for (unsigned int r = 0; r < loopInd.size(); ++r) {
+              // Compute stride for dimension r.
+              IndexExpr stride = LitIE(1);
+              for (unsigned int s = r + 1; s < axis; ++s) {
+                stride = stride * outputDims[s];
+              }
+              Value strideVal = stride.getValue();
+              Value term = createMath.mul(loopInd[r], strideVal);
+              linearIndex = createMath.add(linearIndex, term);
+            }
+
+            // Compute write offset.
+            Value outOffset = createMath.mul(linearIndex, bsOut);
+
+            // Copy data from each input to the output.
+            for (unsigned int i = 0; i < inputNum; ++i) {
+              // Compute read offset.
+              Value inOffset = createMath.mul(linearIndex, blockSizes[i]);
+              // Copy data.
+              Value blockSizeI64 = createMath.cast(
+                  createKrnl.getBuilder().getI64Type(), blockSizes[i]);
+              createKrnl.memcpy(
+                  alloc, operands[i], blockSizeI64, outOffset, inOffset);
+              // Update output offset.
+              outOffset = createMath.add(outOffset, blockSizes[i]);
+            }
+          });
     }
-    SmallVector<IndexExpr, 4> lbs(axis, LitIE(0));
-    ValueRange loopDef = create.krnl.defineLoops(axis);
-
-    // Enable parallelism if required. Do not parallel on the axis dimension.
-    if (enableParallel)
-      tryCreateKrnlParallel(
-          create.krnl, op, "concat", loopDef, lbs, ubs, 0, axis, {axis});
-
-    // Loop body.
-    create.krnl.iterateIE(loopDef, loopDef, lbs, ubs,
-        [&](const KrnlBuilder &createKrnl, ValueRange loopInd) {
-          MathBuilder createMath(createKrnl);
-          // Common factor.
-          Value factor = loopInd[0];
-          for (unsigned int i = 1; i < loopInd.size(); ++i) {
-            factor = createMath.mul(factor, loopInd[i]);
-          }
-
-          // Compute write offset.
-          Value outOffset = createMath.mul(factor, bsOut);
-
-          // Copy data from each input to the output.
-          SmallVector<Value, 4> readIndices, writeIndices;
-          for (unsigned int i = 0; i < inputNum; ++i) {
-            // Compute read offset.
-            Value inOffset = createMath.mul(factor, blockSizes[i]);
-            // Copy data.
-            Value blockSizeI64 = createMath.cast(
-                createKrnl.getBuilder().getI64Type(), blockSizes[i]);
-            createKrnl.memcpy(
-                alloc, operands[i], blockSizeI64, outOffset, inOffset);
-            // Update output offset.
-            outOffset = createMath.add(outOffset, blockSizes[i]);
-          }
-        });
   }
 };
 

@@ -255,6 +255,8 @@ void populateONNXToKrnlConversionPattern(RewritePatternSet &patterns,
   populateLoweringONNXConstantOfShapeOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXConstantOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXConcatOpPattern(patterns, typeConverter, ctx, enableParallel);
+  populateLoweringONNXConcatUnsqueezeExpandForKVCacheOpPattern(patterns, typeConverter, ctx, enableParallel);
+
   populateLoweringONNXConcatShapeTransposeOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXDepthToSpaceOpPattern(patterns, typeConverter, ctx);
   populateLoweringONNXScatterElementsOpPattern(patterns, typeConverter, ctx);

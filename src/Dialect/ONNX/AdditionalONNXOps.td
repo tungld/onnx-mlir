@@ -798,3 +798,92 @@ def ONNXIm2ColOp: ONNX_Op<"Im2Col",
 }
 
 
+
+
+//===----------------------------------------------------------------------===//
+// ONNXConcatUnsqueezeExpandForKVCacheOp
+def ONNXConcatUnsqueezeExpandForKVCacheOp: ONNX_Op<"ConcatUnsqueezeExpandForKVCache",
+    [Pure, DeclareOpInterfaceMethods<ShapeInferenceOpInterface>,
+     DeclareOpInterfaceMethods<ShapeHelperOpInterface>]> {
+  let summary = "ONNX fused Concat-Unsqueeze-Expand operation";
+  let description = [{
+    This operation fuses the sequence of Concat, Unsqueeze, and Expand operations
+    into a single efficient operation.
+    
+    Given inputs A and B, this operation performs:
+    1. Concat(A, B) along axis
+    2. Unsqueeze the result at the same axis
+    3. Expand the unsqueezed dimension to size 'repeat'
+    
+    Example:
+    ```
+    A: [N, H, S, D]
+    B: [N, H, 1, D]
+    
+    Y = Concat(A, B, axis=2)           // [N, H, S+1, D]
+    Z = Unsqueeze(Y, axes=[2])         // [N, H, 1, S+1, D]
+    Out = Expand(Z, shape=[N,H,R,S+1,D]) // [N, H, R, S+1, D]
+    ```
+    
+    The operation is semantically equivalent to:
+    ```
+    for n in range(N):
+      for h in range(H):
+        for r in range(R):
+          for s in range(S+1):
+            for d in range(D):
+              out[n,h,r,s,d] = A[n,h,s,d] if s < S else B[n,h,0,d]
+    ```
+    
+    Attributes:
+    - axis: The axis along which to concatenate A and B, and where to insert the new dimension.
+    - repeat: The size of the expanded dimension.
+    
+    Constraints:
+    - axis must be valid for the input shapes.
+    - B must have size 1 along axis.
+    - repeat must be positive.
+    
+    This operation is not part of the standard and was added to assist onnx-mlir.
+  }];
+
+  let arguments = (ins 
+    AnyTypeOf<[TensorOf<[UI8]>, TensorOf<[UI16]>, TensorOf<[UI32]>,
+               TensorOf<[UI64]>, TensorOf<[I8]>, TensorOf<[I16]>,
+               TensorOf<[I32]>, TensorOf<[I64]>, TensorOf<[BF16]>,
+               TensorOf<[F16]>, TensorOf<[F32]>, TensorOf<[F64]>]>:$A,
+    AnyTypeOf<[TensorOf<[UI8]>, TensorOf<[UI16]>, TensorOf<[UI32]>,
+               TensorOf<[UI64]>, TensorOf<[I8]>, TensorOf<[I16]>,
+               TensorOf<[I32]>, TensorOf<[I64]>, TensorOf<[BF16]>,
+               TensorOf<[F16]>, TensorOf<[F32]>, TensorOf<[F64]>]>:$B,
+    SI64Attr:$axis,
+    SI64Attr:$repeat
+  );
+  
+  let results = (outs 
+    AnyTypeOf<[TensorOf<[UI8]>, TensorOf<[UI16]>, TensorOf<[UI32]>,
+               TensorOf<[UI64]>, TensorOf<[I8]>, TensorOf<[I16]>,
+               TensorOf<[I32]>, TensorOf<[I64]>, TensorOf<[BF16]>,
+               TensorOf<[F16]>, TensorOf<[F32]>, TensorOf<[F64]>]>:$output
+  );
+
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    static int getNumberOfOperands() { return 2; }
+    static int getNumberOfResults() { return 1; }
+    static std::vector<int> getTypeMap() { return {30}; }
+  }];
+
+  let extraClassDefinition = [{
+    onnx_mlir::ONNXOpShapeHelper * ONNXConcatUnsqueezeExpandForKVCacheOp::getShapeHelper(
+        mlir::Operation *op, mlir::ArrayRef<mlir::Value> oper,
+        onnx_mlir::IndexExprBuilder *ieb, onnx_mlir::IndexExprScope *scope) {
+      onnx_mlir::ONNXOpShapeHelper *sh = 
+          new onnx_mlir::ONNXConcatUnsqueezeExpandForKVCacheOpShapeHelper(op, oper, ieb, scope);
+      assert(sh && "Failed to allocate shape helper.");
+      return sh;
+    }
+  }];
+}
+
