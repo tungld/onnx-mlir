@@ -685,3 +685,146 @@ func.func @test_replace_sub_zero_expand(%arg0: tensor<2x4xf32>, %arg1: tensor<?x
 // CHECK:           return [[PARAM_0_]] : tensor<2x4xf32>
 // CHECK:         }
 }
+
+
+
+// -----
+
+// COM: Test basic 4D Add to 3D transformation
+// COM: Pattern: Reshape(3D->4D) -> Add -> Reshape(4D->3D)
+// COM: Should be rewritten to: Add on 3D tensors
+
+func.func @test_rewrite_4d_add_to_3d(%arg0: tensor<2x3x4xf32>, %arg1: tensor<2x3x4xf32>) -> tensor<2x3x4xf32> {
+  %shape_4d = "onnx.Constant"() {value = dense<[2, 3, 4, 1]> : tensor<4xi64>} : () -> tensor<4xi64>
+  %shape_3d = "onnx.Constant"() {value = dense<[2, 3, 4]> : tensor<3xi64>} : () -> tensor<3xi64>
+  
+  %0 = "onnx.Reshape"(%arg0, %shape_4d) : (tensor<2x3x4xf32>, tensor<4xi64>) -> tensor<2x3x4x1xf32>
+  %1 = "onnx.Reshape"(%arg1, %shape_4d) : (tensor<2x3x4xf32>, tensor<4xi64>) -> tensor<2x3x4x1xf32>
+  %2 = "onnx.Add"(%0, %1) : (tensor<2x3x4x1xf32>, tensor<2x3x4x1xf32>) -> tensor<2x3x4x1xf32>
+  %3 = "onnx.Reshape"(%2, %shape_3d) : (tensor<2x3x4x1xf32>, tensor<3xi64>) -> tensor<2x3x4xf32>
+  
+  return %3 : tensor<2x3x4xf32>
+}
+  
+// CHECK-LABEL: func.func @test_rewrite_4d_add_to_3d
+  // CHECK-SAME: (%[[ARG0:.*]]: tensor<2x3x4xf32>, %[[ARG1:.*]]: tensor<2x3x4xf32>) -> tensor<2x3x4xf32>
+  // CHECK: %[[ADD:.*]] = "onnx.Add"(%[[ARG0]], %[[ARG1]])
+  // CHECK: return %[[ADD]]
+
+
+// -----
+
+// COM: Test 4D Add to 3D transformation with fully dynamic dimensions
+// COM: Pattern matches real BERT model: Reshape(3D->4D) -> Add -> Reshape(4D->3D)
+// COM: Shape tensors are computed dynamically using Dim/Concat operations
+
+func.func @test_rewrite_4d_add_to_3d_dynamic(%arg0: tensor<?x?x?xf32>, %arg1: tensor<?x12x?x?xf32>) -> tensor<?x?x?xf32> {
+  %c_1 = onnx.Constant dense<-1> : tensor<1xi64>
+  
+  // Extract dimensions from arg1 (which is already 4D)
+  %dim0 = "onnx.Dim"(%arg1) <{axis = 0 : si64}> : (tensor<?x12x?x?xf32>) -> tensor<1xi64>
+  %dim1 = "onnx.Dim"(%arg1) <{axis = 1 : si64}> : (tensor<?x12x?x?xf32>) -> tensor<1xi64>
+  %dim2 = "onnx.Dim"(%arg1) <{axis = 2 : si64}> : (tensor<?x12x?x?xf32>) -> tensor<1xi64>
+  %dim3 = "onnx.Dim"(%arg1) <{axis = 3 : si64}> : (tensor<?x12x?x?xf32>) -> tensor<1xi64>
+  
+  // Build 4D shape: [dim0, dim1, dim2, dim3]
+  %shape_4d = "onnx.Concat"(%dim0, %dim1, %dim2, %dim3) <{axis = 0 : si64}> : (tensor<1xi64>, tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<4xi64>
+  
+  // Reshape 3D -> 4D
+  %0 = "onnx.Reshape"(%arg0, %shape_4d) <{allowzero = 0 : si64}> : (tensor<?x?x?xf32>, tensor<4xi64>) -> tensor<?x12x?x?xf32>
+  
+  // Add operation
+  %1 = "onnx.Add"(%0, %arg1) : (tensor<?x12x?x?xf32>, tensor<?x12x?x?xf32>) -> tensor<?x12x?x?xf32>
+  
+  // Extract dimensions from Add result
+  %dim2_out = "onnx.Dim"(%1) <{axis = 2 : si64}> : (tensor<?x12x?x?xf32>) -> tensor<1xi64>
+  %dim3_out = "onnx.Dim"(%1) <{axis = 3 : si64}> : (tensor<?x12x?x?xf32>) -> tensor<1xi64>
+  
+  // Build 3D shape: [-1, dim2, dim3]
+  %shape_3d = "onnx.Concat"(%c_1, %dim2_out, %dim3_out) <{axis = 0 : si64}> : (tensor<1xi64>, tensor<1xi64>, tensor<1xi64>) -> tensor<3xi64>
+  
+  // Reshape 4D -> 3D
+  %2 = "onnx.Reshape"(%1, %shape_3d) <{allowzero = 0 : si64}> : (tensor<?x12x?x?xf32>, tensor<3xi64>) -> tensor<?x?x?xf32>
+  
+  return %2 : tensor<?x?x?xf32>
+
+// CHECK-LABEL:  func.func @test_rewrite_4d_add_to_3d_dynamic
+// CHECK-SAME:   ([[PARAM_0_:%.+]]: tensor<?x?x?xf32>, [[PARAM_1_:%.+]]: tensor<?x12x?x?xf32>) -> tensor<?x?x?xf32> {
+// CHECK:           [[SHAPE_:%.+]] = "onnx.Shape"([[PARAM_0_]]) <{start = 0 : si64}> : (tensor<?x?x?xf32>) -> tensor<3xi64>
+// CHECK:           [[RESHAPE_:%.+]] = "onnx.Reshape"([[PARAM_1_]], [[SHAPE_]]) <{allowzero = 0 : si64}> : (tensor<?x12x?x?xf32>, tensor<3xi64>) -> tensor<?x?x?xf32>
+// CHECK:           [[ADD_:%.+]] = "onnx.Add"([[PARAM_0_]], [[RESHAPE_]]) : (tensor<?x?x?xf32>, tensor<?x?x?xf32>) -> tensor<?x?x?xf32>
+// CHECK:           return [[ADD_]] : tensor<?x?x?xf32>
+// CHECK:         }
+}
+
+// -----
+
+// COM: Negative test: Broadcasting case (different shapes)
+// COM: Should NOT be rewritten because NNPA doesn't support broadcasting
+
+func.func @test_no_rewrite_broadcasting(%arg0: tensor<2x3x4xf32>, %arg1: tensor<1x3x4xf32>) -> tensor<2x3x4xf32> {
+  %shape_4d_1 = "onnx.Constant"() {value = dense<[2, 3, 4, 1]> : tensor<4xi64>} : () -> tensor<4xi64>
+  %shape_4d_2 = "onnx.Constant"() {value = dense<[1, 3, 4, 1]> : tensor<4xi64>} : () -> tensor<4xi64>
+  %shape_3d = "onnx.Constant"() {value = dense<[2, 3, 4]> : tensor<3xi64>} : () -> tensor<3xi64>
+  
+  %0 = "onnx.Reshape"(%arg0, %shape_4d_1) : (tensor<2x3x4xf32>, tensor<4xi64>) -> tensor<2x3x4x1xf32>
+  %1 = "onnx.Reshape"(%arg1, %shape_4d_2) : (tensor<1x3x4xf32>, tensor<4xi64>) -> tensor<1x3x4x1xf32>
+  %2 = "onnx.Add"(%0, %1) : (tensor<2x3x4x1xf32>, tensor<1x3x4x1xf32>) -> tensor<2x3x4x1xf32>
+  %3 = "onnx.Reshape"(%2, %shape_3d) : (tensor<2x3x4x1xf32>, tensor<3xi64>) -> tensor<2x3x4xf32>
+  
+  return %3 : tensor<2x3x4xf32>
+  
+  // CHECK-LABEL: func.func @test_no_rewrite_broadcasting
+  // CHECK: onnx.Reshape
+  // CHECK: onnx.Reshape
+  // CHECK: onnx.Add
+  // CHECK: onnx.Reshape
+}
+
+// -----
+
+// COM: Negative test: Wrong rank transformation (3D->5D)
+// COM: Should NOT be rewritten
+
+func.func @test_no_rewrite_wrong_rank(%arg0: tensor<2x3x4xf32>, %arg1: tensor<2x3x4xf32>) -> tensor<2x3x4xf32> {
+  %shape_5d = "onnx.Constant"() {value = dense<[2, 3, 4, 1, 1]> : tensor<5xi64>} : () -> tensor<5xi64>
+  %shape_3d = "onnx.Constant"() {value = dense<[2, 3, 4]> : tensor<3xi64>} : () -> tensor<3xi64>
+  
+  %0 = "onnx.Reshape"(%arg0, %shape_5d) : (tensor<2x3x4xf32>, tensor<5xi64>) -> tensor<2x3x4x1x1xf32>
+  %1 = "onnx.Reshape"(%arg1, %shape_5d) : (tensor<2x3x4xf32>, tensor<5xi64>) -> tensor<2x3x4x1x1xf32>
+  %2 = "onnx.Add"(%0, %1) : (tensor<2x3x4x1x1xf32>, tensor<2x3x4x1x1xf32>) -> tensor<2x3x4x1x1xf32>
+  %3 = "onnx.Reshape"(%2, %shape_3d) : (tensor<2x3x4x1x1xf32>, tensor<3xi64>) -> tensor<2x3x4xf32>
+  
+  return %3 : tensor<2x3x4xf32>
+  
+  // CHECK-LABEL: func.func @test_no_rewrite_wrong_rank
+  // CHECK: onnx.Reshape
+  // CHECK: onnx.Reshape
+  // CHECK: onnx.Add
+  // CHECK: onnx.Reshape
+}
+
+// -----
+
+// COM: Negative test: Multiple uses of intermediate result
+// COM: Should NOT be rewritten because reshape has multiple uses
+
+func.func @test_no_rewrite_multiple_uses(%arg0: tensor<2x3x4xf32>, %arg1: tensor<2x3x4xf32>) -> (tensor<2x3x4xf32>, tensor<2x3x4x1xf32>) {
+  %shape_4d = "onnx.Constant"() {value = dense<[2, 3, 4, 1]> : tensor<4xi64>} : () -> tensor<4xi64>
+  %shape_3d = "onnx.Constant"() {value = dense<[2, 3, 4]> : tensor<3xi64>} : () -> tensor<3xi64>
+  
+  %0 = "onnx.Reshape"(%arg0, %shape_4d) : (tensor<2x3x4xf32>, tensor<4xi64>) -> tensor<2x3x4x1xf32>
+  %1 = "onnx.Reshape"(%arg1, %shape_4d) : (tensor<2x3x4xf32>, tensor<4xi64>) -> tensor<2x3x4x1xf32>
+  %2 = "onnx.Add"(%0, %1) : (tensor<2x3x4x1xf32>, tensor<2x3x4x1xf32>) -> tensor<2x3x4x1xf32>
+  %3 = "onnx.Reshape"(%2, %shape_3d) : (tensor<2x3x4x1xf32>, tensor<3xi64>) -> tensor<2x3x4xf32>
+  
+  return %3, %0 : tensor<2x3x4xf32>, tensor<2x3x4x1xf32>
+  
+  // CHECK-LABEL: func.func @test_no_rewrite_multiple_uses
+  // CHECK: onnx.Reshape
+  // CHECK: onnx.Reshape
+  // CHECK: onnx.Add
+  // CHECK: onnx.Reshape
+}
+
+

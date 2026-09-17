@@ -671,6 +671,161 @@ public:
   }
 };
 
+/// Pattern to rewrite 4D Add to 3D by eliminating unnecessary reshapes.
+/// Matches: Reshape(3D->4D) -> Add -> Reshape(4D->3D)
+/// Rewrites to: Add on 3D tensors directly
+class Rewrite4DAddTo3DPattern : public OpRewritePattern<ONNXReshapeOp> {
+public:
+  DimAnalysis *dimAnalysis;
+
+  Rewrite4DAddTo3DPattern(MLIRContext *context, DimAnalysis *dimAnalysis)
+      : OpRewritePattern<ONNXReshapeOp>(context, 1001),
+        dimAnalysis(dimAnalysis) {}
+
+  LogicalResult matchAndRewrite(
+      ONNXReshapeOp reshape3Op, PatternRewriter &rewriter) const override {
+    if (!canBeRewritten(reshape3Op, dimAnalysis))
+      return failure();
+    return applyTransformation(reshape3Op, rewriter);
+  }
+
+  // Static helper for pattern matching.
+  // NOTE: Must be public to be called from addDynamicallyLegalOpFor lambda.
+  static bool canBeRewritten(
+      ONNXReshapeOp reshape3Op, const DimAnalysis *dimAnalysis) {
+    // Check if this is a 4D -> 3D reshape.
+    Value input4D = reshape3Op.getData();
+    if (getRank(input4D.getType()) != 4 || 
+        getRank(reshape3Op.getReshaped().getType()) != 3)
+      return false;
+
+    // Input must be from an Add operation (not a function argument).
+    if (isa<BlockArgument>(input4D))
+      return false;
+    auto addOp = dyn_cast<ONNXAddOp>(input4D.getDefiningOp());
+    if (!addOp)
+      return false;
+
+    // Identify reshape operations for Add operands.
+    Value addOperand1 = addOp.getA();
+    Value addOperand2 = addOp.getB();
+    ONNXReshapeOp reshape1Op = 
+        !isa<BlockArgument>(addOperand1) && addOperand1.getDefiningOp()
+            ? dyn_cast<ONNXReshapeOp>(addOperand1.getDefiningOp())
+            : nullptr;
+    ONNXReshapeOp reshape2Op = 
+        !isa<BlockArgument>(addOperand2) && addOperand2.getDefiningOp()
+            ? dyn_cast<ONNXReshapeOp>(addOperand2.getDefiningOp())
+            : nullptr;
+
+    // At least one operand must be a 3D->4D reshape.
+    if (!reshape1Op && !reshape2Op)
+      return false;
+
+    // Validate operand ranks: either both 3D or one 3D and one 4D.
+    int64_t rank1 = reshape1Op ? getRank(reshape1Op.getData().getType()) 
+                                : getRank(addOperand1.getType());
+    int64_t rank2 = reshape2Op ? getRank(reshape2Op.getData().getType()) 
+                                : getRank(addOperand2.getType());
+    if (!((rank1 == 3 && rank2 == 3) || (rank1 == 3 && rank2 == 4) || 
+          (rank1 == 4 && rank2 == 3)))
+      return false;
+
+    // Validate no broadcasting: static dimensions must match.
+    auto type1 = mlir::cast<ShapedType>(addOperand1.getType());
+    auto type2 = mlir::cast<ShapedType>(addOperand2.getType());
+    if (type1.getRank() != type2.getRank())
+      return false;
+    for (int64_t i = 0; i < type1.getRank(); ++i) {
+      int64_t dim1 = type1.getDimSize(i);
+      int64_t dim2 = type2.getDimSize(i);
+      if (!ShapedType::isDynamic(dim1) && !ShapedType::isDynamic(dim2) && 
+          dim1 != dim2)
+        return false;
+    }
+
+    // Validate Add result usage: only by this reshape and Dim operations.
+    bool hasReshapeUse = false;
+    for (Operation *user : input4D.getUsers()) {
+      if (auto reshapeUser = dyn_cast<ONNXReshapeOp>(user)) {
+        if (reshapeUser == reshape3Op.getOperation()) {
+          hasReshapeUse = true;
+          continue;
+        }
+      }
+      if (!isa<ONNXDimOp>(user))
+        return false;
+    }
+    if (!hasReshapeUse)
+      return false;
+
+    // Validate single-use for reshape operands.
+    if (reshape1Op && !addOperand1.hasOneUse())
+      return false;
+    if (reshape2Op && !addOperand2.hasOneUse())
+      return false;
+
+    // For Case A (both 3D): validate output shape matches using DimAnalysis.
+    if (rank1 == 3 && rank2 == 3 && dimAnalysis) {
+      Value input3D_1 = reshape1Op.getData();
+      Value input3D_2 = reshape2Op.getData();
+      if (!dimAnalysis->sameShape(input3D_1, reshape3Op.getReshaped()) ||
+          !dimAnalysis->sameShape(input3D_2, reshape3Op.getReshaped()))
+        return false;
+    }
+
+    return true;
+  }
+
+private:
+  // Apply the transformation.
+  LogicalResult applyTransformation(
+      ONNXReshapeOp reshape3Op, PatternRewriter &rewriter) const {
+    Location loc = reshape3Op.getLoc();
+    MultiDialectBuilder<OnnxBuilder> create(rewriter, loc);
+
+    // Get operations.
+    Value input4D = reshape3Op.getData();
+    auto addOp = cast<ONNXAddOp>(input4D.getDefiningOp());
+    Value addOperand1 = addOp.getA();
+    Value addOperand2 = addOp.getB();
+
+    // Get the 3D values for both operands.
+    // When one operand is already 3D and the other is 4D, reshape the 4D
+    // operand to match the 3D operand's shape to avoid broadcasting.
+    Value input3D_1, input3D_2;
+    auto reshape1Op = dyn_cast_or_null<ONNXReshapeOp>(
+        addOperand1.getDefiningOp());
+    auto reshape2Op = dyn_cast_or_null<ONNXReshapeOp>(
+        addOperand2.getDefiningOp());
+
+    if (reshape1Op && reshape2Op) {
+      // Case A: Both operands are from 3D->4D reshapes.
+      input3D_1 = reshape1Op.getData();
+      input3D_2 = reshape2Op.getData();
+    } else if (reshape1Op && !reshape2Op) {
+      // Case B: Operand 1 is 3D->4D reshape, operand 2 is already 4D.
+      // Reshape operand 2 by collapsing its first two dimensions.
+      input3D_1 = reshape1Op.getData();
+      input3D_2 = reshapeTo3D(rewriter, loc, addOperand2);
+    } else if (!reshape1Op && reshape2Op) {
+      // Case B: Operand 1 is already 4D, operand 2 is 3D->4D reshape.
+      // Reshape operand 1 by collapsing its first two dimensions.
+      input3D_2 = reshape2Op.getData();
+      input3D_1 = reshapeTo3D(rewriter, loc, addOperand1);
+    }
+
+    // Create new Add directly on 3D tensors with matching shapes.
+    Value newAdd = create.onnx.add(input3D_1, input3D_2);
+
+    // Replace the final reshape with the new Add result.
+    // The pattern rewriter will automatically handle cleanup of dead operations.
+    rewriter.replaceOp(reshape3Op, newAdd);
+
+    return success();
+  }
+};
+
 class RemoveReshapeWithIdentityPattern
     : public OpRewritePattern<ONNXReshapeOp> {
 public:
@@ -713,6 +868,8 @@ void getRewriteONNXForZHighPatterns(RewritePatternSet &patterns,
   patterns.insert<AddSubWithRHSZeroExpandPattern<ONNXSubOp>>(
       patterns.getContext(), dimAnalysis);
   patterns.insert<RemoveReshapeWithIdentityPattern>(
+      patterns.getContext(), dimAnalysis);
+  patterns.insert<Rewrite4DAddTo3DPattern>(
       patterns.getContext(), dimAnalysis);
 
   // Add Conv to Matmul decomposition pattern for Conv ops that cannot use NNPA.
@@ -1076,7 +1233,12 @@ void getRewriteONNXForZHighDynamicallyLegal(mlir::ConversionTarget *target,
         // Get rid of identity reshape here, as it impacts stick/unstick.
         // So all reshape are legal, unless it is an identity reshape, in
         // which case there is a rule here to remove it.
-        return !isIdentityReshape(op, dimAnalysis);
+        if (isIdentityReshape(op, dimAnalysis))
+          return false;
+        // Also check for 4D->3D Add pattern that can be rewritten.
+        if (Rewrite4DAddTo3DPattern::canBeRewritten(op, dimAnalysis))
+          return false;
+        return true;
       });
 }
 
