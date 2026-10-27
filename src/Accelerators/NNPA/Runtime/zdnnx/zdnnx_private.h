@@ -15,6 +15,10 @@
 #ifndef ZDNNX_ZDNNX_PRIVATE_H
 #define ZDNNX_ZDNNX_PRIVATE_H
 
+#if defined(__MVS__)  // If z/OS, use XL C include and typedef
+#include <builtins.h> // needed for XL C prefetch ops.
+#endif
+
 // AIU parameters getting from zdnn_private.h.
 #define AIU_BYTES_PER_STICK 128
 #define AIU_2BYTE_CELLS_PER_STICK 64
